@@ -1,0 +1,22 @@
+[Unit]
+Description=TrackSuite.work Backend (FastAPI)
+After=network.target
+
+[Service]
+# Compatibility copy. Canonical service file lives at backend/work-time-backend.service.
+# Update User/Group/WorkingDirectory/Environment to match your server setup
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/work-time-app
+Environment="PATH=/opt/work-time-app/venv_server/bin"
+Environment="WORK_TIME_JWT_SECRET=CHANGE-ME-use-python3-c-import-secrets;print(secrets.token_hex(32))"
+Environment="WORK_TIME_ENCRYPTION_KEY=CHANGE-ME-use-python3-c-from-cryptography.fernet-import-Fernet;print(Fernet.generate_key().decode())"
+Environment="WORK_TIME_DB_FILE=/opt/work-time-app/data/work_time_server.db"
+
+ExecStart=/opt/work-time-app/venv_server/bin/uvicorn backend.app_server.main:app --host 127.0.0.1 --port 8007 --workers 1
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

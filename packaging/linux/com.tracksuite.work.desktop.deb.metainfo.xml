@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>com.tracksuite.work.desktop</id>
+    <pkgname>track-suite-work</pkgname>
+
+    <name>TrackSuite.work</name>
+    <summary>Cross-platform work time tracking desktop application</summary>
+    <developer id="com.tracksuite.work">
+        <name>Julian Quandt</name>
+    </developer>
+
+    <url type="homepage">https://tracksuite.work</url>
+
+    <metadata_license>MIT</metadata_license>
+    <project_license>MIT</project_license>
+
+    <description>
+        <p>
+            TrackSuite.work is a work time tracking application with a system tray indicator,
+            detailed productivity dashboard, and optional cloud sync. Track work sessions,
+            view historical summaries, and stay aware of daily hours without interrupting
+            your workflow.
+        </p>
+        <ul>
+            <li>System tray indicator with quick start and stop controls</li>
+            <li>Dashboard with daily, weekly, and overtime summaries</li>
+            <li>Automatic suspend detection with safe clock-out handling</li>
+            <li>Optional sync to a self-hosted or managed backend</li>
+        </ul>
+    </description>
+
+    <launchable type="desktop-id">TrackSuite.work.desktop</launchable>
+
+    <categories>
+        <category>Office</category>
+        <category>Utility</category>
+    </categories>
+
+    <keywords>
+        <keyword>time</keyword>
+        <keyword>tracking</keyword>
+        <keyword>productivity</keyword>
+        <keyword>work</keyword>
+        <keyword>timer</keyword>
+    </keywords>
+
+    <releases>
+        <release version="0.1.0" date="2026-03-31">
+            <description>
+                <p>Initial public desktop release.</p>
+            </description>
+        </release>
+    </releases>
+
+    <content_rating type="oars-1.1" />
+
+    <requires>
+        <display_length compare="ge">768</display_length>
+    </requires>
+
+    <recommends>
+        <control>pointing</control>
+        <control>keyboard</control>
+    </recommends>
+</component>

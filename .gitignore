@@ -1,0 +1,38 @@
+# Environments
+venv/
+env/
+.env
+.venv/*
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs and OS junk
+.vscode/
+.idea/
+.DS_Store
+
+# Database files
+*.db
+*.db-wal
+*.db-shm
+*.bak
+
+# Local junk / never publish
+.coverage
+.commit_msg
+claude*.txt
+.venv/
+
+# Tauri desktop build outputs
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+*.tsbuildinfo
+
+# Website build outputs
+website/node_modules/
+website/dist/
+packaging/linux/tracksuite-work.julianquandt.com.conf

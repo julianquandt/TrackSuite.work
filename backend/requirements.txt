@@ -1,0 +1,14 @@
+fastapi==0.135.1
+uvicorn==0.42.0
+sqlalchemy==2.0.48
+pydantic==2.12.5
+pydantic-core==2.41.5
+starlette==0.52.1
+anyio==4.12.1
+greenlet==3.3.2
+argon2-cffi>=23.1.0
+pyjwt>=2.8.0
+slowapi>=0.1.9
+pydantic[email]
+pyotp>=2.9.0
+cryptography>=45.0.0

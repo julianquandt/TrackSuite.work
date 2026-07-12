@@ -1,0 +1,73 @@
+app-id: com.tracksuite.work.desktop
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.node20
+command: tracksuite-work-desktop
+
+finish-args:
+  # Display
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Network sync
+  - --share=network
+  # Suspend detection via logind on the system bus
+  - --system-talk-name=org.freedesktop.login1
+  # Desktop notifications
+  - --talk-name=org.freedesktop.Notifications
+  # System tray (StatusNotifier / libayatana-appindicator)
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=com.canonical.dbusmenu
+  - --talk-name=org.ayatana.indicator.application
+  # Autostart — plugin writes .desktop file to XDG autostart dir
+  - --filesystem=xdg-config/autostart:create
+
+modules:
+  - name: tracksuite-work-desktop
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/node20/bin
+      env:
+        CARGO_HOME: /run/build/tracksuite-work-desktop/cargo
+        npm_config_cache: /run/build/tracksuite-work-desktop/npm-cache
+
+    sources:
+      # Relative to this manifest file (packaging/linux/), ../../ = repo root.
+      # CI: flatpak-github-actions runs flatpak-builder from the repo root checkout.
+      - type: dir
+        path: ../../
+
+      # Offline dependency sources — regenerate whenever lock files change:
+      #   packaging/linux/generate-sources.sh
+      - node-sources.json
+      - cargo-sources.json
+
+    build-commands:
+      # 1. Install JS deps (offline, populated by node-sources.json)
+      - npm ci --prefix desktop
+
+      # 2. Build frontend (Tauri embeds it into the binary at compile time)
+      - npm run build --prefix desktop
+
+      # 3. Build Rust binary (offline, cargo home populated by cargo-sources.json)
+      - cargo build --release --manifest-path desktop/src-tauri/Cargo.toml
+
+      # 4. Install binary
+      - install -Dm755 desktop/src-tauri/target/release/tracksuite-work-desktop /app/bin/tracksuite-work-desktop
+
+      # 5. Install desktop entry (patch Icon name to match Flatpak app-id convention)
+  - sed 's/Icon=tracksuite-work/Icon=com.tracksuite.work.desktop/' packaging/linux/tracksuite-work.desktop > tracksuite-work-patched.desktop
+  - install -Dm644 tracksuite-work-patched.desktop /app/share/applications/com.tracksuite.work.desktop.desktop
+
+      # 6. Install AppStream metadata
+  - install -Dm644 packaging/linux/com.tracksuite-work.desktop.metainfo.xml /app/share/metainfo/com.tracksuite.work.desktop.metainfo.xml
+
+      # 7. Install icons (hicolor hierarchy)
+  - install -Dm644 desktop/src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/com.tracksuite.work.desktop.png
+  - install -Dm644 desktop/src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/com.tracksuite.work.desktop.png
+  - install -Dm644 desktop/src-tauri/icons/64x64.png /app/share/icons/hicolor/64x64/apps/com.tracksuite.work.desktop.png
+  - install -Dm644 desktop/src-tauri/icons/32x32.png /app/share/icons/hicolor/32x32/apps/com.tracksuite.work.desktop.png

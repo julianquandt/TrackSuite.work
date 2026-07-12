@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TrackSuite.work
+GenericName=Work Time Tracker
+Comment=Cross-platform work time tracking desktop app
+Exec=tracksuite-work-desktop
+Icon=tracksuite-work
+Categories=Utility;Office;
+Keywords=time;tracking;productivity;
+StartupNotify=true
+StartupWMClass=tracksuite-work-desktop

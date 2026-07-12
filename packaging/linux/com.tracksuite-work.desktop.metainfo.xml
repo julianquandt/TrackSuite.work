@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>com.tracksuite.work.desktop</id>
+
+    <name>TrackSuite.work</name>
+    <summary>Cross-platform work time tracking desktop application</summary>
+
+    <metadata_license>MIT</metadata_license>
+    <project_license>MIT</project_license>
+
+    <description>
+        <p>
+            TrackSuite.work is a work time tracking application with a system tray indicator,
+            detailed productivity dashboard, and optional cloud sync. Track work sessions,
+            view historical summaries, and stay aware of daily hours without interrupting
+            your workflow.
+        </p>
+        <ul>
+            <li>System tray indicator with quick start/stop</li>
+            <li>Dashboard with daily, weekly, and monthly views</li>
+            <li>Automatic suspend/resume detection</li>
+            <li>Optional sync to remote backend</li>
+        </ul>
+    </description>
+
+    <launchable type="desktop-id">com.tracksuite.work.desktop.desktop</launchable>
+
+    <url type="homepage">https://github.com/OWNER/tracksuite-work</url>
+    <url type="bugtracker">https://github.com/OWNER/tracksuite-work/issues</url>
+
+    <categories>
+        <category>Utility</category>
+        <category>Office</category>
+    </categories>
+
+    <keywords>
+        <keyword>time</keyword>
+        <keyword>tracking</keyword>
+        <keyword>productivity</keyword>
+        <keyword>work</keyword>
+        <keyword>timer</keyword>
+    </keywords>
+
+    <screenshots>
+        <!-- Add screenshots before submitting to Flathub -->
+    </screenshots>
+
+    <releases>
+        <release version="0.1.0" date="2026-03-31">
+            <description>
+                <p>Initial release.</p>
+            </description>
+        </release>
+    </releases>
+
+    <content_rating type="oars-1.1" />
+
+    <requires>
+        <display_length compare="ge">768</display_length>
+    </requires>
+
+    <recommends>
+        <control>pointing</control>
+        <control>keyboard</control>
+    </recommends>
+</component>
