@@ -668,3 +668,164 @@ def test_daily_hours_aggregation():
     data = response.json()
     assert data["2026-03-19"] == 5.0
     assert data["2026-03-20"] == 4.5
+
+
+def test_sync_reconciles_multiple_open_shifts():
+    """A cross-device race / old client can leave several shifts open at once.
+    The server must keep only the most recently started one open and auto-close
+    the rest to the end of their start day, flagged for the user."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    payload = {
+        "shifts": [
+            {
+                "uuid": "open-old",
+                "start_time": "2026-04-07T08:00:00",
+                "end_time": None,
+                "updated_at": "2026-04-07T08:00:00.000000+00:00",
+            },
+            {
+                "uuid": "open-mid",
+                "start_time": "2026-05-01T09:00:00",
+                "end_time": None,
+                "updated_at": "2026-05-01T09:00:00.000000+00:00",
+            },
+            {
+                "uuid": "open-new",
+                "start_time": "2026-07-10T10:00:00",
+                "end_time": None,
+                "updated_at": "2026-07-10T10:00:00.000000+00:00",
+            },
+        ],
+        "off_days": [],
+        "projects": [],
+    }
+    response = client.post("/sync/", json=payload, headers=headers)
+    assert response.status_code == 200
+    shifts = {s["uuid"]: s for s in response.json()["shifts"]}
+
+    # Most recently started stays open and unflagged.
+    assert shifts["open-new"]["end_time"] is None
+    assert shifts["open-new"]["auto_closed_at"] is None
+
+    # The earlier ones are auto-closed to 23:59:59 of their own start day.
+    assert shifts["open-old"]["end_time"] == "2026-04-07T23:59:59"
+    assert shifts["open-old"]["auto_closed_at"]
+    assert shifts["open-mid"]["end_time"] == "2026-05-01T23:59:59"
+    assert shifts["open-mid"]["auto_closed_at"]
+
+    # Exactly one open shift remains.
+    open_count = sum(1 for s in shifts.values() if s["end_time"] is None and not s["deleted"])
+    assert open_count == 1
+
+
+def test_sync_preserves_timezone_frame_when_auto_closing():
+    """Auto-close must keep the original tz frame so the bounded shift never
+    goes negative or spans days (web stores UTC ISO, desktop stores naive)."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    payload = {
+        "shifts": [
+            {
+                "uuid": "utc-open",
+                "start_time": "2026-04-07T08:00:00.000Z",
+                "end_time": None,
+                "updated_at": "2026-04-07T08:00:00.000000+00:00",
+            },
+            {
+                "uuid": "newer-open",
+                "start_time": "2026-07-10T10:00:00.000Z",
+                "end_time": None,
+                "updated_at": "2026-07-10T10:00:00.000000+00:00",
+            },
+        ],
+        "off_days": [],
+        "projects": [],
+    }
+    response = client.post("/sync/", json=payload, headers=headers)
+    assert response.status_code == 200
+    shifts = {s["uuid"]: s for s in response.json()["shifts"]}
+    assert shifts["utc-open"]["end_time"] == "2026-04-07T23:59:59Z"
+    assert shifts["newer-open"]["end_time"] is None
+
+
+def test_create_shift_auto_closes_prior_open_shift():
+    """Creating a new open shift while one is already open (cross-device) must
+    auto-close the older one rather than leave two open."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    first = client.post(
+        "/shifts/", json={"uuid": "s1", "start_time": "2026-04-07T08:00:00"}, headers=headers
+    )
+    assert first.status_code == 201
+    assert first.json()["end_time"] is None
+
+    second = client.post(
+        "/shifts/", json={"uuid": "s2", "start_time": "2026-07-10T09:00:00"}, headers=headers
+    )
+    assert second.status_code == 201
+    assert second.json()["end_time"] is None  # newest stays open
+
+    all_shifts = {s["uuid"]: s for s in client.get("/shifts/", headers=headers).json()}
+    assert all_shifts["s1"]["end_time"] == "2026-04-07T23:59:59"
+    assert all_shifts["s1"]["auto_closed_at"]
+
+
+def test_sync_single_open_shift_is_untouched():
+    """A single legit open shift (running timer) must not be auto-closed."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    payload = {
+        "shifts": [
+            {
+                "uuid": "only-open",
+                "start_time": "2026-07-14T09:00:00",
+                "end_time": None,
+                "updated_at": "2026-07-14T09:00:00.000000+00:00",
+            }
+        ],
+        "off_days": [],
+        "projects": [],
+    }
+    response = client.post("/sync/", json=payload, headers=headers)
+    assert response.status_code == 200
+    shifts = response.json()["shifts"]
+    assert len(shifts) == 1
+    assert shifts[0]["end_time"] is None
+    assert shifts[0]["auto_closed_at"] is None
+
+
+def test_started_from_is_stored_and_round_trips():
+    """Origin metadata is persisted on create and carried through sync."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    # REST create (web path) stamps origin.
+    created = client.post(
+        "/shifts/",
+        json={"uuid": "w1", "start_time": "2026-03-01T08:00:00",
+              "end_time": "2026-03-01T09:00:00", "started_from": "web"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["started_from"] == "web"
+
+    # Sync push (desktop path) carries origin and it survives the round-trip.
+    payload = {
+        "shifts": [{
+            "uuid": "d1", "start_time": "2026-03-02T08:00:00",
+            "end_time": "2026-03-02T09:00:00",
+            "updated_at": "2026-03-02T09:00:00.000000+00:00",
+            "started_from": "desktop",
+        }],
+        "off_days": [], "projects": [],
+    }
+    resp = client.post("/sync/", json=payload, headers=headers)
+    assert resp.status_code == 200
+    by_uuid = {s["uuid"]: s for s in resp.json()["shifts"]}
+    assert by_uuid["d1"]["started_from"] == "desktop"
+    assert by_uuid["w1"]["started_from"] == "web"

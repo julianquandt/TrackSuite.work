@@ -343,6 +343,9 @@ export interface ShiftItem {
     project_uuid?: string | null;
     start_time: string;
     end_time: string | null;
+    // Set by the server when it auto-closed a shift left running while a newer
+    // one started; the end time is a bounded estimate the user should review.
+    auto_closed_at?: string | null;
 }
 
 export interface OffDayItem {
@@ -366,7 +369,7 @@ export function listShifts() {
 }
 
 export function createShift(startTime: string, endTime: string | null = null, projectUuid?: string | null) {
-    const body: Record<string, unknown> = { start_time: startTime, end_time: endTime };
+    const body: Record<string, unknown> = { start_time: startTime, end_time: endTime, started_from: "web" };
     if (projectUuid !== undefined) body.project_uuid = projectUuid;
     return request<ShiftItem>("POST", "/shifts/", body);
 }

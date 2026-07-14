@@ -28,6 +28,10 @@ struct RemoteSyncShift {
     deleted: bool,
     #[serde(default)]
     deleted_at: Option<String>,
+    #[serde(default)]
+    auto_closed_at: Option<String>,
+    #[serde(default)]
+    started_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +164,8 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
                 "updated_at": s.updated_at,
                 "deleted": s.deleted,
                 "deleted_at": s.deleted_at,
+                "auto_closed_at": s.auto_closed_at,
+                "started_from": s.started_from,
             })
         })
         .collect();
@@ -233,6 +239,8 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
             updated_at: shift.updated_at.clone(),
             deleted: shift.deleted,
             deleted_at: shift.deleted_at.clone(),
+            auto_closed_at: shift.auto_closed_at.clone(),
+            started_from: shift.started_from.clone(),
         })?;
     }
     for off_day in &state.off_days {

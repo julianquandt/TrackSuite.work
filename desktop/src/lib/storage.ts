@@ -5,6 +5,7 @@ import {
     type OffDayRecord,
     type ProjectRecord,
     type ShiftRecord,
+    type StaleClose,
     type SyncConfig,
     type AppearanceConfig,
     type WorkScheduleConfig,
@@ -16,6 +17,8 @@ export interface ShiftRepository {
     getAllShifts(): Promise<ShiftRecord[]>;
     startShift(): Promise<void>;
     endShift(): Promise<void>;
+    heartbeat(): Promise<void>;
+    reconcileStaleShift(staleMinutes: number): Promise<StaleClose | null>;
     addManualShift(startTime: string, endTime: string): Promise<void>;
     deleteShift(shiftId: number): Promise<void>;
 }
@@ -106,6 +109,16 @@ export const shifts: ShiftRepository = {
     },
     async endShift() {
         await invoke("end_shift");
+    },
+    async heartbeat() {
+        await invoke("heartbeat_active_shift");
+    },
+    async reconcileStaleShift(staleMinutes) {
+        const row = await invoke<{ start_time: string; end_time: string } | null>(
+            "reconcile_stale_desktop_shift",
+            { staleMinutes },
+        );
+        return row ? { startTime: row.start_time, endTime: row.end_time } : null;
     },
     async addManualShift(startTime, endTime) {
         await invoke("add_manual_shift", { startTime, endTime });

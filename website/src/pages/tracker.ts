@@ -272,6 +272,9 @@ export function renderTracker(app: HTMLElement): void {
                     </div>
                 </div>
 
+                <!-- Auto-closed shift notice (shifts left running, closed by the server) -->
+                <div id="auto-closed-banner" class="auto-closed-banner" hidden></div>
+
                 <!-- Tracker Clock Console -->
                 <div class="clock-panel" id="clock-console">
                     <span class="badge" id="clock-status">IDLE</span>
@@ -1502,6 +1505,44 @@ export function renderTracker(app: HTMLElement): void {
     }
 
     // ── Fetch & Draw Stats ───────────────────────────────────────────
+    // Notify about shifts the server auto-closed (left running while a newer one
+    // started). Dismissal is remembered per newest auto-close so it won't nag,
+    // but a fresh auto-close re-surfaces it. Editing a shift clears its flag.
+    const AUTO_CLOSED_ACK_KEY = "autoClosedAckAt";
+    function renderAutoClosedBanner() {
+        const el = document.getElementById("auto-closed-banner");
+        if (!el) return;
+        const flagged = shiftsCached.filter(s => s.auto_closed_at);
+        const latest = flagged.reduce((m, s) => (s.auto_closed_at! > m ? s.auto_closed_at! : m), "");
+        const ackAt = localStorage.getItem(AUTO_CLOSED_ACK_KEY) || "";
+        if (flagged.length === 0 || (latest && latest <= ackAt)) {
+            el.hidden = true;
+            el.innerHTML = "";
+            return;
+        }
+        const dates = flagged
+            .map(s => toDateKey(s.start_time))
+            .filter((d, i, a) => a.indexOf(d) === i)
+            .sort()
+            .map(d => `<strong>${escapeHtml(d)}</strong>`)
+            .join(", ");
+        const plural = flagged.length > 1;
+        el.hidden = false;
+        el.innerHTML = `
+            <div class="auto-closed-body">
+                <span class="auto-closed-icon">⚠️</span>
+                <div class="auto-closed-copy">
+                    <div class="auto-closed-title">${flagged.length} shift${plural ? "s were" : " was"} left running and automatically closed.</div>
+                    <div class="auto-closed-text">Their end time is an estimate (end of the start day): ${dates}. Open the day in the timeline and set the correct end time — the note clears once you edit it.</div>
+                </div>
+                <button class="btn btn-outline auto-closed-dismiss" type="button">Dismiss</button>
+            </div>`;
+        el.querySelector(".auto-closed-dismiss")!.addEventListener("click", () => {
+            localStorage.setItem(AUTO_CLOSED_ACK_KEY, latest || new Date().toISOString());
+            el.hidden = true;
+        });
+    }
+
     async function refreshData() {
         const [shiftsResp, offdaysResp, projectsResp] = await Promise.all([listShifts(), listOffDays(), listProjects()]);
 
@@ -1523,6 +1564,7 @@ export function renderTracker(app: HTMLElement): void {
         renderProjectChip();
         renderTimelineProjectSelect();
         renderTimelineShifts();
+        renderAutoClosedBanner();
 
         const offDayDates = new Set(offDaysCached.map(o => o.date));
         const now = new Date();

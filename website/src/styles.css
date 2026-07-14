@@ -1482,3 +1482,23 @@ button[type="submit"] {
 }
 .timeline-project-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .timeline-project-select option { background: var(--bg-surface); color: var(--text-primary); }
+
+/* Auto-closed shift notice (server closed a shift left running). */
+.auto-closed-banner {
+    margin: 0 0 1rem;
+    border: 1px solid var(--danger);
+    border-left-width: 4px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.auto-closed-body {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.85rem 1rem;
+}
+.auto-closed-icon { font-size: 1.15rem; line-height: 1.4; }
+.auto-closed-copy { flex: 1; min-width: 0; }
+.auto-closed-title { font-weight: 600; margin-bottom: 0.2rem; }
+.auto-closed-text { font-size: 0.9rem; opacity: 0.85; }
+.auto-closed-dismiss { flex-shrink: 0; align-self: center; }

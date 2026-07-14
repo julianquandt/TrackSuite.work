@@ -5,6 +5,12 @@ export type ShiftRecord = {
     projectUuid?: string | null;
 };
 
+/** A shift the app retro-closed to its last active time after a missed clock-out. */
+export type StaleClose = {
+    startTime: string;
+    endTime: string;
+};
+
 export type ProjectRecord = {
     uuid: string;
     name: string;

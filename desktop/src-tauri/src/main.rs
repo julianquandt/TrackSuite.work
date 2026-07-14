@@ -141,6 +141,16 @@ fn get_all_shifts() -> Result<Vec<db::Shift>, String> {
 }
 
 #[tauri::command]
+fn heartbeat_active_shift() -> Result<(), String> {
+    db::heartbeat_active_shift_row()
+}
+
+#[tauri::command]
+fn reconcile_stale_desktop_shift(stale_minutes: i64) -> Result<Option<db::StaleClose>, String> {
+    db::reconcile_stale_desktop_shift_row(stale_minutes)
+}
+
+#[tauri::command]
 fn start_shift() -> Result<bool, String> {
     let started = db::start_shift_row()?;
     if started {
@@ -314,6 +324,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_active_shift,
             get_all_shifts,
+            heartbeat_active_shift,
+            reconcile_stale_desktop_shift,
             start_shift,
             end_shift,
             add_manual_shift,

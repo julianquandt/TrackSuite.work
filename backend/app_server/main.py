@@ -145,6 +145,10 @@ def ensure_schema() -> None:
         }
         if "project_uuid" not in shift_columns:
             conn.execute(text("ALTER TABLE shifts ADD COLUMN project_uuid VARCHAR NULL"))
+        if "auto_closed_at" not in shift_columns:
+            conn.execute(text("ALTER TABLE shifts ADD COLUMN auto_closed_at VARCHAR NULL"))
+        if "started_from" not in shift_columns:
+            conn.execute(text("ALTER TABLE shifts ADD COLUMN started_from VARCHAR NULL"))
 
         backfill_ts = sync_now()
         # Backfill identity + timestamps for pre-existing rows.
@@ -694,6 +698,7 @@ class ShiftCreate(BaseModel):
     end_time: Optional[str] = None
     uuid: Optional[str] = None
     project_uuid: Optional[str] = None
+    started_from: Optional[str] = None
 
 
 class ShiftResponse(BaseModel):
@@ -705,6 +710,8 @@ class ShiftResponse(BaseModel):
     project_uuid: Optional[str] = None
     updated_at: Optional[str] = None
     deleted: bool = False
+    auto_closed_at: Optional[str] = None
+    started_from: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -758,6 +765,8 @@ class SyncShift(BaseModel):
     updated_at: str
     deleted: bool = False
     deleted_at: Optional[str] = None
+    auto_closed_at: Optional[str] = None
+    started_from: Optional[str] = None
 
 
 class SyncOffDay(BaseModel):
@@ -1243,6 +1252,8 @@ def create_shift(
         existing.updated_at = sync_now()
         if shift.uuid and not existing.uuid:
             existing.uuid = shift.uuid
+        db.flush()
+        reconcile_open_shifts(db, user_id)
         db.commit()
         db.refresh(existing)
         return existing
@@ -1255,8 +1266,11 @@ def create_shift(
         project_uuid=shift.project_uuid,
         updated_at=sync_now(),
         deleted=False,
+        started_from=shift.started_from,
     )
     db.add(db_shift)
+    db.flush()
+    reconcile_open_shifts(db, user_id)
     db.commit()
     db.refresh(db_shift)
     return db_shift
@@ -1306,6 +1320,8 @@ def update_shift(
     db_shift.end_time = shift_update.end_time
     if "project_uuid" in shift_update.model_fields_set:
         db_shift.project_uuid = shift_update.project_uuid
+    # Editing an auto-closed shift means the user has reviewed it: clear the flag.
+    db_shift.auto_closed_at = None
     db_shift.updated_at = sync_now()
     db.commit()
     db.refresh(db_shift)
@@ -1492,6 +1508,8 @@ def _serialize_sync_shift(shift: Shift) -> SyncShift:
         updated_at=shift.updated_at or "",
         deleted=bool(shift.deleted),
         deleted_at=shift.deleted_at,
+        auto_closed_at=shift.auto_closed_at,
+        started_from=shift.started_from,
     )
 
 
@@ -1515,6 +1533,52 @@ def _serialize_sync_project(project: Project) -> SyncProject:
         deleted=bool(project.deleted),
         deleted_at=project.deleted_at,
     )
+
+
+def _end_of_start_day(start_time: str) -> str:
+    """23:59:59 on the shift's own start date, preserving the original
+    timestamp's timezone frame (Z / +HH:MM / -HH:MM / naive) so the bounded
+    shift stays within its start day and never goes negative."""
+    date_part = start_time[:10]
+    tail = start_time[10:]  # "T08:59:34.123Z" | "T08:59:34+00:00" | "T08:59:34"
+    tz = ""
+    if tail.endswith("Z"):
+        tz = "Z"
+    elif "+" in tail:
+        tz = "+" + tail.split("+", 1)[1]
+    else:
+        idx = tail.rfind("-")  # any '-' after the leading 'T' is an offset
+        if idx > 0:
+            tz = tail[idx:]
+    return f"{date_part}T23:59:59{tz}"
+
+
+def reconcile_open_shifts(db: Session, user_id: int) -> None:
+    """Enforce at most one open shift per user.
+
+    Cross-device races and pre-0.8 clients could leave several shifts open at
+    once; when eventually closed to "now" they became month-spanning. Here the
+    server keeps the most recently started open shift active and auto-closes the
+    rest to the end of their own start day, flagging them (``auto_closed_at``) so
+    clients can surface them for the user to correct. Idempotent; a no-op unless
+    two or more open shifts exist. Does not commit."""
+    open_shifts = (
+        db.query(Shift)
+        .filter(
+            Shift.user_id == user_id,
+            Shift.end_time.is_(None),
+            Shift.deleted.is_(False),
+        )
+        .order_by(Shift.start_time.asc(), Shift.id.asc())
+        .all()
+    )
+    if len(open_shifts) <= 1:
+        return
+    ts = sync_now()
+    for shift in open_shifts[:-1]:  # keep the most recently started one open
+        shift.end_time = _end_of_start_day(shift.start_time)
+        shift.auto_closed_at = ts
+        shift.updated_at = ts
 
 
 def _full_sync_state(db: Session, user_id: int) -> SyncStateResponse:
@@ -1572,6 +1636,8 @@ def push_sync_state(
                 updated_at=incoming.updated_at,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
+                auto_closed_at=incoming.auto_closed_at,
+                started_from=incoming.started_from,
             ))
         elif sync_ts_greater(incoming.updated_at, row.updated_at):
             row.start_time = incoming.start_time
@@ -1580,6 +1646,13 @@ def push_sync_state(
             row.updated_at = incoming.updated_at
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
+            # A newer client write owns the flag: clients that don't know the
+            # field send None, which clears it once the user edits the shift
+            # (i.e. addresses the auto-close); the web app round-trips it.
+            row.auto_closed_at = incoming.auto_closed_at
+            # Origin is immutable metadata: only backfill it, never overwrite.
+            if row.started_from is None:
+                row.started_from = incoming.started_from
 
     for incoming in body.projects:
         row = db.query(Project).filter(
@@ -1623,6 +1696,10 @@ def push_sync_state(
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
 
+    # Collapse any multiple-open-shift state (cross-device race / old clients)
+    # down to a single open shift before returning the authoritative state.
+    db.flush()
+    reconcile_open_shifts(db, user_id)
     db.commit()
     return _full_sync_state(db, user_id)
 

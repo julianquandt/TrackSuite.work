@@ -25,7 +25,10 @@ pub fn init_db() -> Result<(), String> {
             project_uuid TEXT,
             updated_at TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
-            deleted_at TEXT
+            deleted_at TEXT,
+            auto_closed_at TEXT,
+            started_from TEXT,
+            last_active_at TEXT
         );
         CREATE TABLE IF NOT EXISTS off_days (
             date TEXT PRIMARY KEY,
@@ -83,6 +86,11 @@ fn migrate_sync_columns(c: &Connection) -> Result<(), String> {
     ensure_column("shifts", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column("shifts", "deleted_at", "TEXT")?;
     ensure_column("shifts", "project_uuid", "TEXT")?;
+    // auto_closed_at + started_from are synced; last_active_at is a local-only
+    // liveness heartbeat used to retro-close a shift the app couldn't clock out.
+    ensure_column("shifts", "auto_closed_at", "TEXT")?;
+    ensure_column("shifts", "started_from", "TEXT")?;
+    ensure_column("shifts", "last_active_at", "TEXT")?;
     ensure_column("off_days", "uuid", "TEXT")?;
     ensure_column("off_days", "updated_at", "TEXT")?;
     ensure_column("off_days", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
@@ -135,12 +143,22 @@ pub struct Shift {
     pub start_time: String,
     pub end_time: Option<String>,
     pub project_uuid: Option<String>,
+    pub started_from: Option<String>,
+    pub last_active_at: Option<String>,
+}
+
+/// Result of a retro-close: the shift the app couldn't cleanly clock out was
+/// closed to its last known active time. Returned so the UI can notify.
+#[derive(Debug, Serialize, Clone)]
+pub struct StaleClose {
+    pub start_time: String,
+    pub end_time: String,
 }
 
 pub fn get_active_shift_row() -> Result<Option<Shift>, String> {
     let c = conn()?;
     let mut stmt = c
-        .prepare("SELECT id, start_time, end_time, project_uuid FROM shifts WHERE end_time IS NULL AND deleted = 0")
+        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at FROM shifts WHERE end_time IS NULL AND deleted = 0")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query_map([], |row| {
@@ -149,6 +167,8 @@ pub fn get_active_shift_row() -> Result<Option<Shift>, String> {
                 start_time: row.get(1)?,
                 end_time: row.get(2)?,
                 project_uuid: row.get(3)?,
+                started_from: row.get(4)?,
+                last_active_at: row.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -167,11 +187,67 @@ pub fn start_shift_row() -> Result<bool, String> {
     let c = conn()?;
     let now = chrono_now();
     c.execute(
-        "INSERT INTO shifts (uuid, start_time, project_uuid, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, 0)",
+        "INSERT INTO shifts (uuid, start_time, project_uuid, updated_at, deleted, started_from, last_active_at) \
+         VALUES (?1, ?2, ?3, ?4, 0, 'desktop', ?2)",
         params![new_uuid(), now, project, sync_now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// Liveness heartbeat: stamp the open shift's last_active_at with the current
+/// local time. Local-only (not synced); used to retro-close a shift the app
+/// couldn't clock out (missed suspend / crash / power loss). Does not bump
+/// updated_at, so it creates no sync churn.
+pub fn heartbeat_active_shift_row() -> Result<(), String> {
+    let c = conn()?;
+    c.execute(
+        "UPDATE shifts SET last_active_at = ?1 WHERE end_time IS NULL AND deleted = 0",
+        params![chrono_now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// If a desktop-origin shift is still open but its heartbeat has gone stale
+/// (the app was killed without clocking out), retro-close it to its last known
+/// active time and flag it (auto_closed_at) for review. Scoped to
+/// started_from = 'desktop' so a shift still running on another device is never
+/// truncated. Returns the closed shift when it acted, else None.
+pub fn reconcile_stale_desktop_shift_row(stale_minutes: i64) -> Result<Option<StaleClose>, String> {
+    let active = match get_active_shift_row()? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    if active.started_from.as_deref() != Some("desktop") {
+        return Ok(None);
+    }
+    // Only close a shift THIS machine actually tracked: last_active_at is
+    // local-only, so a null here means the shift was synced in from another
+    // device (which may still be running it) — never truncate that.
+    let reference = match active.last_active_at.clone() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let parsed = match chrono::NaiveDateTime::parse_from_str(&reference, "%Y-%m-%dT%H:%M:%S") {
+        Ok(dt) => dt,
+        Err(_) => return Ok(None), // unknown format: don't guess
+    };
+    let now = chrono::Local::now().naive_local();
+    if (now - parsed).num_minutes() <= stale_minutes {
+        return Ok(None); // still fresh — a live session, leave it open
+    }
+    let c = conn()?;
+    let ts = sync_now();
+    c.execute(
+        "UPDATE shifts SET end_time = ?1, auto_closed_at = ?2, updated_at = ?2 WHERE id = ?3",
+        params![reference, ts, active.id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(StaleClose {
+        start_time: active.start_time,
+        end_time: reference,
+    }))
 }
 
 pub fn end_shift_row() -> Result<bool, String> {
@@ -192,7 +268,7 @@ pub fn end_shift_row() -> Result<bool, String> {
 pub fn get_all_shifts_rows() -> Result<Vec<Shift>, String> {
     let c = conn()?;
     let mut stmt = c
-        .prepare("SELECT id, start_time, end_time, project_uuid FROM shifts WHERE deleted = 0 ORDER BY start_time DESC")
+        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at FROM shifts WHERE deleted = 0 ORDER BY start_time DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -201,6 +277,8 @@ pub fn get_all_shifts_rows() -> Result<Vec<Shift>, String> {
                 start_time: row.get(1)?,
                 end_time: row.get(2)?,
                 project_uuid: row.get(3)?,
+                started_from: row.get(4)?,
+                last_active_at: row.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -609,6 +687,8 @@ pub struct SyncShift {
     pub updated_at: String,
     pub deleted: bool,
     pub deleted_at: Option<String>,
+    pub auto_closed_at: Option<String>,
+    pub started_from: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -636,8 +716,8 @@ pub fn get_all_shifts_for_sync() -> Result<Vec<SyncShift>, String> {
     let c = conn()?;
     let mut stmt = c
         .prepare(
-            "SELECT uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at \
-             FROM shifts WHERE uuid IS NOT NULL",
+            "SELECT uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at, \
+             auto_closed_at, started_from FROM shifts WHERE uuid IS NOT NULL",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -650,6 +730,8 @@ pub fn get_all_shifts_for_sync() -> Result<Vec<SyncShift>, String> {
                 updated_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 deleted: row.get::<_, i64>(5)? != 0,
                 deleted_at: row.get(6)?,
+                auto_closed_at: row.get(7)?,
+                started_from: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -696,8 +778,8 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
     match local_updated {
         None => {
             c.execute(
-                "INSERT INTO shifts (uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO shifts (uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at, \
+                 auto_closed_at, started_from) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     shift.uuid,
                     shift.start_time,
@@ -705,7 +787,9 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
                     shift.project_uuid,
                     shift.updated_at,
                     shift.deleted as i64,
-                    shift.deleted_at
+                    shift.deleted_at,
+                    shift.auto_closed_at,
+                    shift.started_from
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -713,7 +797,8 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
         Some(local) if shift.updated_at > local => {
             c.execute(
                 "UPDATE shifts SET start_time = ?2, end_time = ?3, project_uuid = ?4, updated_at = ?5, \
-                 deleted = ?6, deleted_at = ?7 WHERE uuid = ?1",
+                 deleted = ?6, deleted_at = ?7, auto_closed_at = ?8, started_from = COALESCE(started_from, ?9) \
+                 WHERE uuid = ?1",
                 params![
                     shift.uuid,
                     shift.start_time,
@@ -721,7 +806,9 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
                     shift.project_uuid,
                     shift.updated_at,
                     shift.deleted as i64,
-                    shift.deleted_at
+                    shift.deleted_at,
+                    shift.auto_closed_at,
+                    shift.started_from
                 ],
             )
             .map_err(|e| e.to_string())?;

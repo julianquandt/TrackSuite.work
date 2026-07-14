@@ -454,6 +454,63 @@ async function handleSystemResume() {
   notify("Auto Clock-In", "Shift resumed after system wake");
 }
 
+// ── Liveness heartbeat + stale-session recovery ─────────────────────
+// system-suspend is unreliable (no inhibitor lock; never fires on crash or
+// power loss), so a shift can be left open and later closed to "now" —
+// producing runaway durations. While tracking we stamp last_active_at every
+// few minutes; on startup / resume / focus / tick we retro-close any
+// desktop-origin shift whose heartbeat has gone stale, to its last active
+// time (the Rust side does the check and the close).
+const HEARTBEAT_MS = 5 * 60 * 1000;
+const STALE_MINUTES = 11; // ~2 missed beats before we consider a session dead
+let heartbeatTimer: number | null = null;
+
+function updateHeartbeat() {
+  if (isTracking && heartbeatTimer === null) {
+    heartbeatTimer = window.setInterval(() => {
+      void (async () => {
+        // A fired tick after a long gap means the app was frozen/asleep:
+        // recover first, then beat for the (possibly fresh) shift.
+        await checkStaleAndRecover();
+        if (isTracking) await shifts.heartbeat();
+      })();
+    }, HEARTBEAT_MS);
+  } else if (!isTracking && heartbeatTimer !== null) {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+async function checkStaleAndRecover() {
+  let closed;
+  try {
+    closed = await shifts.reconcileStaleShift(STALE_MINUTES);
+  } catch {
+    return; // non-critical; try again on the next trigger
+  }
+  if (!closed) return;
+  await refresh();
+  const endLabel = new Date(closed.endTime).toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  notify(
+    "Shift auto-closed",
+    `A shift left running was closed at ${endLabel}. Review it if the time looks off.`,
+  );
+  // Within work hours, resume a fresh shift (mirrors suspend/resume behaviour).
+  if (
+    currentAutoResumeConfig.enabled &&
+    shouldAutoResumeShift(new Date(), currentAutoResumeConfig) &&
+    !(await shifts.getActiveShift())
+  ) {
+    await shifts.startShift();
+    await refresh();
+    notify("Auto Clock-In", "Shift resumed");
+  }
+  performSync();
+}
+
 function getScheduleHoursInput(day: WorkdayKey): HTMLInputElement | null {
   return document.getElementById(`cfg-hours-${day}`) as HTMLInputElement | null;
 }
@@ -1471,6 +1528,7 @@ async function refresh() {
   ]);
 
   isTracking = activeShift !== null;
+  updateHeartbeat();
   const offDayDates = new Set(offDayList.map((o) => o.date));
 
   // ── Project chip ────────────────────────────────────────────────
@@ -2279,6 +2337,16 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.8.3",
+    date: "2026-07-14",
+    title: "No more runaway shifts",
+    changes: [
+      "Fixed shifts ballooning into huge durations when the app couldn't clock you out cleanly (laptop closed, crash, or power loss). A running shift is now checked with a background heartbeat and, if the app is killed without a clean clock-out, it's recovered on next launch and closed to when you were last active.",
+      "Auto-closed shifts are flagged for review so you can quickly set the correct end time if needed.",
+      "The server now guarantees a single active shift, so shifts can no longer pile up unnoticed across your devices.",
+    ],
+  },
+  {
     version: "0.8.2",
     date: "2026-07-12",
     title: "Projects, reliable sync & auto-updates",
@@ -2357,11 +2425,13 @@ listen("tray-data-changed", () => scheduleRefresh());
 // not-configured / offline case.
 window.addEventListener("focus", () => {
   scheduleRefresh();
+  void checkStaleAndRecover();
   void performSync();
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     scheduleRefresh();
+    void checkStaleAndRecover();
     void performSync();
   }
 });
@@ -2373,6 +2443,8 @@ listen("system-suspend", () => {
 
 listen("system-resume", () => {
   void handleSystemResume();
+  // Backstop for when suspend didn't fire cleanly: close a stale open shift.
+  void checkStaleAndRecover();
 });
 
 async function checkForUpdates() {
@@ -2399,7 +2471,9 @@ document.getElementById("btn-whats-new-close")?.addEventListener("click", () => 
   (document.getElementById("dlg-whats-new") as HTMLDialogElement).close();
 });
 
-loadSettings().then(() => {
+loadSettings().then(async () => {
+  // Recover a shift the app couldn't clock out last run before the first paint.
+  await checkStaleAndRecover();
   refresh();
   performSync();
   maybeShowOnboarding();

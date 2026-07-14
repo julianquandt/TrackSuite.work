@@ -76,6 +76,13 @@ class Shift(Base):
     updated_at: Mapped[str | None] = mapped_column(nullable=True)
     deleted: Mapped[bool] = mapped_column(nullable=False, default=False)
     deleted_at: Mapped[str | None] = mapped_column(nullable=True)
+    # Set by the server when it auto-closes a shift that was left open while a
+    # newer one started (enforces at most one open shift per user). Recoverable:
+    # the client surfaces these so the user can fix the end time; cleared on edit.
+    auto_closed_at: Mapped[str | None] = mapped_column(nullable=True)
+    # Origin of the shift ("desktop" | "web"); immutable metadata used for
+    # reports and to scope client-side stale-session cleanup to its own shifts.
+    started_from: Mapped[str | None] = mapped_column(nullable=True)
 
 
 class Project(Base):
