@@ -150,6 +150,42 @@ fn reconcile_stale_desktop_shift(stale_minutes: i64) -> Result<Option<db::StaleC
     db::reconcile_stale_desktop_shift_row(stale_minutes)
 }
 
+/// Whether the in-app updater can actually replace this install. Tauri can
+/// self-update an AppImage (Linux), .app/.dmg (macOS) and the Windows
+/// installers, but NOT a .deb/.rpm/Flatpak, which the system package manager
+/// owns — attempting it just hangs on an unwritable /usr.
+#[tauri::command]
+fn is_self_updatable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("APPIMAGE").is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Open a URL or local file path in the system default handler (browser for
+/// URLs, package installer for a downloaded .deb/.rpm).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// Download the matching package (.deb/.rpm) for a package-managed Linux
+/// install and return its local path for a manual install.
+#[tauri::command]
+async fn download_update_package() -> Result<String, String> {
+    push_sync::download_latest_package().await
+}
+
 #[tauri::command]
 fn start_shift() -> Result<bool, String> {
     let started = db::start_shift_row()?;
@@ -326,6 +362,9 @@ fn main() {
             get_all_shifts,
             heartbeat_active_shift,
             reconcile_stale_desktop_shift,
+            is_self_updatable,
+            open_url,
+            download_update_package,
             start_shift,
             end_shift,
             add_manual_shift,

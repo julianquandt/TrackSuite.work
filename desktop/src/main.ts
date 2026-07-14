@@ -2337,6 +2337,15 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.8.4",
+    date: "2026-07-14",
+    title: "Smoother updates on Linux packages",
+    changes: [
+      "Fixed the in-app update on Debian/Ubuntu (.deb) and Fedora (.rpm) installs, which could hang on “Downloading…”. These now download the new package and open it in your system installer instead of trying (and failing) to self-update.",
+      "AppImage, macOS and Windows continue to update automatically, and now fall back to the releases page if an automatic update can't complete.",
+    ],
+  },
+  {
     version: "0.8.3",
     date: "2026-07-14",
     title: "No more runaway shifts",
@@ -2447,22 +2456,60 @@ listen("system-resume", () => {
   void checkStaleAndRecover();
 });
 
+const RELEASES_URL = "https://github.com/julianquandt/TrackSuite.work/releases/latest";
+
 async function checkForUpdates() {
   try {
     const update = await check();
-    if (update) {
-      const bar = document.getElementById("update-bar")!;
-      const msg = document.getElementById("update-msg")!;
+    if (!update) return;
+    const bar = document.getElementById("update-bar")!;
+    const msg = document.getElementById("update-msg")!;
+    const installBtn = document.getElementById("btn-update") as HTMLButtonElement;
+    const dismissBtn = document.getElementById("btn-dismiss-update")!;
+    bar.style.display = "";
+    dismissBtn.onclick = () => { bar.style.display = "none"; };
+
+    // Tauri can self-update an AppImage/.dmg/Windows installer, but not a
+    // package-managed .deb/.rpm — attempting that just hangs on an unwritable
+    // /usr, so we download the package and hand it to the system installer.
+    const selfUpdatable = await invoke<boolean>("is_self_updatable").catch(() => true);
+
+    if (selfUpdatable) {
       msg.textContent = `Update available: v${update.version}`;
-      bar.style.display = "";
-      document.getElementById("btn-update")!.addEventListener("click", async () => {
+      installBtn.textContent = "Install & Restart";
+      installBtn.onclick = async () => {
+        installBtn.disabled = true;
         msg.textContent = "Downloading…";
-        await update.downloadAndInstall();
-        await relaunch();
-      });
-      document.getElementById("btn-dismiss-update")!.addEventListener("click", () => {
-        bar.style.display = "none";
-      });
+        try {
+          await update.downloadAndInstall();
+          await relaunch();
+        } catch {
+          msg.textContent = `Couldn't install automatically — download v${update.version}.`;
+          installBtn.textContent = "Open Releases";
+          installBtn.disabled = false;
+          installBtn.onclick = () => void invoke("open_url", { url: RELEASES_URL });
+        }
+      };
+    } else {
+      msg.textContent = `Update available: v${update.version}`;
+      installBtn.textContent = "Download update";
+      installBtn.onclick = async () => {
+        installBtn.disabled = true;
+        msg.textContent = "Downloading…";
+        try {
+          const path = await invoke<string>("download_update_package");
+          msg.textContent = "Downloaded — opening installer…";
+          await invoke("open_url", { url: path });
+          installBtn.textContent = "Open installer";
+          installBtn.disabled = false;
+          installBtn.onclick = () => void invoke("open_url", { url: path });
+        } catch {
+          msg.textContent = `Couldn't download automatically — get v${update.version} from the releases page.`;
+          installBtn.textContent = "Open Releases";
+          installBtn.disabled = false;
+          installBtn.onclick = () => void invoke("open_url", { url: RELEASES_URL });
+        }
+      };
     }
   } catch { /* non-critical */ }
 }

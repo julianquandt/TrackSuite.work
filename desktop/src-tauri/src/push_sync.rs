@@ -262,3 +262,91 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
 
     Ok(SyncStatus::Synced)
 }
+
+/// Public release repo that hosts the downloadable packages.
+const RELEASE_REPO: &str = "julianquandt/TrackSuite.work";
+
+fn has_command(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// For package-managed Linux installs (.deb/.rpm) the in-app updater can't
+/// replace the binary, so instead download the matching package from the latest
+/// release and return its local path; the UI then opens it in the system
+/// installer for a manual, authenticated install. Asset selection reads the
+/// real release asset list (via the GitHub API) rather than guessing filenames.
+pub async fn download_latest_package() -> Result<String, String> {
+    // Which package format can this machine install?
+    let (ext, arch) = if has_command("dpkg") {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        ("deb", arch)
+    } else if has_command("rpm") {
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            other => other,
+        };
+        ("rpm", arch)
+    } else {
+        return Err("No supported package manager (dpkg/rpm) found".to_string());
+    };
+
+    let client = build_client()?;
+    let api = format!("https://api.github.com/repos/{}/releases/latest", RELEASE_REPO);
+    let resp = send_request(Method::GET, &client, &api, "", "", None).await?;
+    if !resp.status().is_success() {
+        return Err(error_message(resp).await?);
+    }
+    let release: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let assets = release
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| "Release has no assets".to_string())?;
+
+    let dot_ext = format!(".{}", ext);
+    let asset = assets
+        .iter()
+        .find(|a| {
+            let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("").to_lowercase();
+            name.ends_with(&dot_ext) && name.contains(arch)
+        })
+        .ok_or_else(|| format!("No .{} package for {} in the latest release", ext, arch))?;
+
+    let url = asset
+        .get("browser_download_url")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| "Asset has no download URL".to_string())?;
+    let name = asset
+        .get("name")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "Asset has no name".to_string())?;
+
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let dir = dirs::download_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}

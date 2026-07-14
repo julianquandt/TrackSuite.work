@@ -1,6 +1,6 @@
 [package]
 name = "tracksuite-work-desktop"
-version = "0.8.3"
+version = "0.8.4"
 description = "TrackSuite.work cross-platform desktop shell"
 authors = ["TrackSuite.work"]
 edition = "2021"
