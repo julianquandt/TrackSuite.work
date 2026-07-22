@@ -1448,7 +1448,9 @@ button[type="submit"] {
     border-radius: 8px; background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem;
 }
 .timeline-brush-input:disabled { opacity: 0.5; }
-#btn-brush-toggle.active { background: var(--accent, #3b82f6); color: #fff; border-color: transparent; }
+/* --accent is white in dark mode, so the label must use the contrasting
+   --accent-fg (not a hardcoded #fff, which was white-on-white in dark). */
+#btn-brush-toggle.active { background: var(--accent, #3b82f6); color: var(--accent-fg, #fff); border-color: transparent; }
 .timeline-brush-hint { font-size: 0.8rem; flex-basis: 100%; }
 .timeline-shift { position: absolute; overflow: hidden; }
 .timeline-shift .tl-shift-label { pointer-events: none; }
@@ -1498,6 +1500,12 @@ button[type="submit"] {
 .trend-drill-crumbs .crumb-sep { opacity: 0.5; }
 .trend-drill-close { flex: none; }
 .trend-drill-empty { margin: 8px 0; font-size: 0.85rem; }
+
+/* Inline monthly off-day calendar (Statistics tab) */
+#offday-calendar-panel { margin-top: 16px; }
+.offcal-nav { display: flex; align-items: center; gap: 8px; }
+.offcal-title { min-width: 8.5rem; text-align: center; font-weight: 600; font-size: 0.9rem; }
+.offcal-hint { margin: 10px 0 0; font-size: 0.75rem; }
 
 /* ── Reports page ─────────────────────────────────────────────────── */
 .reports-page { max-width: 900px; margin: 0 auto; padding: 24px 16px; }

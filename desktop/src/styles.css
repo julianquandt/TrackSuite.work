@@ -621,6 +621,27 @@ td {
     border-top: none;
 }
 
+/* ── Inline monthly off-day calendar ─────────────────────────────── */
+.offcal-nav { display: flex; align-items: center; gap: 8px; }
+.offcal-title { min-width: 8.5rem; text-align: center; font-weight: 600; font-size: 0.9rem; }
+.offcal-hint { margin: 10px 0 0; font-size: 0.75rem; }
+.calendar-days-header {
+    display: grid; grid-template-columns: repeat(7, 1fr); text-align: center;
+    font-weight: 700; font-size: 0.68rem; color: var(--text-muted);
+    margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; user-select: none; }
+.calendar-grid div {
+    display: flex; align-items: center; justify-content: center; aspect-ratio: 1;
+    border-radius: 8px; cursor: pointer; font-weight: 500; font-size: 0.85rem;
+    color: var(--text-main); background: var(--bg-input); border: 1px solid var(--border-color);
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+.calendar-grid div:hover:not(.cal-empty) { border-color: var(--text-muted); }
+.calendar-grid div.cal-empty { cursor: default; background: none; border: none; }
+.calendar-grid div.cal-offday { background: var(--success); border-color: var(--success); color: #fff; font-weight: 700; }
+.calendar-grid div.cal-today { border: 2px solid var(--accent); font-weight: 700; }
+
 /* ── Dialogs ─────────────────────────────────────────────────────── */
 
 .modal {
@@ -1183,7 +1204,9 @@ select option {
     border-radius: 8px; background: var(--bg-input, var(--bg-elevated)); color: var(--text-primary); font: inherit; font-size: 0.9rem;
 }
 .timeline-brush-input:disabled { opacity: 0.5; }
-#btn-brush-toggle.active { background: var(--accent); color: #fff; border-color: transparent; }
+/* --accent-fg is the per-theme contrasting colour; some themes have a white
+   --accent, where a hardcoded #fff would be white-on-white. */
+#btn-brush-toggle.active { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
 .timeline-brush-hint { font-size: 0.8rem; flex-basis: 100%; }
 .timeline-shift .tl-shift-label { pointer-events: none; }
 .timeline-shift.has-note .tl-note-dot {

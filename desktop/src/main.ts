@@ -57,6 +57,9 @@ let brushActive = false;
 let brushPainting = false;
 let brushDirty = false;
 let brushStroke = new Set<number>();
+// In-flight note writes from the current stroke; the brush-end refresh must
+// await these, else its read can race ahead of the writes and revert the notes.
+let brushPending: Promise<unknown>[] = [];
 
 const PROJECT_PALETTE = [
   "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6",
@@ -667,7 +670,7 @@ app.innerHTML = `
       </section>
 
       <!-- Day Timeline Editor -->
-      <section class="panel">
+      <section class="panel" id="timeline-editor-panel">
         <div class="panel-header">
           <div class="panel-title-row">
             <h2>Day timeline editor</h2>
@@ -726,11 +729,18 @@ app.innerHTML = `
       <section class="panel">
         <div class="panel-header">
           <h2>Off days</h2>
-          <div class="btn-row">
-            <button class="btn btn-sm" id="btn-add-offday">Manage off days</button>
+          <div class="btn-row offcal-nav">
+            <button class="btn btn-sm" id="offcal-prev" aria-label="Previous month">‹</button>
+            <span class="offcal-title" id="offcal-title"></span>
+            <button class="btn btn-sm" id="offcal-next" aria-label="Next month">›</button>
+            <button class="btn btn-sm" id="btn-add-offday">Manage</button>
           </div>
         </div>
-        <ul id="offday-list" class="offday-list"></ul>
+        <div class="calendar-days-header">
+          <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+        </div>
+        <div class="calendar-grid" id="offcal-grid"></div>
+        <p class="muted offcal-hint">Click a day to toggle it as an off day. Use “Manage” for bulk ranges.</p>
       </section>
     </div>
 
@@ -1563,12 +1573,12 @@ function initTimelineDrag() {
     if (e.cancelable) e.preventDefault();
     brushPainting = true;
     brushStroke = new Set();
-    void stampNoteOnBlock(blk);
+    brushPending.push(stampNoteOnBlock(blk));
   };
   const brushOver = (e: MouseEvent) => {
     if (!brushActive || !brushPainting) return;
     const blk = brushBlockFromEvent(e);
-    if (blk) void stampNoteOnBlock(blk);
+    if (blk) brushPending.push(stampNoteOnBlock(blk));
   };
   track.addEventListener("mousedown", brushDown);
   track.addEventListener("touchstart", brushDown, { passive: false });
@@ -1577,7 +1587,7 @@ function initTimelineDrag() {
     if (!brushActive || !brushPainting) return;
     const t = e.touches[0];
     const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
-    if (el) void stampNoteOnBlock(el);
+    if (el) brushPending.push(stampNoteOnBlock(el));
   }, { passive: true });
 
   // Grab the selection body to move the whole window.
@@ -1641,7 +1651,16 @@ function initTimelineDrag() {
   };
 
   const onEnd = () => {
-    if (brushPainting) { brushPainting = false; if (brushDirty) { brushDirty = false; void refresh(); performSync(); } }
+    if (brushPainting) {
+      brushPainting = false;
+      if (brushDirty) {
+        brushDirty = false;
+        // Await the stroke's writes before reconciling, or the refresh read
+        // races the writes and reverts the freshly-stamped notes.
+        const pend = brushPending; brushPending = [];
+        void Promise.allSettled(pend).then(() => { void refresh(); performSync(); });
+      }
+    }
     // A click (drag with no movement) on a segment selects that segment's range.
     const wasClick = isTimelineDragging && timelineSelStartMin === timelineSelEndMin;
     isTimelineDragging = false;
@@ -1963,18 +1982,53 @@ async function refresh() {
     });
   });
 
-  // ── Off days ────────────────────────────────────────────────────
-  const list = document.getElementById("offday-list")!;
-  list.innerHTML = offDayList
-    .map((o) => `<li>${o.date} <button class="btn-icon rm-offday" data-date="${o.date}" title="Remove">&times;</button></li>`)
-    .join("");
-  list.querySelectorAll<HTMLButtonElement>(".rm-offday").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (btn.dataset.date) { await offDays.removeOffDay(btn.dataset.date); await refresh(); }
-    });
-  });
+  // ── Off days: monthly calendar ──────────────────────────────────
+  offDayDatesCache = new Set(offDayList.map((o) => o.date));
+  renderOffdayCalendar();
 
   syncTrayState();
+}
+
+// Inline monthly off-day calendar on the dashboard. Clicking a day toggles it;
+// bulk ranges still go through the "Manage" (date-range) dialog.
+let offCalYear = new Date().getFullYear();
+let offCalMonth = new Date().getMonth();
+let offDayDatesCache = new Set<string>();
+
+function renderOffdayCalendar() {
+  const grid = document.getElementById("offcal-grid");
+  const title = document.getElementById("offcal-title");
+  if (!grid || !title) return;
+  title.textContent = new Date(offCalYear, offCalMonth, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  grid.innerHTML = "";
+  const firstDay = new Date(offCalYear, offCalMonth, 1);
+  let startOffset = firstDay.getDay();
+  startOffset = startOffset === 0 ? 6 : startOffset - 1; // Monday-first
+  const numDays = new Date(offCalYear, offCalMonth + 1, 0).getDate();
+  const todayStr = localDateKey(new Date());
+  for (let i = 0; i < startOffset; i++) {
+    const empty = document.createElement("div");
+    empty.className = "cal-empty";
+    grid.appendChild(empty);
+  }
+  for (let day = 1; day <= numDays; day++) {
+    const cell = document.createElement("div");
+    cell.textContent = String(day);
+    const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    if (dateKey === todayStr) cell.classList.add("cal-today");
+    const isOff = offDayDatesCache.has(dateKey);
+    if (isOff) cell.classList.add("cal-offday");
+    cell.title = isOff ? "Off day — click to remove" : "Click to mark as an off day";
+    cell.addEventListener("click", async () => {
+      try {
+        if (isOff) await offDays.removeOffDay(dateKey);
+        else await offDays.addOffDay(dateKey);
+        await refresh();
+        performSync();
+      } catch (err) { console.error("Failed to toggle off day", err); }
+    });
+    grid.appendChild(cell);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2114,20 +2168,23 @@ function currentTrendView(): { start: Date | null; end: Date; granularity: strin
   return { start: null, end: new Date(), granularity: g };
 }
 
+// Relocate the whole timeline-editor PANEL (bar + assign controls + brush, which
+// are siblings) into the drill slot and back. Moving only the bar left the assign
+// controls and brush behind in the dashboard tab.
 function moveEditorIntoSlot() {
-  const wrapper = document.getElementById("timeline-editor-wrapper");
+  const panel = document.getElementById("timeline-editor-panel");
   const slot = document.getElementById("trend-drill-slot");
-  if (!wrapper || !slot || wrapper.parentElement === slot) return;
-  drillEditorOrigParent = wrapper.parentElement;
-  drillEditorOrigNext = wrapper.nextSibling;
-  slot.appendChild(wrapper);
+  if (!panel || !slot || panel.parentElement === slot) return;
+  drillEditorOrigParent = panel.parentElement;
+  drillEditorOrigNext = panel.nextSibling;
+  slot.appendChild(panel);
 }
 function restoreEditorHome() {
-  const wrapper = document.getElementById("timeline-editor-wrapper");
-  if (wrapper && drillEditorOrigParent) {
+  const panel = document.getElementById("timeline-editor-panel");
+  if (panel && drillEditorOrigParent) {
     if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
-      drillEditorOrigParent.insertBefore(wrapper, drillEditorOrigNext);
-    else drillEditorOrigParent.appendChild(wrapper);
+      drillEditorOrigParent.insertBefore(panel, drillEditorOrigNext);
+    else drillEditorOrigParent.appendChild(panel);
   }
   drillEditorOrigParent = null;
   drillEditorOrigNext = null;
@@ -2675,6 +2732,14 @@ document.getElementById("btn-add-shift")!.addEventListener("click", () => {
   performSync();
 });
 
+document.getElementById("offcal-prev")!.addEventListener("click", () => {
+  offCalMonth--; if (offCalMonth < 0) { offCalMonth = 11; offCalYear--; }
+  renderOffdayCalendar();
+});
+document.getElementById("offcal-next")!.addEventListener("click", () => {
+  offCalMonth++; if (offCalMonth > 11) { offCalMonth = 0; offCalYear++; }
+  renderOffdayCalendar();
+});
 document.getElementById("btn-add-offday")!.addEventListener("click", () => {
   clearDialogError("offday-form-error");
   (document.getElementById("inp-offday-start") as HTMLInputElement).value = localDateKey(new Date());

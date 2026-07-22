@@ -323,7 +323,7 @@ export function renderTracker(app: HTMLElement): void {
                 </div>
 
                 <!-- Day Timeline Editor -->
-                <div class="chart-panel">
+                <div class="chart-panel" id="timeline-editor-panel">
                     <div class="panel-title-row">
                         <h3>Day Timeline Editor</h3>
                         <span class="help-hint" tabindex="0" title="Click a bar in Weekly Performance to pick a day. Drag across the track to select a range (or click a segment to select it); drag the selection to move it, or its edges to resize. Then Assign a project — or Remove / press Delete to clear an assignment.">ⓘ</span>
@@ -428,9 +428,8 @@ export function renderTracker(app: HTMLElement): void {
                     <div class="avg-detail" id="avg-detail"></div>
                 </section>
 
-                <div class="tracker-layout">
-                    <!-- Left: Trends Chart -->
-                    <div class="chart-panel">
+                <!-- Trends Chart -->
+                <div class="chart-panel">
                         <div class="section-row" style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
                             <h3>Performance Trends</h3>
                             <div class="control-row" style="margin-bottom:0; gap:8px;">
@@ -458,15 +457,6 @@ export function renderTracker(app: HTMLElement): void {
                         </div>
                         <p class="trend-hint muted">Click a bar to edit that day’s sessions — week/month bars zoom in first.</p>
                         <div class="project-summary" id="project-summary"></div>
-                    </div>
-
-                    <!-- Right: Off-Days Manager -->
-                    <div class="chart-panel">
-                        <h3>Scheduled Off Days</h3>
-                        <ul class="offday-list" id="offday-list">
-                            <li class="muted">No off days scheduled.</li>
-                        </ul>
-                    </div>
                 </div>
 
                 <!-- Slide-down day editor: drill into any day from the trend chart -->
@@ -478,6 +468,23 @@ export function renderTracker(app: HTMLElement): void {
                     <div class="trend-drill-slot" id="trend-drill-slot">
                         <p class="muted trend-drill-empty" id="trend-drill-empty">Click a day bar above to edit that day’s sessions.</p>
                     </div>
+                </div>
+
+                <!-- Scheduled off days: monthly calendar (moved to the bottom) -->
+                <div class="chart-panel" id="offday-calendar-panel">
+                    <div class="section-row" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                        <h3>Scheduled Off Days</h3>
+                        <div class="offcal-nav">
+                            <button type="button" class="btn btn-outline btn-small" id="offcal-prev" aria-label="Previous month">‹</button>
+                            <span class="offcal-title" id="offcal-title"></span>
+                            <button type="button" class="btn btn-outline btn-small" id="offcal-next" aria-label="Next month">›</button>
+                        </div>
+                    </div>
+                    <div class="calendar-days-header" style="display:grid; grid-template-columns:repeat(7, 1fr); text-align:center; font-weight:700; font-size:0.7rem; color:var(--text-secondary); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.05em;">
+                        <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+                    </div>
+                    <div class="calendar-grid" id="offcal-grid" style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px;"></div>
+                    <p class="muted offcal-hint">Click a day to toggle it as an off day. Use “Manage Off Days” for bulk ranges.</p>
                 </div>
             </div>
 
@@ -738,6 +745,9 @@ export function renderTracker(app: HTMLElement): void {
 
     let shiftsCached: ShiftItem[] = [];
     let offDaysCached: OffDayItem[] = [];
+    // Inline off-day calendar (Statistics tab) — its own month cursor.
+    let offCalYear = new Date().getFullYear();
+    let offCalMonth = new Date().getMonth();
     let activeShiftCached: ShiftItem | null = null;
 
     // ── Projects state ───────────────────────────────────────────────
@@ -767,6 +777,10 @@ export function renderTracker(app: HTMLElement): void {
     let brushActive = false;
     let brushPainting = false;
     let brushDirty = false;
+    // In-flight note writes from the current brush stroke. The brush-end
+    // refreshData() must await these, else its GET can race ahead of the PUTs
+    // and revert the freshly-stamped notes.
+    let brushPending: Promise<unknown>[] = [];
 
     function projectById(uuid: string | null | undefined): ProjectItem | null {
         if (!uuid) return null;
@@ -1111,22 +1125,23 @@ export function renderTracker(app: HTMLElement): void {
         return { start: null, end: new Date(), granularity: g };
     }
 
-    // Relocate the single timeline editor into the drill slot (and back), so the
-    // full editor + brush is reused with zero duplication.
+    // Relocate the whole timeline-editor PANEL (bar + assign controls + brush,
+    // which are siblings) into the drill slot and back, so the full editor is
+    // reused with zero duplication. Moving only the bar left the controls behind.
     function moveEditorIntoSlot() {
-        const wrapper = document.getElementById("timeline-editor-wrapper");
+        const panel = document.getElementById("timeline-editor-panel");
         const slot = document.getElementById("trend-drill-slot");
-        if (!wrapper || !slot || wrapper.parentElement === slot) return;
-        drillEditorOrigParent = wrapper.parentElement;
-        drillEditorOrigNext = wrapper.nextSibling;
-        slot.appendChild(wrapper);
+        if (!panel || !slot || panel.parentElement === slot) return;
+        drillEditorOrigParent = panel.parentElement;
+        drillEditorOrigNext = panel.nextSibling;
+        slot.appendChild(panel);
     }
     function restoreEditorHome() {
-        const wrapper = document.getElementById("timeline-editor-wrapper");
-        if (wrapper && drillEditorOrigParent) {
+        const panel = document.getElementById("timeline-editor-panel");
+        if (panel && drillEditorOrigParent) {
             if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
-                drillEditorOrigParent.insertBefore(wrapper, drillEditorOrigNext);
-            else drillEditorOrigParent.appendChild(wrapper);
+                drillEditorOrigParent.insertBefore(panel, drillEditorOrigNext);
+            else drillEditorOrigParent.appendChild(panel);
         }
         drillEditorOrigParent = null; drillEditorOrigNext = null;
     }
@@ -1314,12 +1329,12 @@ export function renderTracker(app: HTMLElement): void {
             if (!blk) return;
             if (e.cancelable) e.preventDefault();
             brushPainting = true;
-            void stampNoteOnBlock(blk);
+            brushPending.push(stampNoteOnBlock(blk));
         };
         const brushOver = (e: MouseEvent) => {
             if (!brushActive || !brushPainting) return;
             const blk = brushBlockFromEvent(e);
-            if (blk) void stampNoteOnBlock(blk);
+            if (blk) brushPending.push(stampNoteOnBlock(blk));
         };
         track.addEventListener("mousedown", brushDown);
         track.addEventListener("touchstart", brushDown, { passive: false });
@@ -1328,7 +1343,7 @@ export function renderTracker(app: HTMLElement): void {
             if (!brushActive || !brushPainting) return;
             const t = e.touches[0];
             const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
-            if (el) void stampNoteOnBlock(el);
+            if (el) brushPending.push(stampNoteOnBlock(el));
         }, { passive: true });
 
         const startMove = (e: MouseEvent | TouchEvent) => {
@@ -1368,7 +1383,16 @@ export function renderTracker(app: HTMLElement): void {
             }
         };
         const onEnd = () => {
-            if (brushPainting) { brushPainting = false; if (brushDirty) { brushDirty = false; void refreshData(); } }
+            if (brushPainting) {
+                brushPainting = false;
+                if (brushDirty) {
+                    brushDirty = false;
+                    // Wait for the stroke's writes to commit before reconciling,
+                    // or the GET races the PUTs and reverts the stamped notes.
+                    const pend = brushPending; brushPending = [];
+                    void Promise.allSettled(pend).then(() => refreshData());
+                }
+            }
             const wasClick = tlDragging && timelineSelStartMin === timelineSelEndMin;
             tlDragging = false; tlResizeL = false; tlResizeR = false; tlMoving = false;
             if (wasClick) {
@@ -1621,6 +1645,52 @@ export function renderTracker(app: HTMLElement): void {
             }
         }
     }
+
+    // Inline monthly off-day calendar on the Statistics tab. Clicking a day
+    // toggles it; bulk ranges still go through the "Manage Off Days" modal.
+    function renderOffdayCalendar() {
+        const grid = document.getElementById("offcal-grid");
+        const title = document.getElementById("offcal-title");
+        if (!grid || !title) return;
+        title.textContent = `${monthNames[offCalMonth]} ${offCalYear}`;
+        grid.innerHTML = "";
+        const firstDay = new Date(offCalYear, offCalMonth, 1);
+        let startOffset = firstDay.getDay();
+        startOffset = startOffset === 0 ? 6 : startOffset - 1; // Monday-first
+        const numDays = new Date(offCalYear, offCalMonth + 1, 0).getDate();
+        const offDayIds = new Map(offDaysCached.map(o => [o.date, o.id]));
+        const todayStr = localDateKey(new Date());
+        for (let i = 0; i < startOffset; i++) {
+            const empty = document.createElement("div");
+            empty.className = "cal-empty";
+            grid.appendChild(empty);
+        }
+        for (let day = 1; day <= numDays; day++) {
+            const cell = document.createElement("div");
+            cell.textContent = String(day);
+            const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+            if (dateKey === todayStr) cell.classList.add("cal-today");
+            const offId = offDayIds.get(dateKey);
+            if (offId !== undefined) cell.classList.add("cal-offday");
+            cell.title = offId !== undefined ? "Off day — click to remove" : "Click to mark as an off day";
+            cell.addEventListener("click", async () => {
+                try {
+                    if (offId !== undefined) await deleteOffDay(offId);
+                    else await createOffDay(dateKey);
+                    await refreshData();
+                } catch (err) { console.error("Failed to toggle off day", err); }
+            });
+            grid.appendChild(cell);
+        }
+    }
+    document.getElementById("offcal-prev")?.addEventListener("click", () => {
+        offCalMonth--; if (offCalMonth < 0) { offCalMonth = 11; offCalYear--; }
+        renderOffdayCalendar();
+    });
+    document.getElementById("offcal-next")?.addEventListener("click", () => {
+        offCalMonth++; if (offCalMonth > 11) { offCalMonth = 0; offCalYear++; }
+        renderOffdayCalendar();
+    });
 
     manageOffdaysBtn.addEventListener("click", () => {
         calYear = new Date().getFullYear();
@@ -2197,33 +2267,8 @@ export function renderTracker(app: HTMLElement): void {
         renderProjectSummary(trendDatasets);
         syncDrillUI();
 
-        // 7. ── Render Off Days List ──────────────────────────────────
-        const offDayListEl = document.getElementById("offday-list")!;
-        if (offDaysCached.length === 0) {
-            offDayListEl.innerHTML = `<li class="muted">No off days scheduled.</li>`;
-        } else {
-            offDayListEl.innerHTML = offDaysCached
-                .sort((a, b) => b.date.localeCompare(a.date))
-                .map(o => `
-                    <li>
-                        <span>${o.date}</span>
-                        <button class="btn-icon rm-offday-btn" data-id="${o.id}" title="Remove Off Day">&times;</button>
-                    </li>
-                `).join("");
-
-            offDayListEl.querySelectorAll(".rm-offday-btn").forEach(btn => {
-                btn.addEventListener("click", async (e) => {
-                    const target = e.currentTarget as HTMLButtonElement;
-                    const id = Number(target.dataset.id);
-                    if (id && confirm("Delete this scheduled off day?")) {
-                        const delRes = await deleteOffDay(id);
-                        if (delRes.ok) {
-                            await refreshData();
-                        }
-                    }
-                });
-            });
-        }
+        // 7. ── Render the monthly off-day calendar ────────────────────
+        renderOffdayCalendar();
 
         // 8. ── Render Shifts Table History ────────────────────────────
         const tableBody = document.getElementById("shift-table-body")!;
