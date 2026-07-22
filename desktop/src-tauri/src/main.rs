@@ -186,6 +186,26 @@ async fn download_update_package() -> Result<String, String> {
     push_sync::download_latest_package().await
 }
 
+/// Save a generated report file (e.g. CSV) to the user's Downloads directory
+/// and return its full path. The webview can't write files directly, so report
+/// exports round-trip through here (mirrors how update packages are saved).
+#[tauri::command]
+fn save_download_file(name: String, contents: String) -> Result<String, String> {
+    // Keep the basename only, so a crafted name can't escape the target dir.
+    let base = std::path::Path::new(&name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "report.csv".to_string());
+    let dir = dirs::download_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(base);
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn start_shift() -> Result<bool, String> {
     let started = db::start_shift_row()?;
@@ -205,8 +225,13 @@ fn end_shift() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn add_manual_shift(start_time: String, end_time: String) -> Result<(), String> {
-    db::add_shift_manual_row(&start_time, &end_time)
+fn add_manual_shift(start_time: String, end_time: String, note: Option<String>) -> Result<(), String> {
+    db::add_shift_manual_row(&start_time, &end_time, note.as_deref())
+}
+
+#[tauri::command]
+fn set_shift_note(shift_id: i64, note: Option<String>) -> Result<(), String> {
+    db::set_shift_note_row(shift_id, note.as_deref())
 }
 
 #[tauri::command]
@@ -247,8 +272,17 @@ fn update_project(
     name: String,
     color: Option<String>,
     archived: bool,
+    rate: Option<String>,
+    currency: Option<String>,
 ) -> Result<(), String> {
-    db::update_project_row(&uuid, &name, color.as_deref(), archived)
+    db::update_project_row(
+        &uuid,
+        &name,
+        color.as_deref(),
+        archived,
+        rate.as_deref(),
+        currency.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -365,9 +399,11 @@ fn main() {
             is_self_updatable,
             open_url,
             download_update_package,
+            save_download_file,
             start_shift,
             end_shift,
             add_manual_shift,
+            set_shift_note,
             delete_shift,
             get_off_days,
             add_off_day,

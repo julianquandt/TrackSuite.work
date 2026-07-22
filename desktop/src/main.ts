@@ -20,6 +20,8 @@ import {
   type WorkdayKey,
 } from "./lib/domain";
 import { DEFAULT_WORK_SCHEDULE, getAdjustedWeeklyTargetHours, getTargetHoursForDate, getWeeklyTargetHours } from "./lib/workSchedule";
+import { isFullMode, loadMode, setModePersisted } from "./lib/mode";
+import { getRemoteProfile, saveRemoteProfile, type ReportProfile } from "./lib/api";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("App root not found");
@@ -49,6 +51,12 @@ let timelineMoveOrigStart = 0;
 let timelineMoveOrigEnd = 0;
 // The day's rendered segments, for click-to-select on the track.
 let timelineBlocks: { startMin: number; endMin: number; projectUuid: string | null }[] = [];
+// Note-brush state: when active, timeline blocks become clickable/draggable to
+// "stamp" the brush note onto their shift (range-drag is suppressed).
+let brushActive = false;
+let brushPainting = false;
+let brushDirty = false;
+let brushStroke = new Set<number>();
 
 const PROJECT_PALETTE = [
   "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6",
@@ -214,8 +222,12 @@ function localDateKey(d: Date): string {
 }
 
 function formatTimeFromMinutes(minutes: number): string {
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
+  // Round to whole minutes: block-click selections carry fractional minutes
+  // (derived from second-precision timestamps) that would otherwise render as
+  // "09:03.7833333333".
+  const total = Math.round(minutes);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
@@ -464,6 +476,7 @@ async function handleSystemResume() {
 const HEARTBEAT_MS = 5 * 60 * 1000;
 const STALE_MINUTES = 11; // ~2 missed beats before we consider a session dead
 let heartbeatTimer: number | null = null;
+let liveBlockTimer: number | null = null;
 
 function updateHeartbeat() {
   if (isTracking && heartbeatTimer === null) {
@@ -478,6 +491,15 @@ function updateHeartbeat() {
   } else if (!isTracking && heartbeatTimer !== null) {
     window.clearInterval(heartbeatTimer);
     heartbeatTimer = null;
+  }
+
+  // Per-second ticker that grows the live timeline block while tracking. There's
+  // no other sub-minute UI clock in the desktop app, so this is dedicated.
+  if (isTracking && liveBlockTimer === null) {
+    liveBlockTimer = window.setInterval(updateLiveTimelineBlock, 1000);
+  } else if (!isTracking && liveBlockTimer !== null) {
+    window.clearInterval(liveBlockTimer);
+    liveBlockTimer = null;
   }
 }
 
@@ -573,9 +595,12 @@ function updateWorkSchedulePreview() {
 
 // ── Tab state ───────────────────────────────────────────────────────
 
-type Tab = "dashboard" | "statistics" | "settings";
+type Tab = "dashboard" | "statistics" | "reports" | "settings";
 
 function switchTab(tab: Tab) {
+  // The trend drill borrows the timeline editor into the Statistics tab; send it
+  // home before showing any other tab (esp. the dashboard, which owns it).
+  if (tab !== "statistics") restoreDrill();
   document.querySelectorAll<HTMLElement>(".tab-page").forEach((p) => {
     const active = p.dataset.tab === tab;
     p.classList.toggle("tab-hidden", !active);
@@ -585,6 +610,7 @@ function switchTab(tab: Tab) {
   });
   if (tab === "dashboard") { refresh(); }
   if (tab === "settings") loadSettings();
+  if (tab === "reports") renderReportsTab();
   if (tab === "statistics") {
     refreshStats();
     if (trendChart) trendChart.resize();
@@ -605,6 +631,7 @@ app.innerHTML = `
       <nav class="tab-bar">
         <button class="tab-btn tab-active" data-tab="dashboard">Dashboard</button>
         <button class="tab-btn" data-tab="statistics">Statistics</button>
+        <button class="tab-btn tab-full-only" data-tab="reports" hidden>Reports</button>
         <button class="tab-btn" data-tab="settings">Settings</button>
       </nav>
       <div id="project-chip-wrap" class="project-chip-wrap"></div>
@@ -670,6 +697,11 @@ app.innerHTML = `
             <button class="btn btn-ghost btn-sm" id="btn-timeline-remove" disabled title="Clear the project from this range (or press Delete)">Remove</button>
           </div>
         </div>
+        <div class="timeline-brush" id="timeline-brush">
+          <button class="btn btn-ghost btn-sm" id="btn-brush-toggle" type="button" title="Paint a note onto shift blocks">🖌 Note brush</button>
+          <input type="text" id="timeline-brush-note" class="timeline-brush-input" placeholder="Turn on the brush, type a note, then click blocks to stamp it" maxlength="500" disabled>
+          <span class="muted timeline-brush-hint" id="timeline-brush-hint"></span>
+        </div>
       </section>
 
       <section class="panel">
@@ -684,7 +716,7 @@ app.innerHTML = `
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Project</th><th></th></tr>
+              <tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Project</th><th>Note</th><th></th></tr>
             </thead>
             <tbody id="shift-body"></tbody>
           </table>
@@ -772,12 +804,94 @@ app.innerHTML = `
           </label>
         </div>
         <div class="chart-wrap" style="height:280px"><canvas id="trend-chart"></canvas></div>
+        <p class="trend-hint muted">Click a bar to edit that day’s sessions — week/month bars zoom in first.</p>
         <div class="project-summary" id="project-summary"></div>
+
+        <!-- Slide-down day editor: drill into any day from the trend chart -->
+        <div id="trend-drill-panel" class="trend-drill-panel" hidden>
+          <div class="trend-drill-head">
+            <div class="trend-drill-crumbs" id="trend-drill-crumbs"></div>
+            <button type="button" class="btn btn-outline trend-drill-close" id="trend-drill-close">Close</button>
+          </div>
+          <div class="trend-drill-slot" id="trend-drill-slot">
+            <p class="muted trend-drill-empty" id="trend-drill-empty">Click a day bar above to edit that day’s sessions.</p>
+          </div>
+        </div>
       </section>
+    </div>
+
+    <!-- ═══ Reports tab (Full mode) ═══ -->
+    <div class="tab-page tab-hidden" data-tab="reports">
+      <section class="panel">
+        <div class="panel-header"><h2>Reports</h2></div>
+        <p class="muted">Generate a billable summary or a timesheet from your tracked time. Set your letterhead and per-project rates, pick a range, then export CSV or print to PDF.</p>
+      </section>
+
+      <details class="panel" id="rp-profile-panel">
+        <summary class="reports-summary-toggle"><strong>Letterhead &amp; Profile</strong><span class="muted"> — appears at the top of printed reports</span></summary>
+        <div id="rp-profile-unavailable" class="muted" hidden>Configure sync (server URL + key) in Settings to use the shared report profile.</div>
+        <div id="rp-profile-body" hidden>
+          <div class="reports-profile-grid">
+            <label>Your name<input type="text" id="pf-name" maxlength="120" placeholder="e.g. Alex Rivera"></label>
+            <label>Company<input type="text" id="pf-company" maxlength="120" placeholder="ACME GmbH"></label>
+            <label>Email<input type="text" id="pf-email" maxlength="160" placeholder="you@example.com"></label>
+            <label>Default currency<input type="text" id="pf-currency" maxlength="8" placeholder="EUR"></label>
+            <label class="span2">Address<textarea id="pf-address" rows="2" placeholder="Street 1&#10;12345 City"></textarea></label>
+            <label class="span2">Letterhead / header note<textarea id="pf-header" rows="2" placeholder="Invoice — freelance software work"></textarea></label>
+            <label class="span2">Footer<textarea id="pf-footer" rows="2" placeholder="Bank: … · IBAN: …"></textarea></label>
+          </div>
+          <div class="reports-custom-fields">
+            <h4>Custom fields</h4>
+            <p class="muted">Extra key/value lines for the letterhead (e.g. VAT ID).</p>
+            <div id="pf-custom-list"></div>
+            <button class="btn btn-outline btn-small" type="button" id="pf-add-field">+ Add field</button>
+          </div>
+          <div class="btn-row" style="margin-top:16px">
+            <button class="btn btn-primary" type="button" id="pf-save">Save profile</button>
+            <span class="muted" id="pf-status"></span>
+          </div>
+        </div>
+      </details>
+
+      <section class="panel no-print">
+        <div class="panel-header"><h2>Generate</h2></div>
+        <p class="muted">Hourly rates are set per project — open the project menu and choose <strong>Manage projects</strong>.</p>
+        <div class="reports-filter-grid">
+          <label>Style<select id="rp-style">
+            <option value="client">Client report (hours × rate)</option>
+            <option value="timesheet">Timesheet (hours vs target)</option>
+          </select></label>
+          <label>From<input type="date" id="rp-from"></label>
+          <label>To<input type="date" id="rp-to"></label>
+          <label>Project<select id="rp-project"><option value="">All projects</option></select></label>
+          <label class="reports-check" id="rp-detailed-wrap"><input type="checkbox" id="rp-detailed" checked> Itemized breakdown</label>
+          <label class="reports-check" id="rp-times-wrap"><input type="checkbox" id="rp-times"> Show work times (don't pool same day)</label>
+        </div>
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-primary" type="button" id="rp-generate">Generate</button>
+          <button class="btn btn-outline" type="button" id="rp-csv">Export CSV</button>
+          <button class="btn btn-outline" type="button" id="rp-print">Print / Save as PDF</button>
+        </div>
+      </section>
+
+      <section class="report-output" id="report-output" hidden></section>
     </div>
 
     <!-- ═══ Settings tab ═══ -->
     <div class="tab-page tab-hidden" data-tab="settings">
+      <section class="panel">
+        <div class="panel-header"><h2>Mode</h2></div>
+        <p class="muted"><strong>Simple</strong> keeps the app focused on tracking. <strong>Full</strong> adds billing rates, a report letterhead, and the Reports tab. Shift notes are available in both.</p>
+        <div class="form-grid">
+          <label class="form-label">App Mode
+            <select id="cfg-mode">
+              <option value="simple">Simple</option>
+              <option value="full">Full (reports &amp; billing)</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
       <section class="panel">
         <div class="panel-header"><h2>Work schedule</h2></div>
         <p class="muted">Set the scheduled hours for each day. Days with 0 hours are treated as non-working days, and off-days reduce your target by the configured hours for that specific date.</p>
@@ -885,6 +999,9 @@ app.innerHTML = `
           <input type="text" id="inp-shift-end-time" placeholder="17:30" inputmode="numeric" autocomplete="off" spellcheck="false" required>
         </label>
       </div>
+      <label style="display:block; margin-top: 10px;">Note (optional)
+        <input type="text" id="inp-shift-note" placeholder="What did you work on?" maxlength="500" autocomplete="off">
+      </label>
       <div class="btn-row modal-actions">
         <button class="btn btn-primary" type="submit">Add</button>
         <button class="btn btn-ghost" type="button" id="btn-cancel-shift">Cancel</button>
@@ -1081,10 +1198,18 @@ function renderProjectsManageList() {
     el.innerHTML = `<p class="muted">No projects yet — add one below.</p>`;
     return;
   }
-  el.innerHTML = projectsCache.map((p) => `
+  const showBilling = isFullMode();
+  const billingHint = showBilling
+    ? `<p class="pm-billing-hint">The <strong>Rate</strong> and <strong>Cur.</strong> boxes set each project's hourly rate + currency for reports (leave currency blank to use your default).</p>`
+    : "";
+  el.innerHTML = billingHint + projectsCache.map((p) => `
     <div class="project-manage-row" data-uuid="${p.uuid}">
       <input type="color" class="pm-color" value="${p.color || UNASSIGNED_FALLBACK}" title="Color">
       <input type="text" class="pm-name" value="${escapeHtml(p.name)}" maxlength="60">
+      ${showBilling ? `
+      <input type="text" class="pm-rate" value="${escapeHtml(p.rate ?? "")}" placeholder="Rate" title="Hourly rate for reports" inputmode="decimal">
+      <input type="text" class="pm-currency" value="${escapeHtml(p.currency ?? "")}" placeholder="Cur." title="Currency (e.g. EUR); blank uses your profile default" maxlength="8">
+      ` : ""}
       <label class="pm-archive"><input type="checkbox" class="pm-archived" ${p.archived ? "checked" : ""}> Archived</label>
       <button class="btn-icon pm-delete" type="button" title="Delete project">&times;</button>
     </div>`).join("");
@@ -1093,15 +1218,30 @@ function renderProjectsManageList() {
     const uuid = row.dataset.uuid!;
     const nameEl = row.querySelector(".pm-name") as HTMLInputElement;
     const colorEl = row.querySelector(".pm-color") as HTMLInputElement;
+    const rateEl = row.querySelector(".pm-rate") as HTMLInputElement | null;
+    const currencyEl = row.querySelector(".pm-currency") as HTMLInputElement | null;
     const archEl = row.querySelector(".pm-archived") as HTMLInputElement;
+    const proj = projectsCache.find((x) => x.uuid === uuid);
     const save = async () => {
-      await projects.updateProject(uuid, nameEl.value.trim() || "Untitled", colorEl.value, archEl.checked);
+      // Preserve existing billing when the fields aren't shown (Simple mode);
+      // otherwise take the edited values so a rename never wipes a rate.
+      let rate = proj?.rate ?? null;
+      let currency = proj?.currency ?? null;
+      if (rateEl && currencyEl) {
+        currency = currencyEl.value.trim().toUpperCase();
+        currencyEl.value = currency;
+        rate = rateEl.value.trim() === "" ? null : rateEl.value.trim();
+        currency = currency === "" ? null : currency;
+      }
+      await projects.updateProject(uuid, nameEl.value.trim() || "Untitled", colorEl.value, archEl.checked, { rate, currency });
       await loadProjects();
       renderProjectChip();
       performSync();
     };
     nameEl.addEventListener("change", save);
     colorEl.addEventListener("change", save);
+    rateEl?.addEventListener("change", save);
+    currencyEl?.addEventListener("change", save);
     archEl.addEventListener("change", save);
     row.querySelector(".pm-delete")!.addEventListener("click", async () => {
       await projects.deleteProject(uuid);
@@ -1119,7 +1259,51 @@ function openProjectsDialog() {
   (document.getElementById("dlg-projects") as HTMLDialogElement).showModal();
 }
 
+let timelineShiftsCache: ShiftRecord[] = [];
+
+// Stamp the brush note onto one shift block: optimistic DOM update + persist.
+// Skips blocks already painted in this stroke so a drag doesn't re-write them.
+async function stampNoteOnBlock(el: HTMLElement): Promise<void> {
+  const id = Number(el.dataset.shiftId);
+  if (!id || brushStroke.has(id)) return;
+  brushStroke.add(id);
+  const raw = (document.getElementById("timeline-brush-note") as HTMLInputElement).value.trim();
+  const newNote = raw === "" ? null : raw;
+  el.classList.toggle("has-note", !!newNote);
+  el.classList.add("just-stamped");
+  setTimeout(() => el.classList.remove("just-stamped"), 400);
+  const dot = el.querySelector(".tl-note-dot");
+  if (newNote && !dot) el.insertAdjacentHTML("beforeend", `<span class="tl-note-dot">•</span>`);
+  else if (!newNote && dot) dot.remove();
+  brushDirty = true;
+  await shifts.setShiftNote(id, newNote);
+}
+
+function initBrush() {
+  const toggle = document.getElementById("btn-brush-toggle") as HTMLButtonElement | null;
+  const input = document.getElementById("timeline-brush-note") as HTMLInputElement | null;
+  const hint = document.getElementById("timeline-brush-hint");
+  const wrapper = document.getElementById("timeline-editor-wrapper");
+  if (!toggle || !input || !hint || !wrapper) return;
+  toggle.addEventListener("click", () => {
+    brushActive = !brushActive;
+    toggle.classList.toggle("active", brushActive);
+    wrapper.classList.toggle("brush-mode", brushActive);
+    input.disabled = !brushActive;
+    if (brushActive) {
+      timelineSelStartMin = timelineSelEndMin = 0;
+      updateSelectionUI();
+      hint.textContent = "Click a block to stamp the note; drag across to cover several. Empty note = erase.";
+      input.focus();
+    } else {
+      hint.textContent = "";
+    }
+    renderTimelineShifts(timelineShiftsCache);
+  });
+}
+
 function renderTimelineShifts(allShifts: ShiftRecord[]) {
+  timelineShiftsCache = allShifts;
   const track = document.getElementById("timeline-track");
   if (!track) return;
 
@@ -1143,10 +1327,29 @@ function renderTimelineShifts(allShifts: ShiftRecord[]) {
     .map((s) => {
       const startMin = (Math.max(new Date(s.startTime).getTime(), dayStartMs) - dayStartMs) / 60000;
       const endMin = (Math.min(new Date(s.endTime!).getTime(), dayEndMs) - dayStartMs) / 60000;
-      return { s, startMin, endMin };
+      return { s, startMin, endMin, live: false };
     });
 
-  timelineHasShifts = blocks.length > 0;
+  // The running shift has no endTime, so it never lands in `blocks`. Render it as
+  // a live block whose right edge tracks "now" (capped to the day) and grows on a
+  // per-second tick — see updateLiveTimelineBlock().
+  const nowMs = Date.now();
+  const active = allShifts.find((s) => !s.endTime);
+  let liveEntry: { s: ShiftRecord; startMin: number; endMin: number; live: boolean } | null = null;
+  if (active) {
+    const st = new Date(active.startTime).getTime();
+    if (st < dayEndMs && Math.min(nowMs, dayEndMs) > dayStartMs) {
+      liveEntry = {
+        s: active,
+        startMin: (Math.max(st, dayStartMs) - dayStartMs) / 60000,
+        endMin: (Math.min(nowMs, dayEndMs) - dayStartMs) / 60000,
+        live: true,
+      };
+    }
+  }
+
+  const entries = liveEntry ? [...blocks, liveEntry] : blocks;
+  timelineHasShifts = entries.length > 0;
   const container = document.getElementById("timeline-container");
   const ticksEl = document.getElementById("timeline-ticks");
   const emptyEl = document.getElementById("timeline-empty");
@@ -1155,6 +1358,8 @@ function renderTimelineShifts(allShifts: ShiftRecord[]) {
   if (emptyEl) emptyEl.hidden = timelineHasShifts;
 
   renderTimelineDayLabel();
+  // Range-assign occupancy excludes the open shift: splitting a running shift by
+  // range is not supported. The live block stays note-brushable only.
   timelineBlocks = blocks.map((b) => ({ startMin: b.startMin, endMin: b.endMin, projectUuid: b.s.projectUuid ?? null }));
 
   if (!timelineHasShifts) {
@@ -1164,8 +1369,8 @@ function renderTimelineShifts(allShifts: ShiftRecord[]) {
   }
 
   // Zoom the window to the worked span (± 30 min padding, snapped to 30 min).
-  const minStart = Math.min(...blocks.map((b) => b.startMin));
-  const maxEnd = Math.max(...blocks.map((b) => b.endMin));
+  const minStart = Math.min(...entries.map((b) => b.startMin));
+  const maxEnd = Math.max(...entries.map((b) => b.endMin));
   timelineSpanStart = Math.max(0, Math.floor((minStart - 30) / 30) * 30);
   timelineSpanEnd = Math.min(1440, Math.ceil((maxEnd + 30) / 30) * 30);
   if (timelineSpanEnd - timelineSpanStart < 60) {
@@ -1173,12 +1378,16 @@ function renderTimelineShifts(allShifts: ShiftRecord[]) {
   }
   const span = timelineSpanEnd - timelineSpanStart;
 
-  for (const b of blocks) {
+  for (const b of entries) {
     const start = new Date(b.s.startTime);
-    const end = new Date(b.s.endTime!);
     const blockColor = projectColor(b.s.projectUuid);
     const shiftDiv = document.createElement("div");
     shiftDiv.className = "timeline-shift";
+    const note = b.s.note ?? "";
+    if (note) shiftDiv.classList.add("has-note");
+    if (brushActive) shiftDiv.classList.add("brushable");
+    if (b.live) { shiftDiv.classList.add("timeline-live"); shiftDiv.id = "timeline-live-block"; }
+    shiftDiv.dataset.shiftId = String(b.s.id);
     shiftDiv.style.left = `${((b.startMin - timelineSpanStart) / span) * 100}%`;
     shiftDiv.style.width = `${((b.endMin - b.startMin) / span) * 100}%`;
     shiftDiv.style.backgroundColor = blockColor;
@@ -1187,12 +1396,42 @@ function renderTimelineShifts(allShifts: ShiftRecord[]) {
 
     const name = projectName(b.s.projectUuid);
     const durHours = (b.endMin - b.startMin) / 60;
-    shiftDiv.innerText = `${name} (${durHours.toFixed(1)}h)`;
-    shiftDiv.title = `${name}: ${start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} – ${end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+    shiftDiv.innerHTML = `<span class="tl-shift-label">${escapeHtml(name)} (${durHours.toFixed(1)}h)</span>${note ? `<span class="tl-note-dot">•</span>` : ""}`;
+    const from = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (b.live) {
+      shiftDiv.title = note ? `${name}: ${from} – now (running)\nNote: ${note}` : `${name}: ${from} – now (running)`;
+    } else {
+      const times = `${from} – ${new Date(b.s.endTime!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+      shiftDiv.title = note ? `${name}: ${times}\nNote: ${note}` : `${name}: ${times}`;
+    }
     track.appendChild(shiftDiv);
   }
 
   renderTimelineTicks();
+}
+
+// Grow the live (running-shift) block each second without a full re-render, so
+// the timeline reflects the active session in real time. Re-pads the whole strip
+// only when the block outgrows the padded span, and never yanks the DOM out from
+// under an in-progress drag/brush stroke.
+function updateLiveTimelineBlock() {
+  const active = timelineShiftsCache.find((s) => !s.endTime);
+  if (!active) return;
+  const el = document.getElementById("timeline-live-block") as HTMLElement | null;
+  if (!el) return;
+  if (isTimelineDragging || isTimelineResizingLeft || isTimelineResizingRight || isTimelineMoving || brushPainting) return;
+  const dayStartMs = parseLocalDate(timelineDate || localDateKey(new Date()), "00:00:00").getTime();
+  const dayEndMs = dayStartMs + 1440 * 60000;
+  const st = new Date(active.startTime).getTime();
+  if (st >= dayEndMs) return;
+  const startMin = (Math.max(st, dayStartMs) - dayStartMs) / 60000;
+  const endMin = (Math.min(Date.now(), dayEndMs) - dayStartMs) / 60000;
+  if (endMin > timelineSpanEnd) { renderTimelineShifts(timelineShiftsCache); return; }
+  const span = timelineSpanEnd - timelineSpanStart;
+  el.style.left = `${((startMin - timelineSpanStart) / span) * 100}%`;
+  el.style.width = `${((endMin - startMin) / span) * 100}%`;
+  const label = el.querySelector(".tl-shift-label");
+  if (label) label.textContent = `${projectName(active.projectUuid)} (${((endMin - startMin) / 60).toFixed(1)}h)`;
 }
 
 function renderTimelineTicks() {
@@ -1267,7 +1506,7 @@ function updateSelectionUI() {
 
     const startStr = formatTimeFromMinutes(timelineSelStartMin);
     const endStr = formatTimeFromMinutes(timelineSelEndMin);
-    const durMin = timelineSelEndMin - timelineSelStartMin;
+    const durMin = Math.round(timelineSelEndMin - timelineSelStartMin);
     const h = Math.floor(durMin / 60);
     const m = durMin % 60;
     const durStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
@@ -1298,6 +1537,7 @@ function initTimelineDrag() {
   if (!track || !handleLeft || !handleRight || !selectionEl) return;
 
   const startDrag = (e: MouseEvent | TouchEvent) => {
+    if (brushActive) return; // brush mode owns block clicks; no range-select
     // Clicks on the selection are handled by its own move/resize listeners.
     if (selectionEl.contains(e.target as Node)) return;
 
@@ -1306,12 +1546,39 @@ function initTimelineDrag() {
     timelineSelStartMin = timelineDragStartMin;
     timelineSelEndMin = timelineDragStartMin;
     updateSelectionUI();
-    
+
     if (e.cancelable) e.preventDefault();
   };
 
   track.addEventListener("mousedown", startDrag);
   track.addEventListener("touchstart", startDrag, { passive: false });
+
+  // Note-brush painting: stamp the brush note onto blocks in brush mode.
+  const brushBlockFromEvent = (e: Event): HTMLElement | null =>
+    (e.target as HTMLElement)?.closest(".timeline-shift") as HTMLElement | null;
+  const brushDown = (e: MouseEvent | TouchEvent) => {
+    if (!brushActive) return;
+    const blk = brushBlockFromEvent(e);
+    if (!blk) return;
+    if (e.cancelable) e.preventDefault();
+    brushPainting = true;
+    brushStroke = new Set();
+    void stampNoteOnBlock(blk);
+  };
+  const brushOver = (e: MouseEvent) => {
+    if (!brushActive || !brushPainting) return;
+    const blk = brushBlockFromEvent(e);
+    if (blk) void stampNoteOnBlock(blk);
+  };
+  track.addEventListener("mousedown", brushDown);
+  track.addEventListener("touchstart", brushDown, { passive: false });
+  track.addEventListener("mouseover", brushOver);
+  track.addEventListener("touchmove", (e) => {
+    if (!brushActive || !brushPainting) return;
+    const t = e.touches[0];
+    const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
+    if (el) void stampNoteOnBlock(el);
+  }, { passive: true });
 
   // Grab the selection body to move the whole window.
   const startMove = (e: MouseEvent | TouchEvent) => {
@@ -1374,6 +1641,7 @@ function initTimelineDrag() {
   };
 
   const onEnd = () => {
+    if (brushPainting) { brushPainting = false; if (brushDirty) { brushDirty = false; void refresh(); performSync(); } }
     // A click (drag with no movement) on a segment selects that segment's range.
     const wasClick = isTimelineDragging && timelineSelStartMin === timelineSelEndMin;
     isTimelineDragging = false;
@@ -1455,6 +1723,7 @@ function initTimeline() {
   });
 
   initTimelineDrag();
+  initBrush();
 }
 
 type BarRadius = { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number };
@@ -1649,10 +1918,43 @@ async function refresh() {
         <td>${dateStr}</td><td>${startStr}</td><td>${endStr}</td>
         <td>${formatDuration(d)}</td>
         <td><span class="shift-project-tag"><span class="project-dot" style="background:${projectColor(s.projectUuid)}"></span>${escapeHtml(projectName(s.projectUuid))}</span></td>
+        <td><input type="text" class="shift-note-input" data-id="${s.id}" value="${escapeHtml(s.note ?? "")}" placeholder="Add note…" maxlength="500" title="Enter: save and move down · ↓: copy the note from the row above"></td>
         <td><button class="btn-icon delete-shift" data-id="${s.id}" title="Delete">&times;</button></td>
       </tr>`;
     })
     .join("");
+
+  const saveNoteInput = async (input: HTMLInputElement) => {
+    const id = Number(input.dataset.id);
+    if (!id) return;
+    const note = input.value.trim();
+    const newNote = note === "" ? null : note;
+    const rec = allShifts.find((x) => x.id === id);
+    if (rec && (rec.note ?? null) === newNote) return;
+    await shifts.setShiftNote(id, newNote);
+    if (rec) rec.note = newNote;
+    performSync();
+  };
+  tbody.querySelectorAll<HTMLInputElement>(".shift-note-input").forEach((input) => {
+    input.addEventListener("change", () => void saveNoteInput(input));
+    // Carry-down flow: Enter saves and drops to the next row; ↓ copies the note
+    // from the row above (fast repeats without copy-paste).
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void saveNoteInput(input);
+        const next = input.closest("tr")?.nextElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+        next?.focus();
+      } else if (e.key === "ArrowDown") {
+        const prev = input.closest("tr")?.previousElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+        if (prev) {
+          e.preventDefault();
+          input.value = prev.value;
+          void saveNoteInput(input);
+        }
+      }
+    });
+  });
 
   tbody.querySelectorAll<HTMLButtonElement>(".delete-shift").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -1786,30 +2088,174 @@ function weekKey(d: Date): string {
   return `${d.getFullYear()}-W${String(wn).padStart(2, "0")}`;
 }
 
+// ── Trend-chart drill-down: reach & edit ANY day's sessions ──────────
+// The trend chart already spans arbitrary history; clicking a bar drills in.
+// A day bar opens that day's timeline editor (moved into the slide-down slot in
+// the Statistics tab); a week/month bar zooms the chart into its days first. A
+// breadcrumb walks back out. This is the only path to backfill projects/notes on
+// days older than the current week.
+type TrendDrillLevel = { start: Date; end: Date; granularity: string; label: string };
+let trendDrillStack: TrendDrillLevel[] = [];
+let trendBucketRange: Record<string, { start: number; end: number }> = {};
+let trendLabelsCurrent: string[] = [];
+let trendGranularityCurrent = "day";
+let drillDay: string | null = null;
+let drillEditorOrigParent: HTMLElement | null = null;
+let drillEditorOrigNext: Node | null = null;
+// Cached inputs so drill navigation can re-render the chart without refreshStats.
+let trendLastShifts: ShiftRecord[] = [];
+let trendLastOffDays: Set<string> = new Set();
+let trendLastHolidays = false;
+
+function currentTrendView(): { start: Date | null; end: Date; granularity: string } {
+  const top = trendDrillStack[trendDrillStack.length - 1];
+  if (top) return { start: top.start, end: top.end, granularity: top.granularity };
+  const g = (document.getElementById("trend-granularity") as HTMLSelectElement)?.value || "day";
+  return { start: null, end: new Date(), granularity: g };
+}
+
+function moveEditorIntoSlot() {
+  const wrapper = document.getElementById("timeline-editor-wrapper");
+  const slot = document.getElementById("trend-drill-slot");
+  if (!wrapper || !slot || wrapper.parentElement === slot) return;
+  drillEditorOrigParent = wrapper.parentElement;
+  drillEditorOrigNext = wrapper.nextSibling;
+  slot.appendChild(wrapper);
+}
+function restoreEditorHome() {
+  const wrapper = document.getElementById("timeline-editor-wrapper");
+  if (wrapper && drillEditorOrigParent) {
+    if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
+      drillEditorOrigParent.insertBefore(wrapper, drillEditorOrigNext);
+    else drillEditorOrigParent.appendChild(wrapper);
+  }
+  drillEditorOrigParent = null;
+  drillEditorOrigNext = null;
+}
+
+function rerenderTrend() {
+  refreshTrendChart(trendLastShifts, trendLastOffDays, trendLastHolidays);
+}
+
+function openDayDrill(dateKey: string) {
+  drillDay = dateKey;
+  moveEditorIntoSlot();
+  const empty = document.getElementById("trend-drill-empty");
+  if (empty) empty.hidden = true;
+  setTimelineDay(dateKey, trendLastShifts);
+  syncDrillUI();
+  document.getElementById("trend-drill-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// Restore the editor to its dashboard home and reset drill state. Used both by
+// the Close button and when leaving the Statistics tab.
+function restoreDrill() {
+  restoreEditorHome();
+  trendDrillStack = [];
+  drillDay = null;
+  const empty = document.getElementById("trend-drill-empty");
+  if (empty) empty.hidden = false;
+  const panel = document.getElementById("trend-drill-panel");
+  if (panel) panel.hidden = true;
+}
+
+function closeTrendDrill() {
+  restoreDrill();
+  rerenderTrend();
+}
+
+function drillToLevel(level: number) {
+  restoreEditorHome();
+  trendDrillStack = level < 0 ? [] : trendDrillStack.slice(0, level + 1);
+  drillDay = null;
+  const empty = document.getElementById("trend-drill-empty");
+  if (empty) empty.hidden = false;
+  rerenderTrend();
+}
+
+function onTrendBarClick(index: number) {
+  const bk = trendLabelsCurrent[index];
+  if (bk == null) return;
+  if (trendGranularityCurrent === "day") { openDayDrill(bk); return; }
+  const range = trendBucketRange[bk];
+  if (!range) return;
+  const startD = new Date(range.start);
+  const label = trendGranularityCurrent === "week"
+    ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    : startD.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  trendDrillStack.push({ start: startD, end: new Date(range.end), granularity: "day", label });
+  drillDay = null;
+  const empty = document.getElementById("trend-drill-empty");
+  if (empty) empty.hidden = false;
+  rerenderTrend();
+}
+
+function syncDrillUI() {
+  const panel = document.getElementById("trend-drill-panel");
+  const crumbs = document.getElementById("trend-drill-crumbs");
+  if (!panel || !crumbs) return;
+  const open = trendDrillStack.length > 0 || drillDay != null;
+  panel.hidden = !open;
+  if (!open) return;
+  const parts = [`<button type="button" class="crumb" data-level="-1">All</button>`];
+  trendDrillStack.forEach((lvl, i) => {
+    parts.push(`<span class="crumb-sep">▸</span><button type="button" class="crumb" data-level="${i}">${escapeHtml(lvl.label)}</button>`);
+  });
+  if (drillDay) {
+    const d = new Date(drillDay + "T00:00:00");
+    parts.push(`<span class="crumb-sep">▸</span><span class="crumb crumb-current">${escapeHtml(d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }))}</span>`);
+  }
+  crumbs.innerHTML = parts.join("");
+  crumbs.querySelectorAll(".crumb[data-level]").forEach((b) =>
+    b.addEventListener("click", () => drillToLevel(parseInt((b as HTMLElement).dataset.level!))));
+}
+
 function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, includeHolidays: boolean) {
+  // Cache inputs so drill navigation can re-render without a full refreshStats.
+  trendLastShifts = allShifts;
+  trendLastOffDays = offDayDates;
+  trendLastHolidays = includeHolidays;
+
   const countEl = document.getElementById("trend-count") as HTMLInputElement;
   const unitEl = document.getElementById("trend-unit") as HTMLSelectElement;
-  const granEl = document.getElementById("trend-granularity") as HTMLSelectElement;
-  const trendCount = parseInt(countEl.value) || 7;
-  const trendUnit = unitEl.value;
-  const granularity = granEl.value;
   const now = new Date();
 
+  // Honour the drill stack: a drilled-in view fixes the range + granularity
+  // (e.g. the 7 days of a clicked week); otherwise use the user's selects.
+  const drillView = currentTrendView();
+  const granularity = drillView.granularity;
   let trendStart: Date;
-  if (trendUnit === "days") trendStart = addDays(now, -trendCount);
-  else if (trendUnit === "weeks") trendStart = addDays(now, -trendCount * 7);
-  else trendStart = addDays(now, -trendCount * 30);
+  let trendEnd = now;
+  if (drillView.start) {
+    trendStart = new Date(drillView.start);
+    trendEnd = new Date(drillView.end);
+  } else {
+    const trendCount = parseInt(countEl.value) || 7;
+    const trendUnit = unitEl.value;
+    if (trendUnit === "days") trendStart = addDays(now, -trendCount);
+    else if (trendUnit === "weeks") trendStart = addDays(now, -trendCount * 7);
+    else trendStart = addDays(now, -trendCount * 30);
+  }
   trendStart.setHours(0, 0, 0, 0);
+  const trendEndMs = new Date(trendEnd).setHours(23, 59, 59, 999);
 
-  const relevant = allShifts.filter((s) => new Date(s.startTime) >= trendStart);
+  const relevant = allShifts.filter((s) => {
+    const t = new Date(s.startTime).getTime();
+    return t >= trendStart.getTime() && t <= trendEndMs;
+  });
 
-  // Establish ordered buckets and accumulate off-day credited hours.
+  // Ordered buckets, each bucket's day range (for drill), + off-day credit.
   const bucketKeys: string[] = [];
+  const bucketRange: Record<string, { start: number; end: number }> = {};
   const offdayCredit: Record<string, number> = {};
   const cursor = new Date(trendStart);
-  while (cursor <= now) {
+  while (cursor.getTime() <= trendEndMs) {
     const bk = bucketKey(cursor, granularity);
     if (!bucketKeys.includes(bk)) bucketKeys.push(bk);
+    const dayMs = cursor.getTime();
+    const r = bucketRange[bk];
+    if (!r) bucketRange[bk] = { start: dayMs, end: dayMs };
+    else { if (dayMs < r.start) r.start = dayMs; if (dayMs > r.end) r.end = dayMs; }
     const dk = localDateKey(cursor);
     const targetHours = getTargetHoursForDate(cursor, currentWorkSchedule);
     if (includeHolidays && offDayDates.has(dk) && targetHours > 0) {
@@ -1819,6 +2265,10 @@ function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, i
   }
   const labels = [...bucketKeys].sort();
   const idxOf = (bk: string) => labels.indexOf(bk);
+  // Cache for the bar-click drill handler.
+  trendLabelsCurrent = labels;
+  trendGranularityCurrent = granularity;
+  trendBucketRange = bucketRange;
 
   const datasets = buildProjectStackDatasets(
     labels.length,
@@ -1850,6 +2300,8 @@ function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, i
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
+        onClick: (_evt, els) => { if (els.length) onTrendBarClick(els[0].index); },
+        onHover: (evt, els) => { const t = evt.native?.target as HTMLElement | undefined; if (t) t.style.cursor = els.length ? "pointer" : "default"; },
         plugins: { legend: { display: datasets.length > 1, position: "bottom" } },
         scales: {
           x: { stacked: true, grid: { display: false }, ticks: { maxRotation: 45 } },
@@ -1860,6 +2312,7 @@ function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, i
   }
 
   renderProjectSummary(datasets);
+  syncDrillUI();
 }
 
 /** Compact "Hours by project" totals for the trend range, shown under the chart. */
@@ -1888,8 +2341,14 @@ function bucketKey(d: Date, granularity: string): string {
 
 // Wire stats controls
 for (const id of ["stats-unit", "stats-count", "stats-holidays", "trend-count", "trend-unit", "trend-granularity"]) {
-  document.getElementById(id)!.addEventListener("change", () => refreshStats());
+  document.getElementById(id)!.addEventListener("change", () => {
+    // Changing the trend range/granularity redefines the root view — drop any
+    // active drill so the fresh selection isn't overridden by a stale level.
+    if (id.startsWith("trend-")) restoreDrill();
+    refreshStats();
+  });
 }
+document.getElementById("trend-drill-close")!.addEventListener("click", closeTrendDrill);
 
 // ═══════════════════════════════════════════════════════════════════
 //  SETTINGS + SYNC
@@ -1991,11 +2450,33 @@ async function loadSettings() {
     applyAppearance(app);
   }
 
+  (document.getElementById("cfg-mode") as HTMLSelectElement).value = isFullMode() ? "full" : "simple";
+
   // Autostart state
   try {
     (document.getElementById("cfg-autostart") as HTMLInputElement).checked = await autostartIsEnabled();
   } catch { /* plugin may not be available in dev */ }
 }
+
+// Show/hide Full-mode-only surfaces (the Reports tab button) based on mode.
+function applyMode() {
+  const full = isFullMode();
+  document.querySelectorAll<HTMLElement>(".tab-full-only").forEach((el) => {
+    el.hidden = !full;
+  });
+  if (!full) {
+    const reportsActive = document.querySelector<HTMLElement>('.tab-page[data-tab="reports"]:not(.tab-hidden)');
+    if (reportsActive) switchTab("dashboard");
+  }
+}
+
+document.getElementById("cfg-mode")?.addEventListener("change", async (e) => {
+  const mode = (e.target as HTMLSelectElement).value === "full" ? "full" : "simple";
+  await setModePersisted(mode);
+  applyMode();
+  // Re-render project management so rate/currency fields appear/disappear.
+  renderProjectsManageList();
+});
 
 document.getElementById("cfg-theme")?.addEventListener("change", async (e) => {
   const theme = (e.target as HTMLSelectElement).value as any;
@@ -2154,6 +2635,7 @@ document.getElementById("btn-add-shift")!.addEventListener("click", () => {
   (document.getElementById("inp-shift-end-date") as HTMLInputElement).value = today;
   (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = "";
   (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = "";
+  (document.getElementById("inp-shift-note") as HTMLInputElement).value = "";
   (document.getElementById("dlg-shift") as HTMLDialogElement).showModal();
   (document.getElementById("inp-shift-start-date") as HTMLInputElement).focus();
 });
@@ -2186,7 +2668,8 @@ document.getElementById("btn-add-shift")!.addEventListener("click", () => {
     return;
   }
 
-  await shifts.addManualShift(start, end);
+  const noteVal = (document.getElementById("inp-shift-note") as HTMLInputElement).value.trim();
+  await shifts.addManualShift(start, end, noteVal === "" ? null : noteVal);
   (document.getElementById("dlg-shift") as HTMLDialogElement).close("ok");
   await refresh();
   performSync();
@@ -2336,6 +2819,18 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "0.9.0",
+    date: "2026-07-22",
+    title: "Reports, billing & a smarter timeline",
+    changes: [
+      "New Simple/Full mode toggle (Settings → Mode). Simple keeps the clean tracker; Full unlocks billing, the letterhead profile and Reports.",
+      "Reports tab: generate a Client report (hours × rate, per-project totals) or a Timesheet (worked vs. your schedule), then print to PDF or export CSV. Set an hourly rate and currency per project, and a reusable letterhead in your profile.",
+      "Shift notes everywhere: jot what you worked on. On a multi-project day, use the 🖌 note brush to paint one note across several timeline blocks, or press Enter/↓ to carry a note down the sessions list.",
+      "The timeline now shows your running shift as a live block that grows in real time, instead of appearing only after you clock out.",
+      "Backfill older days: click any bar in the Statistics trend chart to open that day's editor — week and month bars zoom in first, with a breadcrumb to step back out. No more being stuck on the current week.",
+    ],
+  },
   {
     version: "0.8.4",
     date: "2026-07-14",
@@ -2518,12 +3013,367 @@ document.getElementById("btn-whats-new-close")?.addEventListener("click", () => 
   (document.getElementById("dlg-whats-new") as HTMLDialogElement).close();
 });
 
-loadSettings().then(async () => {
-  // Recover a shift the app couldn't clock out last run before the first paint.
-  await checkStaleAndRecover();
-  refresh();
-  performSync();
-  maybeShowOnboarding();
-  void maybeShowWhatsNew();
-  checkForUpdates();
-});
+// ── Reports tab (Full mode) ─────────────────────────────────────────
+let rpProfile: ReportProfile = {};
+let rpShifts: ShiftRecord[] = [];
+let rpOffDaySet = new Set<string>();
+let rpWired = false;
+let rpProfileAvailable = false;
+
+const RP_WEEKDAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function rpEl<T extends HTMLElement = HTMLElement>(id: string): T {
+  return document.getElementById(id) as T;
+}
+function fmtHoursNum(h: number): string { return h.toFixed(2); }
+function fmtMoney(a: number): string {
+  return a.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function signedHoursNum(h: number): string {
+  const r = Math.round(h * 100) / 100;
+  return (r >= 0 ? "+" : "") + r.toFixed(2);
+}
+function reportCsvCell(v: string): string {
+  let s = v ?? "";
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+interface RpLineItem {
+  date: string; startTime: string; endTime: string | null;
+  projectName: string; projectUuid: string | null; note: string;
+  hours: number; rate: number | null; currency: string; amount: number | null;
+}
+
+interface RpDetailRow {
+  date: string; times: string; projectName: string; note: string;
+  hours: number; amount: number | null; currency: string;
+}
+
+function rpFmtTime(iso: string): string {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function rpBuildLineItems(): RpLineItem[] {
+  const fromMs = new Date(rpEl<HTMLInputElement>("rp-from").value + "T00:00:00").getTime();
+  const toMs = new Date(rpEl<HTMLInputElement>("rp-to").value + "T23:59:59.999").getTime();
+  const projFilter = rpEl<HTMLSelectElement>("rp-project").value || null;
+  const defaultCurrency = (rpProfile.default_currency ?? "").toUpperCase();
+  return rpShifts
+    .filter((s) => s.endTime !== null)
+    .filter((s) => { const ms = new Date(s.startTime).getTime(); return ms >= fromMs && ms <= toMs; })
+    .filter((s) => (projFilter ? (s.projectUuid ?? null) === projFilter : true))
+    .sort((a, b) => a.startTime.localeCompare(b.startTime))
+    .map((s) => {
+      const proj = projectsCache.find((p) => p.uuid === (s.projectUuid ?? null));
+      const hours = shiftDurationHours(s);
+      const rateNum = proj && proj.rate != null && proj.rate !== "" ? parseFloat(proj.rate) : null;
+      const currency = (proj?.currency && proj.currency !== "" ? proj.currency : defaultCurrency).toUpperCase();
+      const rate = rateNum != null && !Number.isNaN(rateNum) ? rateNum : null;
+      const amount = rate != null ? hours * rate : null;
+      return { date: localDateKey(new Date(s.startTime)), startTime: s.startTime, endTime: s.endTime, projectName: proj?.name ?? "Unassigned", projectUuid: s.projectUuid ?? null, note: s.note ?? "", hours, rate, currency, amount };
+    });
+}
+
+// One row per shift (with work times) when `withTimes`, otherwise same day +
+// project pooled into a single row (hours/amount summed, distinct notes joined).
+function rpBuildDetailRows(withTimes: boolean): RpDetailRow[] {
+  const items = rpBuildLineItems();
+  if (withTimes) {
+    return items.map((it) => ({
+      date: it.date,
+      times: it.endTime ? `${rpFmtTime(it.startTime)}–${rpFmtTime(it.endTime)}` : rpFmtTime(it.startTime),
+      projectName: it.projectName, note: it.note, hours: it.hours, amount: it.amount, currency: it.currency,
+    }));
+  }
+  const pooled = new Map<string, RpDetailRow & { notes: Set<string> }>();
+  for (const it of items) {
+    const key = it.date + "|" + (it.projectUuid ?? "unassigned") + "|" + it.currency;
+    let row = pooled.get(key);
+    if (!row) {
+      row = { date: it.date, times: "", projectName: it.projectName, note: "", hours: 0, amount: it.amount != null ? 0 : null, currency: it.currency, notes: new Set() };
+      pooled.set(key, row);
+    }
+    row.hours += it.hours;
+    if (it.amount != null) row.amount = (row.amount ?? 0) + it.amount;
+    if (it.note.trim()) row.notes.add(it.note.trim());
+  }
+  return Array.from(pooled.values()).map((r) => ({
+    date: r.date, times: r.times, projectName: r.projectName,
+    note: Array.from(r.notes).join("; "), hours: r.hours, amount: r.amount, currency: r.currency,
+  }));
+}
+
+interface RpTimesheetRow { date: string; weekday: string; worked: number; target: number; diff: number; }
+function rpBuildTimesheet(): RpTimesheetRow[] {
+  const fromV = rpEl<HTMLInputElement>("rp-from").value;
+  const toV = rpEl<HTMLInputElement>("rp-to").value;
+  const projFilter = rpEl<HTMLSelectElement>("rp-project").value || null;
+  const workedByDay = new Map<string, number>();
+  for (const s of rpShifts) {
+    if (!s.endTime) continue;
+    if (projFilter && (s.projectUuid ?? null) !== projFilter) continue;
+    const key = localDateKey(new Date(s.startTime));
+    workedByDay.set(key, (workedByDay.get(key) ?? 0) + shiftDurationHours(s));
+  }
+  const rows: RpTimesheetRow[] = [];
+  const cursor = new Date(fromV + "T00:00:00");
+  const end = new Date(toV + "T00:00:00");
+  while (cursor.getTime() <= end.getTime()) {
+    const key = localDateKey(cursor);
+    const worked = workedByDay.get(key) ?? 0;
+    const target = rpOffDaySet.has(key) ? 0 : getTargetHoursForDate(cursor, currentWorkSchedule);
+    if (worked > 0 || target > 0) {
+      rows.push({ date: key, weekday: RP_WEEKDAY[cursor.getDay()], worked, target, diff: worked - target });
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return rows;
+}
+
+function rpCurrentStyle(): string { return rpEl<HTMLSelectElement>("rp-style").value; }
+
+function rpLetterhead(from: string, to: string): string {
+  const p = rpProfile;
+  const custom = (p.custom_fields ?? []).filter((f) => f.label || f.value);
+  return `
+    <div class="report-letterhead">
+      <div class="report-sender">
+        ${p.name ? `<div class="report-name">${escapeHtml(p.name)}</div>` : ""}
+        ${p.company ? `<div>${escapeHtml(p.company)}</div>` : ""}
+        ${p.address ? `<div class="report-addr">${escapeHtml(p.address).replace(/\n/g, "<br>")}</div>` : ""}
+        ${p.email ? `<div>${escapeHtml(p.email)}</div>` : ""}
+        ${custom.map((f) => `<div class="report-cf"><span>${escapeHtml(f.label)}:</span> ${escapeHtml(f.value)}</div>`).join("")}
+      </div>
+      <div class="report-meta">
+        <div class="report-title">${p.letter_header ? escapeHtml(p.letter_header) : "Time report"}</div>
+        <div class="muted">${escapeHtml(from)} — ${escapeHtml(to)}</div>
+        <div class="muted">Generated ${escapeHtml(localDateKey(new Date()))}</div>
+      </div>
+    </div>`;
+}
+
+function rpRenderReport() {
+  const isClient = rpCurrentStyle() === "client";
+  rpEl("rp-detailed-wrap").style.display = isClient ? "" : "none";
+  rpEl("rp-times-wrap").style.display = isClient && rpEl<HTMLInputElement>("rp-detailed").checked ? "" : "none";
+  if (rpCurrentStyle() === "timesheet") rpRenderTimesheet();
+  else rpRenderClientReport();
+}
+
+function rpRenderClientReport() {
+  const detailed = rpEl<HTMLInputElement>("rp-detailed").checked;
+  const items = rpBuildLineItems();
+  const out = rpEl("report-output");
+  out.hidden = false;
+  const fromV = rpEl<HTMLInputElement>("rp-from").value;
+  const toV = rpEl<HTMLInputElement>("rp-to").value;
+
+  const groups = new Map<string, { name: string; hours: number; rate: number | null; currency: string; amount: number | null }>();
+  for (const it of items) {
+    const key = (it.projectUuid ?? "unassigned") + "|" + it.currency;
+    const g = groups.get(key);
+    if (g) { g.hours += it.hours; if (it.amount != null) g.amount = (g.amount ?? 0) + it.amount; }
+    else groups.set(key, { name: it.projectName, hours: it.hours, rate: it.rate, currency: it.currency, amount: it.amount });
+  }
+  const totalsByCurrency = new Map<string, number>();
+  for (const it of items) if (it.amount != null) totalsByCurrency.set(it.currency, (totalsByCurrency.get(it.currency) ?? 0) + it.amount);
+  const totalHours = items.reduce((s, it) => s + it.hours, 0);
+
+  const summaryRows = Array.from(groups.values()).map((g) => `
+    <tr><td>${escapeHtml(g.name)}</td><td class="num">${fmtHoursNum(g.hours)}</td>
+    <td class="num">${g.rate != null ? fmtMoney(g.rate) + " " + escapeHtml(g.currency) : "—"}</td>
+    <td class="num">${g.amount != null ? fmtMoney(g.amount) + " " + escapeHtml(g.currency) : "—"}</td></tr>`).join("");
+  const totalsRows = Array.from(totalsByCurrency.entries()).map(([cur, amt]) => `
+    <tr class="report-total-row"><td colspan="3" class="num"><strong>Total (${escapeHtml(cur || "—")})</strong></td>
+    <td class="num"><strong>${fmtMoney(amt)} ${escapeHtml(cur)}</strong></td></tr>`).join("");
+  const withTimes = rpEl<HTMLInputElement>("rp-times").checked;
+  const detailRows = detailed ? rpBuildDetailRows(withTimes) : [];
+  const detailTable = detailed ? `
+    <h4 class="report-h">Itemized entries</h4>
+    <table class="report-table"><thead><tr><th>Date</th>${withTimes ? "<th>Time</th>" : ""}<th>Project</th><th>Note</th><th class="num">Hours</th><th class="num">Amount</th></tr></thead>
+    <tbody>${detailRows.map((r) => `<tr><td>${escapeHtml(r.date)}</td>${withTimes ? `<td>${escapeHtml(r.times)}</td>` : ""}<td>${escapeHtml(r.projectName)}</td><td>${escapeHtml(r.note)}</td>
+      <td class="num">${fmtHoursNum(r.hours)}</td><td class="num">${r.amount != null ? fmtMoney(r.amount) + " " + escapeHtml(r.currency) : "—"}</td></tr>`).join("")}</tbody></table>` : "";
+
+  out.innerHTML = `
+    ${rpLetterhead(fromV, toV)}
+    ${items.length === 0 ? `<p class="muted">No completed shifts in this range.</p>` : `
+    <h4 class="report-h">Summary by project</h4>
+    <table class="report-table"><thead><tr><th>Project</th><th class="num">Hours</th><th class="num">Rate</th><th class="num">Amount</th></tr></thead>
+    <tbody>${summaryRows}
+      <tr class="report-total-row"><td class="num"><strong>Total hours</strong></td><td class="num"><strong>${fmtHoursNum(totalHours)}</strong></td><td></td><td></td></tr>
+      ${totalsRows}</tbody></table>${detailTable}`}
+    ${rpProfile.footer ? `<div class="report-footer">${escapeHtml(rpProfile.footer).replace(/\n/g, "<br>")}</div>` : ""}`;
+}
+
+function rpRenderTimesheet() {
+  const rows = rpBuildTimesheet();
+  const out = rpEl("report-output");
+  out.hidden = false;
+  const fromV = rpEl<HTMLInputElement>("rp-from").value;
+  const toV = rpEl<HTMLInputElement>("rp-to").value;
+  const totalWorked = rows.reduce((s, r) => s + r.worked, 0);
+  const totalTarget = rows.reduce((s, r) => s + r.target, 0);
+  const body = rows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.weekday)}</td>
+    <td class="num">${fmtHoursNum(r.worked)}</td><td class="num">${fmtHoursNum(r.target)}</td><td class="num">${signedHoursNum(r.diff)}</td></tr>`).join("");
+  out.innerHTML = `
+    ${rpLetterhead(fromV, toV)}
+    ${rows.length === 0 ? `<p class="muted">No working days in this range.</p>` : `
+    <h4 class="report-h">Timesheet</h4>
+    <table class="report-table"><thead><tr><th>Date</th><th>Day</th><th class="num">Worked</th><th class="num">Target</th><th class="num">+/−</th></tr></thead>
+    <tbody>${body}
+      <tr class="report-total-row"><td colspan="2"><strong>Total</strong></td><td class="num"><strong>${fmtHoursNum(totalWorked)}</strong></td>
+      <td class="num"><strong>${fmtHoursNum(totalTarget)}</strong></td><td class="num"><strong>${signedHoursNum(totalWorked - totalTarget)}</strong></td></tr></tbody></table>`}
+    ${rpProfile.footer ? `<div class="report-footer">${escapeHtml(rpProfile.footer).replace(/\n/g, "<br>")}</div>` : ""}`;
+}
+
+async function rpExportCsv() {
+  let header: string[]; let rows: string[][]; let kind: string;
+  if (rpCurrentStyle() === "timesheet") {
+    const ts = rpBuildTimesheet();
+    if (ts.length === 0) { alert("No working days in this range to export."); return; }
+    header = ["Date", "Day", "Worked", "Target", "Difference"];
+    rows = ts.map((r) => [r.date, r.weekday, fmtHoursNum(r.worked), fmtHoursNum(r.target), signedHoursNum(r.diff)]);
+    kind = "timesheet";
+  } else {
+    const withTimes = rpEl<HTMLInputElement>("rp-times").checked;
+    const detail = rpBuildDetailRows(withTimes);
+    if (detail.length === 0) { alert("No completed shifts in this range to export."); return; }
+    header = withTimes
+      ? ["Date", "Time", "Project", "Note", "Hours", "Currency", "Amount"]
+      : ["Date", "Project", "Note", "Hours", "Currency", "Amount"];
+    rows = detail.map((r) => {
+      const base = [r.date];
+      if (withTimes) base.push(r.times);
+      base.push(r.projectName, r.note, fmtHoursNum(r.hours), r.currency, r.amount != null ? r.amount.toFixed(2) : "");
+      return base;
+    });
+    kind = "report";
+  }
+  const csv = [header, ...rows].map((r) => r.map((c) => reportCsvCell(String(c))).join(",")).join("\r\n");
+  const name = `${kind}_${rpEl<HTMLInputElement>("rp-from").value}_${rpEl<HTMLInputElement>("rp-to").value}.csv`;
+  try {
+    const path = await invoke<string>("save_download_file", { name, contents: csv });
+    alert("Saved to: " + path);
+  } catch (err) {
+    alert("Failed to save CSV: " + err);
+  }
+}
+
+// ── Profile editor (Full mode) ──────────────────────────────────────
+function rpRenderCustomFields(fields: { label: string; value: string }[]) {
+  const el = rpEl("pf-custom-list");
+  el.innerHTML = fields.map((f) => `
+    <div class="pf-custom-row">
+      <input type="text" class="pf-cf-label" value="${escapeHtml(f.label)}" placeholder="Label (e.g. VAT ID)" maxlength="60">
+      <input type="text" class="pf-cf-value" value="${escapeHtml(f.value)}" placeholder="Value" maxlength="120">
+      <button class="btn-icon pf-cf-remove" type="button" title="Remove">&times;</button>
+    </div>`).join("");
+  el.querySelectorAll<HTMLButtonElement>(".pf-cf-remove").forEach((b) => b.addEventListener("click", () => b.closest(".pf-custom-row")?.remove()));
+}
+function rpCollectCustomFields(): { label: string; value: string }[] {
+  return Array.from(rpEl("pf-custom-list").querySelectorAll<HTMLElement>(".pf-custom-row"))
+    .map((row) => ({ label: (row.querySelector(".pf-cf-label") as HTMLInputElement).value.trim(), value: (row.querySelector(".pf-cf-value") as HTMLInputElement).value.trim() }))
+    .filter((f) => f.label !== "" || f.value !== "");
+}
+function rpFillProfileForm() {
+  rpEl<HTMLInputElement>("pf-name").value = rpProfile.name ?? "";
+  rpEl<HTMLInputElement>("pf-company").value = rpProfile.company ?? "";
+  rpEl<HTMLInputElement>("pf-email").value = rpProfile.email ?? "";
+  rpEl<HTMLInputElement>("pf-currency").value = rpProfile.default_currency ?? "";
+  rpEl<HTMLTextAreaElement>("pf-address").value = rpProfile.address ?? "";
+  rpEl<HTMLTextAreaElement>("pf-header").value = rpProfile.letter_header ?? "";
+  rpEl<HTMLTextAreaElement>("pf-footer").value = rpProfile.footer ?? "";
+  rpRenderCustomFields(rpProfile.custom_fields ?? []);
+}
+function rpReadProfileForm(): ReportProfile {
+  return {
+    name: rpEl<HTMLInputElement>("pf-name").value.trim(),
+    company: rpEl<HTMLInputElement>("pf-company").value.trim(),
+    email: rpEl<HTMLInputElement>("pf-email").value.trim(),
+    default_currency: rpEl<HTMLInputElement>("pf-currency").value.trim().toUpperCase(),
+    address: rpEl<HTMLTextAreaElement>("pf-address").value.trim(),
+    letter_header: rpEl<HTMLTextAreaElement>("pf-header").value.trim(),
+    footer: rpEl<HTMLTextAreaElement>("pf-footer").value.trim(),
+    custom_fields: rpCollectCustomFields(),
+  };
+}
+
+function rpWireHandlers() {
+  if (rpWired) return;
+  rpWired = true;
+  rpEl("rp-generate").addEventListener("click", rpRenderReport);
+  rpEl("rp-style").addEventListener("change", rpRenderReport);
+  rpEl("rp-detailed").addEventListener("change", rpRenderReport);
+  rpEl("rp-times").addEventListener("change", rpRenderReport);
+  rpEl("rp-csv").addEventListener("click", () => void rpExportCsv());
+  rpEl("rp-print").addEventListener("click", () => { if (rpEl("report-output").hidden) rpRenderReport(); window.print(); });
+  rpEl("pf-add-field").addEventListener("click", () => { const f = rpCollectCustomFields(); f.push({ label: "", value: "" }); rpRenderCustomFields(f); });
+  rpEl("pf-save").addEventListener("click", async () => {
+    const status = rpEl("pf-status");
+    const sync = await settings.getSyncConfig();
+    if (!sync) { status.textContent = "Configure sync first."; return; }
+    const btn = rpEl<HTMLButtonElement>("pf-save");
+    btn.disabled = true; status.textContent = "Saving…";
+    rpProfile = rpReadProfileForm();
+    const res = await saveRemoteProfile(sync.serverUrl, sync.apiKey, rpProfile);
+    btn.disabled = false;
+    if (res.ok) { status.textContent = "Saved."; setTimeout(() => (status.textContent = ""), 2500); }
+    else { status.textContent = "Failed to save: " + (res.message ?? "server error"); }
+  });
+}
+
+async function renderReportsTab() {
+  rpWireHandlers();
+
+  // Default the date range to the current month on first open.
+  const fromEl = rpEl<HTMLInputElement>("rp-from");
+  const toEl = rpEl<HTMLInputElement>("rp-to");
+  if (!fromEl.value) {
+    const now = new Date();
+    fromEl.value = localDateKey(new Date(now.getFullYear(), now.getMonth(), 1));
+    toEl.value = localDateKey(now);
+  }
+
+  // Load the shared report profile from the server (Full mode needs sync).
+  const sync = await settings.getSyncConfig();
+  rpProfileAvailable = !!sync;
+  rpEl("rp-profile-unavailable").hidden = rpProfileAvailable;
+  rpEl("rp-profile-body").hidden = !rpProfileAvailable;
+  if (sync) {
+    try {
+      const res = await getRemoteProfile(sync.serverUrl, sync.apiKey);
+      if (res.ok && res.data?.profile) rpProfile = res.data.profile; else rpProfile = {};
+    } catch { rpProfile = {}; }
+    rpFillProfileForm();
+  }
+
+  // Load tracking data (projects are already in projectsCache).
+  const [allShifts, offDayList] = await Promise.all([shifts.getAllShifts(), offDays.getOffDays()]);
+  rpShifts = allShifts;
+  rpOffDaySet = new Set(offDayList.map((o) => o.date));
+
+  const sel = rpEl<HTMLSelectElement>("rp-project");
+  sel.innerHTML = `<option value="">All projects</option>`;
+  for (const p of projectsCache.filter((p) => !p.archived)) {
+    const opt = document.createElement("option");
+    opt.value = p.uuid;
+    opt.textContent = p.name;
+    sel.appendChild(opt);
+  }
+
+  rpRenderReport();
+}
+
+loadMode()
+  .then(() => { applyMode(); return loadSettings(); })
+  .then(async () => {
+    // Recover a shift the app couldn't clock out last run before the first paint.
+    await checkStaleAndRecover();
+    refresh();
+    performSync();
+    maybeShowOnboarding();
+    void maybeShowWhatsNew();
+    checkForUpdates();
+  });

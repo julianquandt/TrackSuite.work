@@ -89,3 +89,29 @@ export function createRemoteOffDay(serverUrl: string, apiKey: string, date: stri
         body: { date },
     });
 }
+
+// ── Report profile (Full mode) ──────────────────────────────────────
+// The letterhead/report profile lives server-side (Fernet-encrypted, one per
+// account) so it's shared across devices. The desktop reads/writes it over the
+// same authenticated channel as sync; it requires sync to be configured.
+
+export type ReportProfile = {
+    name?: string;
+    company?: string;
+    address?: string;
+    email?: string;
+    letter_header?: string;
+    footer?: string;
+    default_currency?: string;
+    custom_fields?: { label: string; value: string }[];
+};
+
+type RemoteProfile = { profile: ReportProfile | null; profile_updated_at: string | null };
+
+export function getRemoteProfile(serverUrl: string, apiKey: string) {
+    return request<RemoteProfile>("GET", serverUrl, "/profile/", { apiKey });
+}
+
+export function saveRemoteProfile(serverUrl: string, apiKey: string, profile: ReportProfile) {
+    return request<RemoteProfile>("PUT", serverUrl, "/profile/", { apiKey, body: { profile } });
+}

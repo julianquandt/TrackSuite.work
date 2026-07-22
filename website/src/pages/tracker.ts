@@ -17,6 +17,7 @@ import {
     type ProjectItem
 } from "../api";
 import { navigate } from "../router";
+import { getMode, setMode, isFullMode } from "../mode";
 
 // ── Project helpers (module-level, pure) ─────────────────────────────
 const PROJECT_PALETTE = [
@@ -51,8 +52,12 @@ function contrastText(color: string): string {
 }
 
 function formatTimeFromMinutes(minutes: number): string {
-    const h = Math.floor(minutes / 60);
-    const m = minutes % 60;
+    // Round to whole minutes: block-click selections carry fractional minutes
+    // (derived from second-precision timestamps) that would otherwise render as
+    // "09:03.7833333333".
+    const total = Math.round(minutes);
+    const h = Math.floor(total / 60);
+    const m = total % 60;
     return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
@@ -136,6 +141,17 @@ function localDateKey(d: Date): string {
     const m = String(d.getMonth() + 1).padStart(2, "0");
     const day = String(d.getDate()).padStart(2, "0");
     return `${y}-${m}-${day}`;
+}
+
+// Shift timestamps are stored as naive local wall clock ("2026-07-15T09:00:00",
+// no zone) to match what the desktop app writes — never toISOString(), which
+// emits UTC "Z" and produced mixed-frame shifts that 500'd /stats/daily-hours/.
+// Reading side already parses zoneless date-times as local via new Date(...).
+function localIso(d: Date): string {
+    const h = String(d.getHours()).padStart(2, "0");
+    const min = String(d.getMinutes()).padStart(2, "0");
+    const s = String(d.getSeconds()).padStart(2, "0");
+    return `${localDateKey(d)}T${h}:${min}:${s}`;
 }
 
 function weekStartDate(): Date {
@@ -333,6 +349,11 @@ export function renderTracker(app: HTMLElement): void {
                             <button class="btn btn-outline btn-small" id="btn-timeline-remove" disabled title="Clear the project from this range (or press Delete)">Remove</button>
                         </div>
                     </div>
+                    <div class="timeline-brush" id="timeline-brush">
+                        <button class="btn btn-outline btn-small" id="btn-brush-toggle" type="button" title="Paint a note onto shift blocks">🖌 Note brush</button>
+                        <input type="text" id="timeline-brush-note" class="timeline-brush-input" placeholder="Turn on the brush, type a note, then click blocks to stamp it" maxlength="500" disabled />
+                        <span class="muted timeline-brush-hint" id="timeline-brush-hint"></span>
+                    </div>
                 </div>
 
                 <!-- Shifts History Section -->
@@ -350,12 +371,13 @@ export function renderTracker(app: HTMLElement): void {
                                     <th>End</th>
                                     <th>Duration</th>
                                     <th>Project</th>
+                                    <th>Note</th>
                                     <th style="text-align: right;">Action</th>
                                 </tr>
                             </thead>
                             <tbody id="shift-table-body">
                                 <tr>
-                                    <td colspan="6" class="muted" style="text-align:center; padding: 24px;">Loading shift history…</td>
+                                    <td colspan="7" class="muted" style="text-align:center; padding: 24px;">Loading shift history…</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -434,6 +456,7 @@ export function renderTracker(app: HTMLElement): void {
                         <div style="position: relative; height: 260px; width: 100%;">
                             <canvas id="trend-chart"></canvas>
                         </div>
+                        <p class="trend-hint muted">Click a bar to edit that day’s sessions — week/month bars zoom in first.</p>
                         <div class="project-summary" id="project-summary"></div>
                     </div>
 
@@ -445,10 +468,37 @@ export function renderTracker(app: HTMLElement): void {
                         </ul>
                     </div>
                 </div>
+
+                <!-- Slide-down day editor: drill into any day from the trend chart -->
+                <div id="trend-drill-panel" class="trend-drill-panel" hidden>
+                    <div class="trend-drill-head">
+                        <div class="trend-drill-crumbs" id="trend-drill-crumbs"></div>
+                        <button type="button" class="btn btn-outline trend-drill-close" id="trend-drill-close">Close</button>
+                    </div>
+                    <div class="trend-drill-slot" id="trend-drill-slot">
+                        <p class="muted trend-drill-empty" id="trend-drill-empty">Click a day bar above to edit that day’s sessions.</p>
+                    </div>
+                </div>
             </div>
 
             <!-- ═══ Tab: Settings ═══ -->
             <div class="tab-page tab-hidden" id="tab-settings">
+                <!-- App Mode -->
+                <section class="panel">
+                    <div class="panel-header">
+                        <h2>Mode</h2>
+                        <p class="muted"><strong>Simple</strong> keeps the app focused on tracking. <strong>Full</strong> adds billing rates, a report letterhead, and the Reports page. Shift notes are available in both.</p>
+                    </div>
+                    <div class="control-row">
+                        <label class="ctrl">App Mode
+                            <select id="cfg-mode-select">
+                                <option value="simple">Simple</option>
+                                <option value="full">Full (reports &amp; billing)</option>
+                            </select>
+                        </label>
+                    </div>
+                </section>
+
                 <!-- Work Schedule settings -->
                 <section class="panel">
                     <div class="panel-header">
@@ -516,6 +566,9 @@ export function renderTracker(app: HTMLElement): void {
                         <input type="text" id="inp-shift-end-time" placeholder="17:00" required />
                     </label>
                 </div>
+                <label style="display:block; margin-top: 12px;">Note (optional)
+                    <input type="text" id="inp-shift-note" placeholder="What did you work on?" maxlength="500" />
+                </label>
                 <div class="btn-row modal-actions">
                     <button class="btn btn-primary" type="submit">Add Shift</button>
                     <button class="btn btn-ghost" type="button" id="btn-cancel-shift">Cancel</button>
@@ -614,8 +667,27 @@ export function renderTracker(app: HTMLElement): void {
     const trendGranEl = document.getElementById("trend-granularity") as HTMLSelectElement;
 
     const statsHandler = () => refreshData();
-    [statsUnitEl, statsCountEl, statsHolidaysEl, trendCountEl, trendUnitEl, trendGranEl].forEach(el => {
+    [statsUnitEl, statsCountEl, statsHolidaysEl].forEach(el => {
         el.addEventListener("change", statsHandler);
+    });
+    // Changing the trend range/granularity redefines the root view — drop any
+    // active drill so the fresh selection isn't overridden by a stale level.
+    [trendCountEl, trendUnitEl, trendGranEl].forEach(el => {
+        el.addEventListener("change", () => {
+            restoreEditorHome();
+            trendDrillStack = [];
+            drillDay = null;
+            void refreshData();
+        });
+    });
+
+    // App mode selector: switching to Full reveals billing/reports surfaces.
+    // Reload so the nav (Reports link) and mode-gated UI re-render everywhere.
+    const modeSelect = document.getElementById("cfg-mode-select") as HTMLSelectElement;
+    modeSelect.value = getMode();
+    modeSelect.addEventListener("change", () => {
+        setMode(modeSelect.value === "full" ? "full" : "simple");
+        window.location.reload();
     });
 
     // Theme selector setup
@@ -690,6 +762,11 @@ export function renderTracker(app: HTMLElement): void {
     let tlMoveOrigStart = 0;
     let tlMoveOrigEnd = 0;
     let timelineBlocks: { startMin: number; endMin: number; projectUuid: string | null }[] = [];
+    // Note-brush state: when active, timeline blocks become clickable/draggable
+    // to "stamp" the brush note onto their shift (range-drag is suppressed).
+    let brushActive = false;
+    let brushPainting = false;
+    let brushDirty = false;
 
     function projectById(uuid: string | null | undefined): ProjectItem | null {
         if (!uuid) return null;
@@ -720,7 +797,7 @@ export function renderTracker(app: HTMLElement): void {
             if (nowMs - startMs < 1000) {
                 await updateShift(activeShiftCached.id, activeShiftCached.start_time, null, projectUuid);
             } else {
-                const nowIso = new Date(nowMs).toISOString();
+                const nowIso = localIso(new Date(nowMs));
                 await updateShift(activeShiftCached.id, activeShiftCached.start_time, nowIso, activeShiftCached.project_uuid ?? null);
                 await createShift(nowIso, null, projectUuid);
             }
@@ -770,10 +847,18 @@ export function renderTracker(app: HTMLElement): void {
         const el = document.getElementById("projects-manage-list");
         if (!el) return;
         if (projectsCached.length === 0) { el.innerHTML = `<p class="muted">No projects yet — add one below.</p>`; return; }
-        el.innerHTML = projectsCached.map(p => `
+        const showBilling = isFullMode();
+        const billingHint = showBilling
+            ? `<p class="pm-billing-hint">The <strong>Rate</strong> and <strong>Cur.</strong> boxes set each project's hourly rate + currency for reports (leave currency blank to use your default).</p>`
+            : "";
+        el.innerHTML = billingHint + projectsCached.map(p => `
             <div class="project-manage-row" data-id="${p.id}">
                 <input type="color" class="pm-color" value="${p.color || UNASSIGNED_FALLBACK}" title="Color">
                 <input type="text" class="pm-name" value="${escapeHtml(p.name)}" maxlength="60">
+                ${showBilling ? `
+                <input type="text" class="pm-rate" value="${escapeHtml(p.rate ?? "")}" placeholder="Rate" title="Hourly rate for reports" inputmode="decimal">
+                <input type="text" class="pm-currency" value="${escapeHtml(p.currency ?? "")}" placeholder="Cur." title="Currency (e.g. EUR); blank uses your profile default" maxlength="8">
+                ` : ""}
                 <label class="pm-archive"><input type="checkbox" class="pm-archived" ${p.archived ? "checked" : ""}> Archived</label>
                 <button class="btn-icon pm-delete" type="button" title="Delete project">&times;</button>
             </div>`).join("");
@@ -781,13 +866,31 @@ export function renderTracker(app: HTMLElement): void {
             const id = Number(row.dataset.id);
             const nameEl = row.querySelector(".pm-name") as HTMLInputElement;
             const colorEl = row.querySelector(".pm-color") as HTMLInputElement;
+            const rateEl = row.querySelector(".pm-rate") as HTMLInputElement | null;
+            const currencyEl = row.querySelector(".pm-currency") as HTMLInputElement | null;
             const archEl = row.querySelector(".pm-archived") as HTMLInputElement;
             const save = async () => {
-                await updateProject(id, { name: nameEl.value.trim() || "Untitled", color: colorEl.value, archived: archEl.checked });
+                const fields: { name: string; color: string; archived: boolean; rate?: string | null; currency?: string | null } = {
+                    name: nameEl.value.trim() || "Untitled",
+                    color: colorEl.value,
+                    archived: archEl.checked,
+                };
+                // Only touch billing when the fields are shown (Full mode), so a
+                // Simple-mode save never clears a rate set elsewhere.
+                if (rateEl && currencyEl) {
+                    const rate = rateEl.value.trim();
+                    const currency = currencyEl.value.trim().toUpperCase();
+                    currencyEl.value = currency;
+                    fields.rate = rate === "" ? null : rate;
+                    fields.currency = currency === "" ? null : currency;
+                }
+                await updateProject(id, fields);
                 await reloadProjects(); renderProjectChip();
             };
             nameEl.addEventListener("change", save);
             colorEl.addEventListener("change", save);
+            rateEl?.addEventListener("change", save);
+            currencyEl?.addEventListener("change", save);
             archEl.addEventListener("change", save);
             row.querySelector(".pm-delete")!.addEventListener("click", async () => {
                 if (!confirm("Delete this project? Its shifts keep their time but become Unassigned.")) return;
@@ -815,9 +918,9 @@ export function renderTracker(app: HTMLElement): void {
             if (sMs < oStart) segs.push({ start: sMs, end: oStart, proj: s.project_uuid ?? null });
             segs.push({ start: oStart, end: oEnd, proj: projectUuid });
             if (oEnd < eMs) segs.push({ start: oEnd, end: eMs, proj: s.project_uuid ?? null });
-            await updateShift(s.id, new Date(segs[0].start).toISOString(), new Date(segs[0].end).toISOString(), segs[0].proj);
+            await updateShift(s.id, localIso(new Date(segs[0].start)), localIso(new Date(segs[0].end)), segs[0].proj);
             for (const seg of segs.slice(1)) {
-                await createShift(new Date(seg.start).toISOString(), new Date(seg.end).toISOString(), seg.proj);
+                await createShift(localIso(new Date(seg.start)), localIso(new Date(seg.end)), seg.proj);
             }
         }
         const fresh = await listShifts();
@@ -841,7 +944,7 @@ export function renderTracker(app: HTMLElement): void {
                 } else break;
             }
             if (toDelete.length > 0) {
-                await updateShift(keep.id, keep.start_time, new Date(mergedEndMs).toISOString(), keep.project_uuid ?? null);
+                await updateShift(keep.id, keep.start_time, localIso(new Date(mergedEndMs)), keep.project_uuid ?? null);
                 for (const d of toDelete) await deleteShift(d.id);
             }
             i = j;
@@ -882,9 +985,31 @@ export function renderTracker(app: HTMLElement): void {
             .map(s => {
                 const startMin = (Math.max(new Date(s.start_time).getTime(), dayStartMs) - dayStartMs) / 60000;
                 const endMin = (Math.min(new Date(s.end_time!).getTime(), dayEndMs) - dayStartMs) / 60000;
-                return { s, startMin, endMin };
+                return { s, startMin, endMin, live: false };
             });
-        timelineHasShifts = blocks.length > 0;
+
+        // The running shift has no end_time, so it never lands in `blocks`. Render
+        // it as a live block whose right edge tracks "now" (capped to the day) and
+        // grows on the 1s clock tick — see updateLiveTimelineBlock().
+        const nowMs = Date.now();
+        const active = shiftsCached.find(s => s.end_time === null);
+        let liveEntry: { s: ShiftItem; startMin: number; endMin: number; live: boolean } | null = null;
+        if (active) {
+            const st = new Date(active.start_time).getTime();
+            if (st < dayEndMs && Math.min(nowMs, dayEndMs) > dayStartMs) {
+                liveEntry = {
+                    s: active,
+                    startMin: (Math.max(st, dayStartMs) - dayStartMs) / 60000,
+                    endMin: (Math.min(nowMs, dayEndMs) - dayStartMs) / 60000,
+                    live: true,
+                };
+            }
+        }
+
+        const entries = liveEntry ? [...blocks, liveEntry] : blocks;
+        timelineHasShifts = entries.length > 0;
+        // Range-assign occupancy excludes the open shift: splitting a running shift
+        // by range is not supported. The live block stays note-brushable only.
         timelineBlocks = blocks.map(b => ({ startMin: b.startMin, endMin: b.endMin, projectUuid: b.s.project_uuid ?? null }));
 
         const container = document.getElementById("timeline-container");
@@ -896,29 +1021,62 @@ export function renderTracker(app: HTMLElement): void {
         renderTimelineDayLabel();
 
         if (!timelineHasShifts) { timelineSpanStart = 8 * 60; timelineSpanEnd = 18 * 60; return; }
-        const minStart = Math.min(...blocks.map(b => b.startMin));
-        const maxEnd = Math.max(...blocks.map(b => b.endMin));
+        const minStart = Math.min(...entries.map(b => b.startMin));
+        const maxEnd = Math.max(...entries.map(b => b.endMin));
         timelineSpanStart = Math.max(0, Math.floor((minStart - 30) / 30) * 30);
         timelineSpanEnd = Math.min(1440, Math.ceil((maxEnd + 30) / 30) * 30);
         if (timelineSpanEnd - timelineSpanStart < 60) timelineSpanEnd = Math.min(1440, timelineSpanStart + 60);
         const span = timelineSpanEnd - timelineSpanStart;
 
-        for (const b of blocks) {
+        for (const b of entries) {
             const start = new Date(b.s.start_time);
-            const end = new Date(b.s.end_time!);
             const color = projectColor(b.s.project_uuid);
             const div = document.createElement("div");
             div.className = "timeline-shift";
+            const note = b.s.note ?? "";
+            if (note) div.classList.add("has-note");
+            if (brushActive) div.classList.add("brushable");
+            if (b.live) { div.classList.add("timeline-live"); div.id = "timeline-live-block"; }
+            div.dataset.shiftId = String(b.s.id);
             div.style.left = `${((b.startMin - timelineSpanStart) / span) * 100}%`;
             div.style.width = `${((b.endMin - b.startMin) / span) * 100}%`;
             div.style.backgroundColor = color;
             div.style.color = contrastText(color);
             const name = projectName(b.s.project_uuid);
-            div.innerText = `${name} (${((b.endMin - b.startMin) / 60).toFixed(1)}h)`;
-            div.title = `${name}: ${start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} – ${end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+            div.innerHTML = `<span class="tl-shift-label">${escapeHtml(name)} (${((b.endMin - b.startMin) / 60).toFixed(1)}h)</span>${note ? `<span class="tl-note-dot" title="${escapeHtml(note)}">•</span>` : ""}`;
+            const from = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            if (b.live) {
+                div.title = note ? `${name}: ${from} – now (running)\nNote: ${note}` : `${name}: ${from} – now (running)`;
+            } else {
+                const times = `${from} – ${new Date(b.s.end_time!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+                div.title = note ? `${name}: ${times}\nNote: ${note}` : `${name}: ${times}`;
+            }
             track.appendChild(div);
         }
         renderTimelineTicks();
+    }
+
+    // Grow the live (running-shift) block each second without a full re-render,
+    // so the timeline reflects the active session in real time. Re-pads the whole
+    // strip only when the block outgrows the padded span, and never yanks the DOM
+    // out from under an in-progress drag/brush stroke.
+    function updateLiveTimelineBlock() {
+        if (!activeShiftCached) return;
+        const el = document.getElementById("timeline-live-block") as HTMLElement | null;
+        if (!el) return;
+        if (tlDragging || tlResizeL || tlResizeR || tlMoving || brushPainting) return;
+        const dayStartMs = parseLocalDayStartMs(timelineDayKey);
+        const dayEndMs = dayStartMs + 1440 * 60000;
+        const st = new Date(activeShiftCached.start_time).getTime();
+        if (st >= dayEndMs) return;
+        const startMin = (Math.max(st, dayStartMs) - dayStartMs) / 60000;
+        const endMin = (Math.min(Date.now(), dayEndMs) - dayStartMs) / 60000;
+        if (endMin > timelineSpanEnd) { renderTimelineShifts(); return; }
+        const span = timelineSpanEnd - timelineSpanStart;
+        el.style.left = `${((startMin - timelineSpanStart) / span) * 100}%`;
+        el.style.width = `${((endMin - startMin) / span) * 100}%`;
+        const label = el.querySelector(".tl-shift-label");
+        if (label) label.textContent = `${projectName(activeShiftCached.project_uuid)} (${((endMin - startMin) / 60).toFixed(1)}h)`;
     }
 
     function setTimelineDay(dateKey: string) {
@@ -928,6 +1086,116 @@ export function renderTracker(app: HTMLElement): void {
         renderTimelineShifts();
         renderTimelineProjectSelect();
         document.getElementById("timeline-editor-wrapper")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    // ── Trend-chart drill-down: reach & edit ANY day's sessions ──────
+    // The trend chart already spans arbitrary history; clicking a bar drills in.
+    // A day bar opens that day's timeline editor (moved into the slide-down slot);
+    // a week/month bar zooms the chart into its days first. A breadcrumb walks
+    // back out. This is the only path to backfill projects/notes on old days.
+    type TrendDrillLevel = { start: Date; end: Date; granularity: string; label: string };
+    let trendDrillStack: TrendDrillLevel[] = [];
+    let trendBucketRange: Record<string, { start: number; end: number }> = {};
+    let trendLabelsCurrent: string[] = [];
+    let trendGranularityCurrent = "day";
+    let drillDay: string | null = null;
+    let drillEditorOrigParent: HTMLElement | null = null;
+    let drillEditorOrigNext: Node | null = null;
+
+    // What range/granularity the trend chart should show: the top drill level, or
+    // the user's configured selects at the root.
+    function currentTrendView(): { start: Date | null; end: Date; granularity: string } {
+        const top = trendDrillStack[trendDrillStack.length - 1];
+        if (top) return { start: top.start, end: top.end, granularity: top.granularity };
+        const g = (document.getElementById("trend-granularity") as HTMLSelectElement)?.value || "day";
+        return { start: null, end: new Date(), granularity: g };
+    }
+
+    // Relocate the single timeline editor into the drill slot (and back), so the
+    // full editor + brush is reused with zero duplication.
+    function moveEditorIntoSlot() {
+        const wrapper = document.getElementById("timeline-editor-wrapper");
+        const slot = document.getElementById("trend-drill-slot");
+        if (!wrapper || !slot || wrapper.parentElement === slot) return;
+        drillEditorOrigParent = wrapper.parentElement;
+        drillEditorOrigNext = wrapper.nextSibling;
+        slot.appendChild(wrapper);
+    }
+    function restoreEditorHome() {
+        const wrapper = document.getElementById("timeline-editor-wrapper");
+        if (wrapper && drillEditorOrigParent) {
+            if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
+                drillEditorOrigParent.insertBefore(wrapper, drillEditorOrigNext);
+            else drillEditorOrigParent.appendChild(wrapper);
+        }
+        drillEditorOrigParent = null; drillEditorOrigNext = null;
+    }
+
+    function openDayDrill(dateKey: string) {
+        drillDay = dateKey;
+        moveEditorIntoSlot();
+        const empty = document.getElementById("trend-drill-empty");
+        if (empty) empty.hidden = true;
+        setTimelineDay(dateKey);
+        syncDrillUI();
+        document.getElementById("trend-drill-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function closeTrendDrill() {
+        restoreEditorHome();
+        trendDrillStack = [];
+        drillDay = null;
+        syncDrillUI();
+        void refreshData();
+    }
+
+    // Pop the drill stack to a level (-1 = root) and drop any open day.
+    function drillToLevel(level: number) {
+        restoreEditorHome();
+        trendDrillStack = level < 0 ? [] : trendDrillStack.slice(0, level + 1);
+        drillDay = null;
+        const empty = document.getElementById("trend-drill-empty");
+        if (empty) empty.hidden = false;
+        void refreshData();
+    }
+
+    // Click on a trend bar: day bucket → open editor; week/month → zoom into days.
+    function onTrendBarClick(index: number) {
+        const bk = trendLabelsCurrent[index];
+        if (bk == null) return;
+        if (trendGranularityCurrent === "day") { openDayDrill(bk); return; }
+        const range = trendBucketRange[bk];
+        if (!range) return;
+        const startD = new Date(range.start);
+        const label = trendGranularityCurrent === "week"
+            ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+            : startD.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+        trendDrillStack.push({ start: startD, end: new Date(range.end), granularity: "day", label });
+        drillDay = null;
+        const empty = document.getElementById("trend-drill-empty");
+        if (empty) empty.hidden = false;
+        void refreshData();
+    }
+
+    // Show/hide the slide-down panel and paint the breadcrumb trail.
+    function syncDrillUI() {
+        const panel = document.getElementById("trend-drill-panel");
+        const crumbs = document.getElementById("trend-drill-crumbs");
+        if (!panel || !crumbs) return;
+        const open = trendDrillStack.length > 0 || drillDay != null;
+        panel.hidden = !open;
+        if (!open) return;
+        const parts = [`<button type="button" class="crumb" data-level="-1">All</button>`];
+        trendDrillStack.forEach((lvl, i) => {
+            parts.push(`<span class="crumb-sep">▸</span><button type="button" class="crumb" data-level="${i}">${escapeHtml(lvl.label)}</button>`);
+        });
+        if (drillDay) {
+            const d = new Date(drillDay + "T00:00:00");
+            parts.push(`<span class="crumb-sep">▸</span><span class="crumb crumb-current">${escapeHtml(d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }))}</span>`);
+        }
+        crumbs.innerHTML = parts.join("");
+        crumbs.querySelectorAll(".crumb[data-level]").forEach(b =>
+            b.addEventListener("click", () => drillToLevel(parseInt((b as HTMLElement).dataset.level!))));
     }
 
     function renderTimelineProjectSelect() {
@@ -956,7 +1224,7 @@ export function renderTracker(app: HTMLElement): void {
             const span = timelineSpanEnd - timelineSpanStart;
             selectionEl.style.left = `${((timelineSelStartMin - timelineSpanStart) / span) * 100}%`;
             selectionEl.style.width = `${((timelineSelEndMin - timelineSelStartMin) / span) * 100}%`;
-            const durMin = timelineSelEndMin - timelineSelStartMin;
+            const durMin = Math.round(timelineSelEndMin - timelineSelStartMin);
             const h = Math.floor(durMin / 60), m = durMin % 60;
             labelEl.textContent = `Selected: ${formatTimeFromMinutes(timelineSelStartMin)} to ${formatTimeFromMinutes(timelineSelEndMin)} (${h > 0 ? `${h}h ${m}m` : `${m}m`})`;
             selectEl.disabled = false; assignBtn.disabled = false; if (removeBtn) removeBtn.disabled = false;
@@ -972,6 +1240,52 @@ export function renderTracker(app: HTMLElement): void {
         return Math.round((timelineSpanStart + pct * span) / 5) * 5;
     }
 
+    // Stamp the brush note onto one shift block, updating the DOM optimistically
+    // and persisting. Skips a no-op so dragging across a block doesn't re-write it.
+    async function stampNoteOnBlock(el: HTMLElement): Promise<void> {
+        const id = Number(el.dataset.shiftId);
+        const s = shiftsCached.find(x => x.id === id);
+        if (!s) return;
+        const raw = (document.getElementById("timeline-brush-note") as HTMLInputElement).value.trim();
+        const newNote = raw === "" ? null : raw;
+        if ((s.note ?? null) === newNote) return;
+        s.note = newNote;
+        el.classList.toggle("has-note", !!newNote);
+        el.classList.add("just-stamped");
+        setTimeout(() => el.classList.remove("just-stamped"), 400);
+        let dot = el.querySelector(".tl-note-dot");
+        if (newNote && !dot) el.insertAdjacentHTML("beforeend", `<span class="tl-note-dot">•</span>`);
+        else if (!newNote && dot) dot.remove();
+        brushDirty = true;
+        // Persist; the optimistic DOM stays even on failure — the brush-end
+        // refreshData() reconciles against the server either way.
+        await updateShift(id, s.start_time, s.end_time, undefined, newNote);
+    }
+
+    function initBrush() {
+        const toggle = document.getElementById("btn-brush-toggle") as HTMLButtonElement | null;
+        const input = document.getElementById("timeline-brush-note") as HTMLInputElement | null;
+        const hint = document.getElementById("timeline-brush-hint");
+        const wrapper = document.getElementById("timeline-editor-wrapper");
+        if (!toggle || !input || !hint || !wrapper) return;
+        toggle.addEventListener("click", () => {
+            brushActive = !brushActive;
+            toggle.classList.toggle("active", brushActive);
+            wrapper.classList.toggle("brush-mode", brushActive);
+            input.disabled = !brushActive;
+            // Brush mode and range-assign are mutually exclusive interactions.
+            if (brushActive) {
+                timelineSelStartMin = timelineSelEndMin = 0;
+                updateSelectionUI();
+                hint.textContent = "Click a block to stamp the note; drag across to cover several. Empty note = erase.";
+                input.focus();
+            } else {
+                hint.textContent = "";
+            }
+            renderTimelineShifts();
+        });
+    }
+
     function initTimelineDrag() {
         const track = document.getElementById("timeline-track");
         const handleLeft = document.getElementById("handle-left");
@@ -980,6 +1294,7 @@ export function renderTracker(app: HTMLElement): void {
         if (!track || !handleLeft || !handleRight || !selectionEl) return;
 
         const startDrag = (e: MouseEvent | TouchEvent) => {
+            if (brushActive) return; // brush mode owns block clicks; no range-select
             if (selectionEl.contains(e.target as Node)) return;
             tlDragging = true;
             tlDragStartMin = getMinutesFromEvent(e, track);
@@ -989,6 +1304,32 @@ export function renderTracker(app: HTMLElement): void {
         };
         track.addEventListener("mousedown", startDrag);
         track.addEventListener("touchstart", startDrag, { passive: false });
+
+        // Note-brush painting: stamp the brush note onto blocks in brush mode.
+        const brushBlockFromEvent = (e: Event): HTMLElement | null =>
+            (e.target as HTMLElement)?.closest(".timeline-shift") as HTMLElement | null;
+        const brushDown = (e: MouseEvent | TouchEvent) => {
+            if (!brushActive) return;
+            const blk = brushBlockFromEvent(e);
+            if (!blk) return;
+            if (e.cancelable) e.preventDefault();
+            brushPainting = true;
+            void stampNoteOnBlock(blk);
+        };
+        const brushOver = (e: MouseEvent) => {
+            if (!brushActive || !brushPainting) return;
+            const blk = brushBlockFromEvent(e);
+            if (blk) void stampNoteOnBlock(blk);
+        };
+        track.addEventListener("mousedown", brushDown);
+        track.addEventListener("touchstart", brushDown, { passive: false });
+        track.addEventListener("mouseover", brushOver);
+        track.addEventListener("touchmove", (e) => {
+            if (!brushActive || !brushPainting) return;
+            const t = e.touches[0];
+            const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
+            if (el) void stampNoteOnBlock(el);
+        }, { passive: true });
 
         const startMove = (e: MouseEvent | TouchEvent) => {
             if (e.target === handleLeft || e.target === handleRight) return;
@@ -1027,6 +1368,7 @@ export function renderTracker(app: HTMLElement): void {
             }
         };
         const onEnd = () => {
+            if (brushPainting) { brushPainting = false; if (brushDirty) { brushDirty = false; void refreshData(); } }
             const wasClick = tlDragging && timelineSelStartMin === timelineSelEndMin;
             tlDragging = false; tlResizeL = false; tlResizeR = false; tlMoving = false;
             if (wasClick) {
@@ -1092,6 +1434,8 @@ export function renderTracker(app: HTMLElement): void {
     // ── One-time project/timeline wiring ─────────────────────────────
     renderTimelineDayLabel();
     initTimelineDrag();
+    initBrush();
+    document.getElementById("trend-drill-close")?.addEventListener("click", closeTrendDrill);
     document.getElementById("btn-timeline-assign")?.addEventListener("click", () => {
         const sel = document.getElementById("timeline-project-select") as HTMLSelectElement;
         void applyTimelineRange(sel.value || null);
@@ -1163,6 +1507,7 @@ export function renderTracker(app: HTMLElement): void {
         (document.getElementById("inp-shift-end-date") as HTMLInputElement).value = todayStr;
         (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = "09:00";
         (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = "17:00";
+        (document.getElementById("inp-shift-note") as HTMLInputElement).value = "";
         const errEl = document.getElementById("shift-error")!;
         errEl.textContent = "";
         errEl.style.display = "none";
@@ -1383,7 +1728,7 @@ export function renderTracker(app: HTMLElement): void {
         try {
             if (activeShiftCached) {
                 // Clock Out
-                const end = new Date().toISOString();
+                const end = localIso(new Date());
                 const res = await updateShift(activeShiftCached.id, activeShiftCached.start_time, end);
                 if (res.ok) {
                     stopTimer();
@@ -1393,7 +1738,7 @@ export function renderTracker(app: HTMLElement): void {
                 }
             } else {
                 // Clock In (tagged with the current project)
-                const start = new Date().toISOString();
+                const start = localIso(new Date());
                 const res = await createShift(start, null, currentProjectUuid);
                 if (res.ok) {
                     await refreshData();
@@ -1454,7 +1799,13 @@ export function renderTracker(app: HTMLElement): void {
             return;
         }
 
-        const res = await createShift(new Date(startIso).toISOString(), new Date(endIso).toISOString());
+        const noteVal = (document.getElementById("inp-shift-note") as HTMLInputElement).value.trim();
+        const res = await createShift(
+            startIso,
+            endIso,
+            undefined,
+            noteVal === "" ? undefined : noteVal,
+        );
         if (res.ok) {
             dlgShift.close();
             await refreshData();
@@ -1490,6 +1841,7 @@ export function renderTracker(app: HTMLElement): void {
             const min = Math.floor(elapsedMs / 60000) % 60;
             const hrs = Math.floor(elapsedMs / 3600000);
             timerEl.textContent = `${String(hrs).padStart(2, "0")}:${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+            updateLiveTimelineBlock();
         };
 
         updateText();
@@ -1652,7 +2004,11 @@ export function renderTracker(app: HTMLElement): void {
                         const native = evt.native as Event | null;
                         if (!native) return;
                         const pts = chart.getElementsAtEventForMode(native, "index", { intersect: false }, false);
-                        if (pts.length) setTimelineDay(dayKeys[pts[0].index]);
+                        if (!pts.length) return;
+                        // The weekly bar edits in the editor's home slot; if a trend
+                        // drill has it in the slide-down, send it back first.
+                        if (drillDay != null || trendDrillStack.length) { restoreEditorHome(); trendDrillStack = []; drillDay = null; syncDrillUI(); }
+                        setTimelineDay(dayKeys[pts[0].index]);
                     },
                     onHover: (evt, els) => { const el = evt.native?.target as HTMLElement | undefined; if (el) el.style.cursor = els.length ? "pointer" : "default"; }
                 }
@@ -1750,25 +2106,42 @@ export function renderTracker(app: HTMLElement): void {
         `;
 
         // 6. ── Trends Chart & Calculations ────────────────────────────
-        const trendCount = parseInt(trendCountEl.value) || 7;
-        const trendUnit = trendUnitEl.value;
-        const granularity = trendGranEl.value;
-
+        // Honour the drill stack: a drilled-in view fixes the range + granularity
+        // (e.g. the 7 days of a clicked week); otherwise use the user's selects.
+        const drillView = currentTrendView();
+        const granularity = drillView.granularity;
         let trendStart: Date;
-        if (trendUnit === "days") trendStart = addDays(now, -trendCount);
-        else if (trendUnit === "weeks") trendStart = addDays(now, -trendCount * 7);
-        else trendStart = addDays(now, -trendCount * 30);
+        let trendEnd = now;
+        if (drillView.start) {
+            trendStart = new Date(drillView.start);
+            trendEnd = new Date(drillView.end);
+        } else {
+            const trendCount = parseInt(trendCountEl.value) || 7;
+            const trendUnit = trendUnitEl.value;
+            if (trendUnit === "days") trendStart = addDays(now, -trendCount);
+            else if (trendUnit === "weeks") trendStart = addDays(now, -trendCount * 7);
+            else trendStart = addDays(now, -trendCount * 30);
+        }
         trendStart.setHours(0, 0, 0, 0);
+        const trendEndMs = new Date(trendEnd).setHours(23, 59, 59, 999);
 
-        const trendRelevant = shiftsCached.filter(s => new Date(s.start_time) >= trendStart);
+        const trendRelevant = shiftsCached.filter(s => {
+            const t = new Date(s.start_time).getTime();
+            return t >= trendStart.getTime() && t <= trendEndMs;
+        });
 
-        // Ordered buckets + off-day credited hours (folded into Unassigned).
+        // Ordered buckets, each bucket's day range (for drill), + off-day credit.
         const bucketKeysList: string[] = [];
+        const bucketRange: Record<string, { start: number; end: number }> = {};
         const offdayCredit: Record<string, number> = {};
         const trendCursor = new Date(trendStart);
-        while (trendCursor <= now) {
+        while (trendCursor.getTime() <= trendEndMs) {
             const bk = bucketKey(trendCursor, granularity);
             if (!bucketKeysList.includes(bk)) bucketKeysList.push(bk);
+            const dayMs = trendCursor.getTime();
+            const r = bucketRange[bk];
+            if (!r) bucketRange[bk] = { start: dayMs, end: dayMs };
+            else { if (dayMs < r.start) r.start = dayMs; if (dayMs > r.end) r.end = dayMs; }
             const dk = localDateKey(trendCursor);
             const targetHours = getTargetHoursForDate(trendCursor, currentSchedule);
             if (includeHolidays && offDayDates.has(dk) && targetHours > 0) {
@@ -1778,6 +2151,10 @@ export function renderTracker(app: HTMLElement): void {
         }
         const trendLabels = [...bucketKeysList].sort();
         const idxOf = (bk: string) => trendLabels.indexOf(bk);
+        // Cache for the bar-click drill handler.
+        trendLabelsCurrent = trendLabels;
+        trendGranularityCurrent = granularity;
+        trendBucketRange = bucketRange;
 
         const trendDatasets = buildProjectStackDatasets(
             trendLabels.length,
@@ -1807,6 +2184,8 @@ export function renderTracker(app: HTMLElement): void {
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
+                    onClick: (_evt, els) => { if (els.length) onTrendBarClick(els[0].index); },
+                    onHover: (evt, els) => { const t = (evt.native?.target as HTMLElement | undefined); if (t) t.style.cursor = els.length ? "pointer" : "default"; },
                     plugins: { legend: { display: trendDatasets.length > 1, position: "bottom", labels: { color: textColor } } },
                     scales: {
                         x: { stacked: true, grid: { color: gridColor }, ticks: { color: textColor } },
@@ -1816,6 +2195,7 @@ export function renderTracker(app: HTMLElement): void {
             });
         }
         renderProjectSummary(trendDatasets);
+        syncDrillUI();
 
         // 7. ── Render Off Days List ──────────────────────────────────
         const offDayListEl = document.getElementById("offday-list")!;
@@ -1852,7 +2232,7 @@ export function renderTracker(app: HTMLElement): void {
             .sort((a, b) => b.start_time.localeCompare(a.start_time));
 
         if (sortedShifts.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="muted" style="text-align:center; padding: 24px;">No completed shifts logged.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="muted" style="text-align:center; padding: 24px;">No completed shifts logged.</td></tr>`;
         } else {
             tableBody.innerHTML = sortedShifts.slice(0, 25).map(s => {
                 const startLocal = new Date(s.start_time);
@@ -1866,12 +2246,45 @@ export function renderTracker(app: HTMLElement): void {
                         <td>${s.end_time ? endLocal.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "active"}</td>
                         <td><span class="badge badge-success">${formatDuration(dur)}</span></td>
                         <td><span class="shift-project-tag"><span class="project-dot" style="background:${projectColor(s.project_uuid)}"></span>${escapeHtml(projectName(s.project_uuid))}</span></td>
+                        <td><input type="text" class="shift-note-input" data-id="${s.id}" value="${escapeHtml(s.note ?? "")}" placeholder="Add note…" maxlength="500" title="Enter: save and move down · ↓: copy the note from the row above" /></td>
                         <td style="text-align: right;">
                             <button class="btn btn-outline btn-small btn-danger delete-shift-btn" data-id="${s.id}" style="padding: 4px 8px;">Delete</button>
                         </td>
                     </tr>
                 `;
             }).join("");
+
+            const saveNoteInput = async (input: HTMLInputElement) => {
+                const id = Number(input.dataset.id);
+                const s = shiftsCached.find(x => x.id === id);
+                if (!s) return;
+                const note = input.value.trim();
+                const newNote = note === "" ? null : note;
+                if ((s.note ?? null) === newNote) return;
+                const res = await updateShift(id, s.start_time, s.end_time, undefined, newNote);
+                if (res.ok) s.note = res.data?.note ?? newNote;
+                else alert("Failed to save note: server error.");
+            };
+            tableBody.querySelectorAll<HTMLInputElement>(".shift-note-input").forEach(input => {
+                input.addEventListener("change", () => void saveNoteInput(input));
+                // Carry-down flow: Enter saves and drops to the next row; ↓ copies
+                // the note from the row above (fast repeats without copy-paste).
+                input.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") {
+                        e.preventDefault();
+                        void saveNoteInput(input);
+                        const next = input.closest("tr")?.nextElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+                        next?.focus();
+                    } else if (e.key === "ArrowDown") {
+                        const prev = input.closest("tr")?.previousElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+                        if (prev) {
+                            e.preventDefault();
+                            input.value = prev.value;
+                            void saveNoteInput(input);
+                        }
+                    }
+                });
+            });
 
             tableBody.querySelectorAll(".delete-shift-btn").forEach(btn => {
                 btn.addEventListener("click", async (e) => {

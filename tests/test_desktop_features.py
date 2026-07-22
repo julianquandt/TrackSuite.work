@@ -10,11 +10,16 @@ def _read(path: str) -> str:
 # ── Auto-sync ────────────────────────────────────────────────────────
 
 def test_auto_sync_on_startup():
-    """Boot sequence calls performSync() after loadSettings."""
+    """Boot sequence loads settings then calls performSync().
+
+    The boot chain begins at loadMode() (0.9.0 mode-gated render) and runs
+    loadMode → loadSettings → refresh/performSync; assert that ordering.
+    """
     src = _read("desktop/src/main.ts")
-    boot_idx = src.index("loadSettings().then")
+    boot_idx = src.index("loadMode()")
+    settings_idx = src.index("loadSettings()", boot_idx)
     sync_idx = src.index("performSync()", boot_idx)
-    assert sync_idx > boot_idx
+    assert boot_idx < settings_idx < sync_idx
 
 
 def test_auto_sync_on_clock_out():

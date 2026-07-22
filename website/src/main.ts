@@ -7,6 +7,7 @@ import { renderLogin } from "./pages/login";
 import { renderDashboard } from "./pages/dashboard";
 import { renderDocs } from "./pages/docs";
 import { renderTracker } from "./pages/tracker";
+import { renderReports } from "./pages/reports";
 
 const app = document.getElementById("app")!;
 
@@ -22,6 +23,7 @@ route("#/login", () => render(renderLogin));
 route("#/dashboard", () => render(renderDashboard));
 route("#/docs", () => render(renderDocs));
 route("#/tracker", () => render(renderTracker));
+route("#/reports", () => render(renderReports));
 
 startRouter();
 

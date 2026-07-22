@@ -1,9 +1,11 @@
 import { getToken, logout } from "./api";
+import { isFullMode } from "./mode";
 
 export function renderNav(app: HTMLElement): void {
     const token = getToken();
+    const reportsLink = isFullMode() ? `<a href="#/reports">Reports</a>` : "";
     const navRight = token
-        ? `<a href="#/tracker">Tracker</a><a href="#/docs">Docs</a><a href="#/dashboard">Dashboard</a><a href="#/" id="nav-logout">Logout</a>`
+        ? `<a href="#/tracker">Tracker</a>${reportsLink}<a href="#/docs">Docs</a><a href="#/dashboard">Dashboard</a><a href="#/" id="nav-logout">Logout</a>`
         : `<a href="#/docs">Docs</a><a href="#/login">Login</a><a href="#/register" class="btn btn-primary btn-small">Sign Up</a>`;
 
     const nav = document.createElement("nav");

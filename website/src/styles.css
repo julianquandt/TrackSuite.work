@@ -1427,8 +1427,139 @@ button[type="submit"] {
 }
 .pm-archive { display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-secondary); white-space: nowrap; }
 .new-project-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
+.project-manage-row .pm-rate, .project-manage-row .pm-currency {
+    padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: 8px;
+    background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem; min-width: 0;
+}
+.project-manage-row .pm-rate { width: 72px; flex-shrink: 0; text-align: right; }
+.project-manage-row .pm-currency { width: 56px; flex-shrink: 0; text-transform: uppercase; }
 
 .shift-project-tag { display: inline-flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--text-secondary); }
+.shift-note-input {
+    width: 100%; min-width: 90px; padding: 5px 8px; border: 1px solid var(--border-subtle);
+    border-radius: 6px; background: var(--bg-surface); color: var(--text-primary); font-size: 0.85rem;
+}
+.pm-billing-hint { font-size: 0.8rem; color: var(--text-secondary); margin: 0 0 10px; }
+
+/* ── Timeline note brush ──────────────────────────────────────────── */
+.timeline-brush { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.timeline-brush-input {
+    flex: 1; min-width: 180px; padding: 7px 10px; border: 1px solid var(--border-subtle);
+    border-radius: 8px; background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem;
+}
+.timeline-brush-input:disabled { opacity: 0.5; }
+#btn-brush-toggle.active { background: var(--accent, #3b82f6); color: #fff; border-color: transparent; }
+.timeline-brush-hint { font-size: 0.8rem; flex-basis: 100%; }
+.timeline-shift { position: absolute; overflow: hidden; }
+.timeline-shift .tl-shift-label { pointer-events: none; }
+.timeline-shift.has-note .tl-note-dot {
+    position: absolute; top: 1px; right: 3px; font-size: 1.1rem; line-height: 1;
+    color: currentColor; opacity: 0.85; pointer-events: none;
+}
+.timeline-editor-wrapper.brush-mode .timeline-shift.brushable {
+    /* Blocks are pointer-events:none by default (the track handles range-drag);
+       in brush mode they must catch clicks so the note can be stamped. */
+    pointer-events: auto; cursor: crosshair;
+    outline: 1px dashed rgba(255,255,255,0.6); outline-offset: -3px;
+}
+.timeline-shift.just-stamped { box-shadow: 0 0 0 2px #fff inset; }
+
+/* The running shift: a live block whose right edge tracks "now". A soft pulse
+   plus a striped trailing edge signals it is still growing. */
+.timeline-shift.timeline-live {
+    animation: tl-live-pulse 2s ease-in-out infinite;
+}
+.timeline-shift.timeline-live::after {
+    content: ""; position: absolute; top: 0; right: 0; bottom: 0; width: 10px;
+    background: repeating-linear-gradient(-45deg, rgba(255,255,255,0.45) 0 3px, transparent 3px 6px);
+    pointer-events: none;
+}
+@keyframes tl-live-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
+    50% { box-shadow: 0 0 0 2px rgba(255,255,255,0.5) inset; }
+}
+
+/* ── Trend-chart drill-down (backfill any day's sessions) ─────────── */
+.trend-hint { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-tertiary); }
+.trend-drill-panel {
+    margin-top: 16px; border: 1px solid var(--border-subtle); border-radius: 10px;
+    padding: 12px 14px; background: var(--bg-surface); animation: drill-slide 0.18s ease-out;
+}
+@keyframes drill-slide { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+.trend-drill-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.trend-drill-crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 0.82rem; }
+.trend-drill-crumbs .crumb {
+    background: none; border: none; padding: 2px 4px; cursor: pointer;
+    color: var(--text-secondary); font: inherit; border-radius: 4px;
+}
+.trend-drill-crumbs .crumb:hover { text-decoration: underline; color: var(--text-primary); }
+.trend-drill-crumbs .crumb-current { color: var(--text-primary); font-weight: 600; cursor: default; }
+.trend-drill-crumbs .crumb-current:hover { text-decoration: none; }
+.trend-drill-crumbs .crumb-sep { opacity: 0.5; }
+.trend-drill-close { flex: none; }
+.trend-drill-empty { margin: 8px 0; font-size: 0.85rem; }
+
+/* ── Reports page ─────────────────────────────────────────────────── */
+.reports-page { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+.reports-summary-toggle { cursor: pointer; list-style: revert; }
+.reports-summary-toggle h3 { margin: 0; }
+.reports-profile-grid, .reports-filter-grid {
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 8px;
+}
+.reports-profile-grid label, .reports-filter-grid label {
+    display: flex; flex-direction: column; gap: 5px; font-size: 0.85rem; color: var(--text-secondary);
+}
+.reports-profile-grid .span2 { grid-column: 1 / -1; }
+.reports-profile-grid input, .reports-profile-grid textarea,
+.reports-filter-grid input, .reports-filter-grid select {
+    padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: 8px;
+    background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem; font-family: inherit;
+}
+.reports-check { flex-direction: row !important; align-items: center; gap: 8px !important; }
+.reports-check input { width: auto; }
+.reports-custom-fields { margin-top: 18px; }
+.reports-custom-fields h4 { margin: 0 0 4px; }
+.pf-custom-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.pf-custom-row .pf-cf-label { flex: 0 0 40%; }
+.pf-custom-row .pf-cf-value { flex: 1; }
+.pf-custom-row input {
+    min-width: 0; padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: 8px;
+    background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem;
+}
+
+.report-output {
+    margin-top: 24px; padding: 32px; background: #fff; color: #111;
+    border: 1px solid var(--border-subtle); border-radius: 12px;
+}
+.report-letterhead { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; border-bottom: 2px solid #111; padding-bottom: 16px; margin-bottom: 20px; }
+.report-sender { font-size: 0.9rem; line-height: 1.5; }
+.report-name { font-weight: 700; font-size: 1.05rem; }
+.report-addr { margin: 2px 0; }
+.report-cf span { color: #555; }
+.report-meta { text-align: right; font-size: 0.9rem; }
+.report-title { font-weight: 700; font-size: 1.15rem; margin-bottom: 4px; }
+.report-meta .muted { color: #555; }
+.report-h { margin: 18px 0 8px; font-size: 1rem; color: #111; }
+.report-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.report-table th, .report-table td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #ddd; }
+.report-table th { color: #333; border-bottom: 2px solid #999; }
+.report-table .num { text-align: right; white-space: nowrap; }
+.report-total-row td { border-top: 2px solid #999; border-bottom: none; }
+.report-footer { margin-top: 24px; padding-top: 12px; border-top: 1px solid #ddd; font-size: 0.85rem; color: #333; }
+
+@media print {
+    /* Force a white page (the app background is theme-dark) and drop everything
+       except the report itself from the flow — hiding via display:none (not
+       visibility) so no dark app chrome paints onto extra pages. */
+    html, body, #app { background: #fff !important; }
+    .site-nav { display: none !important; }
+    .reports-page > *:not(.report-output) { display: none !important; }
+    .report-output {
+        position: static !important; margin: 0 !important; padding: 0 !important;
+        border: none !important; border-radius: 0 !important;
+        background: #fff !important; color: #111 !important;
+    }
+}
 
 .panel-title-row { display: flex; align-items: center; gap: 8px; }
 .help-hint {

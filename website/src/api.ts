@@ -343,6 +343,8 @@ export interface ShiftItem {
     project_uuid?: string | null;
     start_time: string;
     end_time: string | null;
+    // Free-text description of what was worked on (shown in reports).
+    note?: string | null;
     // Set by the server when it auto-closed a shift left running while a newer
     // one started; the end time is a bounded estimate the user should review.
     auto_closed_at?: string | null;
@@ -362,22 +364,39 @@ export interface ProjectItem {
     name: string;
     color: string | null;
     archived: boolean;
+    // Optional billing info for reports: hourly rate (string to avoid float
+    // rounding) and its currency (null = use the profile's default currency).
+    rate?: string | null;
+    currency?: string | null;
 }
 
 export function listShifts() {
     return request<ShiftItem[]>("GET", "/shifts/");
 }
 
-export function createShift(startTime: string, endTime: string | null = null, projectUuid?: string | null) {
+export function createShift(
+    startTime: string,
+    endTime: string | null = null,
+    projectUuid?: string | null,
+    note?: string | null,
+) {
     const body: Record<string, unknown> = { start_time: startTime, end_time: endTime, started_from: "web" };
     if (projectUuid !== undefined) body.project_uuid = projectUuid;
+    if (note !== undefined) body.note = note;
     return request<ShiftItem>("POST", "/shifts/", body);
 }
 
-export function updateShift(id: number, startTime: string, endTime: string | null, projectUuid?: string | null) {
+export function updateShift(
+    id: number,
+    startTime: string,
+    endTime: string | null,
+    projectUuid?: string | null,
+    note?: string | null,
+) {
     const body: Record<string, unknown> = { start_time: startTime, end_time: endTime };
-    // Only send project_uuid when explicitly provided, so plain edits preserve it.
+    // Only send project_uuid / note when explicitly provided, so plain edits preserve them.
     if (projectUuid !== undefined) body.project_uuid = projectUuid;
+    if (note !== undefined) body.note = note;
     return request<ShiftItem>("PUT", `/shifts/${id}`, body);
 }
 
@@ -385,11 +404,24 @@ export function listProjects() {
     return request<ProjectItem[]>("GET", "/projects/");
 }
 
-export function createProject(name: string, color: string | null) {
-    return request<ProjectItem>("POST", "/projects/", { name, color });
+export function createProject(
+    name: string,
+    color: string | null,
+    fields: { rate?: string | null; currency?: string | null } = {},
+) {
+    return request<ProjectItem>("POST", "/projects/", { name, color, ...fields });
 }
 
-export function updateProject(id: number, fields: { name?: string; color?: string | null; archived?: boolean }) {
+export function updateProject(
+    id: number,
+    fields: {
+        name?: string;
+        color?: string | null;
+        archived?: boolean;
+        rate?: string | null;
+        currency?: string | null;
+    },
+) {
     return request<ProjectItem>("PUT", `/projects/${id}`, fields);
 }
 
@@ -411,4 +443,37 @@ export function createOffDay(date: string) {
 
 export function deleteOffDay(id: number) {
     return request<null>("DELETE", `/off-days/${id}`);
+}
+
+// ── Report profile ───────────────────────────────────────────────────
+
+export interface ProfileCustomField {
+    label: string;
+    value: string;
+}
+
+export interface ReportProfile {
+    name?: string;
+    company?: string;
+    address?: string;
+    email?: string;
+    // Free-text block rendered as the letterhead on generated reports.
+    letter_header?: string;
+    // Optional closing block (e.g. bank details, signature line).
+    footer?: string;
+    default_currency?: string;
+    custom_fields?: ProfileCustomField[];
+}
+
+export interface ProfileResponse {
+    profile: ReportProfile | null;
+    profile_updated_at: string | null;
+}
+
+export function getProfile() {
+    return request<ProfileResponse>("GET", "/profile/");
+}
+
+export function saveProfile(profile: ReportProfile) {
+    return request<ProfileResponse>("PUT", "/profile/", { profile });
 }

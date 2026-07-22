@@ -19,7 +19,8 @@ export interface ShiftRepository {
     endShift(): Promise<void>;
     heartbeat(): Promise<void>;
     reconcileStaleShift(staleMinutes: number): Promise<StaleClose | null>;
-    addManualShift(startTime: string, endTime: string): Promise<void>;
+    addManualShift(startTime: string, endTime: string, note?: string | null): Promise<void>;
+    setShiftNote(shiftId: number, note: string | null): Promise<void>;
     deleteShift(shiftId: number): Promise<void>;
 }
 
@@ -32,7 +33,13 @@ export interface OffDayRepository {
 export interface ProjectRepository {
     getProjects(): Promise<ProjectRecord[]>;
     createProject(name: string, color: string | null): Promise<ProjectRecord>;
-    updateProject(uuid: string, name: string, color: string | null, archived: boolean): Promise<void>;
+    updateProject(
+        uuid: string,
+        name: string,
+        color: string | null,
+        archived: boolean,
+        billing?: { rate?: string | null; currency?: string | null },
+    ): Promise<void>;
     deleteProject(uuid: string): Promise<void>;
     getCurrentProject(): Promise<string | null>;
     /** Returns true if switching split an active shift. */
@@ -57,8 +64,8 @@ export interface SettingsRepository {
 
 // ── Tauri-backed implementations ────────────────────────────────────
 
-type RustShift = { id: number; start_time: string; end_time: string | null; project_uuid: string | null };
-type RustProject = { uuid: string; name: string; color: string | null; archived: boolean };
+type RustShift = { id: number; start_time: string; end_time: string | null; project_uuid: string | null; note?: string | null };
+type RustProject = { uuid: string; name: string; color: string | null; archived: boolean; rate?: string | null; currency?: string | null };
 
 async function getConfigValue(key: string) {
     return await invoke<string | null>("get_config", { key });
@@ -69,7 +76,7 @@ async function setConfigValue(key: string, value: string) {
 }
 
 function toShiftRecord(r: RustShift): ShiftRecord {
-    return { id: r.id, startTime: r.start_time, endTime: r.end_time, projectUuid: r.project_uuid };
+    return { id: r.id, startTime: r.start_time, endTime: r.end_time, projectUuid: r.project_uuid, note: r.note ?? null };
 }
 
 function timeTextToMinutes(value: string): number {
@@ -120,8 +127,11 @@ export const shifts: ShiftRepository = {
         );
         return row ? { startTime: row.start_time, endTime: row.end_time } : null;
     },
-    async addManualShift(startTime, endTime) {
-        await invoke("add_manual_shift", { startTime, endTime });
+    async addManualShift(startTime, endTime, note) {
+        await invoke("add_manual_shift", { startTime, endTime, note: note ?? null });
+    },
+    async setShiftNote(shiftId, note) {
+        await invoke("set_shift_note", { shiftId, note });
     },
     async deleteShift(shiftId) {
         await invoke("delete_shift", { shiftId });
@@ -144,14 +154,18 @@ export const offDays: OffDayRepository = {
 export const projects: ProjectRepository = {
     async getProjects() {
         const rows = await invoke<RustProject[]>("get_projects");
-        return rows.map((r) => ({ uuid: r.uuid, name: r.name, color: r.color, archived: r.archived }));
+        return rows.map((r) => ({ uuid: r.uuid, name: r.name, color: r.color, archived: r.archived, rate: r.rate ?? null, currency: r.currency ?? null }));
     },
     async createProject(name, color) {
         const r = await invoke<RustProject>("create_project", { name, color });
-        return { uuid: r.uuid, name: r.name, color: r.color, archived: r.archived };
+        return { uuid: r.uuid, name: r.name, color: r.color, archived: r.archived, rate: r.rate ?? null, currency: r.currency ?? null };
     },
-    async updateProject(uuid, name, color, archived) {
-        await invoke("update_project", { uuid, name, color, archived });
+    async updateProject(uuid, name, color, archived, billing) {
+        await invoke("update_project", {
+            uuid, name, color, archived,
+            rate: billing?.rate ?? null,
+            currency: billing?.currency ?? null,
+        });
     },
     async deleteProject(uuid) {
         await invoke("delete_project", { uuid });

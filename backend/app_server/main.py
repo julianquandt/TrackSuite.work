@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
+import json
 import os
 import uuid as uuid_lib
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -20,6 +22,7 @@ from .auth import (
     build_totp_uri,
     create_access_token,
     decode_access_token,
+    decrypt_secret,
     encrypt_secret,
     generate_api_key,
     generate_recovery_codes,
@@ -104,6 +107,43 @@ def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(value)
 
 
+@lru_cache(maxsize=1)
+def report_timezone() -> tzinfo:
+    """Timezone the wall-clock ("naive") shift timestamps are written in.
+
+    The desktop app stores local wall-clock time (``2026-07-15T09:00:00``)
+    while the web app stores UTC (``2026-07-15T07:00:00Z``); the same shift can
+    carry one of each when it is started on one and closed on the other. To
+    compare them the server has to know which zone the naive half means. Set
+    ``WORK_TIME_REPORT_TIMEZONE`` (IANA name) when the server does not run in
+    the same zone as the user, e.g. a UTC VPS serving a Europe/Berlin user."""
+    name = os.getenv("WORK_TIME_REPORT_TIMEZONE")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def to_local_naive(value: Optional[str], tz: tzinfo) -> Optional[datetime]:
+    """Shift timestamp as local wall clock in ``tz``, or None if unparseable.
+
+    Naive input is taken at face value (already local); offset-aware input is
+    converted into ``tz`` first, so mixed-frame shifts subtract cleanly and land
+    on the day the user actually worked. Mirrors how the clients read these
+    strings back with ``new Date(...)``."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(tz).replace(tzinfo=None)
+
+
 def _add_sync_columns(conn, table: str) -> None:
     """Additively add sync-metadata columns to an existing entity table."""
     columns = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
@@ -149,6 +189,27 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE shifts ADD COLUMN auto_closed_at VARCHAR NULL"))
         if "started_from" not in shift_columns:
             conn.execute(text("ALTER TABLE shifts ADD COLUMN started_from VARCHAR NULL"))
+        # Report metadata (0.9.0): free-text note per shift.
+        if "note" not in shift_columns:
+            conn.execute(text("ALTER TABLE shifts ADD COLUMN note VARCHAR NULL"))
+
+        # Report metadata (0.9.0): per-project billing rate + currency.
+        project_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))
+        }
+        if "rate" not in project_columns:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN rate VARCHAR NULL"))
+        if "currency" not in project_columns:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN currency VARCHAR NULL"))
+
+        # Report profile (0.9.0): encrypted JSON blob on the user row.
+        user_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(users)"))
+        }
+        if "profile_encrypted" not in user_columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN profile_encrypted VARCHAR NULL"))
+        if "profile_updated_at" not in user_columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN profile_updated_at VARCHAR NULL"))
 
         backfill_ts = sync_now()
         # Backfill identity + timestamps for pre-existing rows.
@@ -699,6 +760,7 @@ class ShiftCreate(BaseModel):
     uuid: Optional[str] = None
     project_uuid: Optional[str] = None
     started_from: Optional[str] = None
+    note: Optional[str] = None
 
 
 class ShiftResponse(BaseModel):
@@ -708,6 +770,7 @@ class ShiftResponse(BaseModel):
     start_time: str
     end_time: Optional[str] = None
     project_uuid: Optional[str] = None
+    note: Optional[str] = None
     updated_at: Optional[str] = None
     deleted: bool = False
     auto_closed_at: Optional[str] = None
@@ -719,12 +782,16 @@ class ProjectCreate(BaseModel):
     name: str
     color: Optional[str] = None
     uuid: Optional[str] = None
+    rate: Optional[str] = None
+    currency: Optional[str] = None
 
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None
     color: Optional[str] = None
     archived: Optional[bool] = None
+    rate: Optional[str] = None
+    currency: Optional[str] = None
 
 
 class ProjectResponse(BaseModel):
@@ -734,6 +801,8 @@ class ProjectResponse(BaseModel):
     name: str
     color: Optional[str] = None
     archived: bool = False
+    rate: Optional[str] = None
+    currency: Optional[str] = None
     updated_at: Optional[str] = None
     deleted: bool = False
     model_config = ConfigDict(from_attributes=True)
@@ -754,6 +823,22 @@ class OffDayResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# The report profile is an opaque JSON object (name, company, address,
+# letterhead, default currency, custom fields …). The server stores it
+# Fernet-encrypted at rest and never inspects its shape, so the web app can
+# evolve the fields without backend changes.
+PROFILE_MAX_BYTES = 64 * 1024
+
+
+class ProfileResponse(BaseModel):
+    profile: Optional[Dict[str, Any]] = None
+    profile_updated_at: Optional[str] = None
+
+
+class ProfileUpdate(BaseModel):
+    profile: Dict[str, Any]
+
+
 # ── Full-state sync schemas ──────────────────────────────────────────
 
 
@@ -762,6 +847,7 @@ class SyncShift(BaseModel):
     start_time: str
     end_time: Optional[str] = None
     project_uuid: Optional[str] = None
+    note: Optional[str] = None
     updated_at: str
     deleted: bool = False
     deleted_at: Optional[str] = None
@@ -782,6 +868,8 @@ class SyncProject(BaseModel):
     name: str
     color: Optional[str] = None
     archived: bool = False
+    rate: Optional[str] = None
+    currency: Optional[str] = None
     updated_at: str
     deleted: bool = False
     deleted_at: Optional[str] = None
@@ -1247,6 +1335,7 @@ def create_shift(
         if shift.end_time:
             existing.end_time = shift.end_time
         existing.project_uuid = shift.project_uuid
+        existing.note = shift.note
         existing.deleted = False
         existing.deleted_at = None
         existing.updated_at = sync_now()
@@ -1264,6 +1353,7 @@ def create_shift(
         start_time=shift.start_time,
         end_time=shift.end_time,
         project_uuid=shift.project_uuid,
+        note=shift.note,
         updated_at=sync_now(),
         deleted=False,
         started_from=shift.started_from,
@@ -1320,6 +1410,8 @@ def update_shift(
     db_shift.end_time = shift_update.end_time
     if "project_uuid" in shift_update.model_fields_set:
         db_shift.project_uuid = shift_update.project_uuid
+    if "note" in shift_update.model_fields_set:
+        db_shift.note = shift_update.note
     # Editing an auto-closed shift means the user has reviewed it: clear the flag.
     db_shift.auto_closed_at = None
     db_shift.updated_at = sync_now()
@@ -1392,6 +1484,47 @@ def delete_off_day(
     return None
 
 
+# ── Report profile endpoints ─────────────────────────────────────────
+
+
+@app.get("/profile/", response_model=ProfileResponse)
+def get_profile(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.profile_encrypted:
+        return ProfileResponse(profile=None, profile_updated_at=None)
+    try:
+        raw = decrypt_secret(user.profile_encrypted)
+        profile = json.loads(raw)
+    except Exception:
+        # Corrupt / key-rotated blob: surface as empty rather than 500 so the
+        # user can just re-save a fresh profile.
+        return ProfileResponse(profile=None, profile_updated_at=user.profile_updated_at)
+    return ProfileResponse(profile=profile, profile_updated_at=user.profile_updated_at)
+
+
+@app.put("/profile/", response_model=ProfileResponse)
+def update_profile(
+    body: ProfileUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    raw = json.dumps(body.profile, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > PROFILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Profile is too large.")
+    user.profile_encrypted = encrypt_secret(raw)
+    user.profile_updated_at = sync_now()
+    db.commit()
+    return ProfileResponse(profile=body.profile, profile_updated_at=user.profile_updated_at)
+
+
 # ── Project endpoints ────────────────────────────────────────────────
 
 
@@ -1410,6 +1543,8 @@ def create_project(
     if existing:
         existing.name = project.name
         existing.color = project.color
+        existing.rate = project.rate
+        existing.currency = project.currency
         existing.deleted = False
         existing.deleted_at = None
         existing.updated_at = sync_now()
@@ -1422,6 +1557,8 @@ def create_project(
         uuid=project.uuid or new_uuid(),
         name=project.name,
         color=project.color,
+        rate=project.rate,
+        currency=project.currency,
         archived=False,
         updated_at=sync_now(),
         deleted=False,
@@ -1460,6 +1597,10 @@ def update_project(
         db_project.color = body.color
     if "archived" in body.model_fields_set and body.archived is not None:
         db_project.archived = body.archived
+    if "rate" in body.model_fields_set:
+        db_project.rate = body.rate
+    if "currency" in body.model_fields_set:
+        db_project.currency = body.currency
     db_project.updated_at = sync_now()
     db.commit()
     db.refresh(db_project)
@@ -1505,6 +1646,7 @@ def _serialize_sync_shift(shift: Shift) -> SyncShift:
         start_time=shift.start_time,
         end_time=shift.end_time,
         project_uuid=shift.project_uuid,
+        note=shift.note,
         updated_at=shift.updated_at or "",
         deleted=bool(shift.deleted),
         deleted_at=shift.deleted_at,
@@ -1529,6 +1671,8 @@ def _serialize_sync_project(project: Project) -> SyncProject:
         name=project.name,
         color=project.color,
         archived=bool(project.archived),
+        rate=project.rate,
+        currency=project.currency,
         updated_at=project.updated_at or "",
         deleted=bool(project.deleted),
         deleted_at=project.deleted_at,
@@ -1633,6 +1777,7 @@ def push_sync_state(
                 start_time=incoming.start_time,
                 end_time=incoming.end_time,
                 project_uuid=incoming.project_uuid,
+                note=incoming.note,
                 updated_at=incoming.updated_at,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
@@ -1643,6 +1788,7 @@ def push_sync_state(
             row.start_time = incoming.start_time
             row.end_time = incoming.end_time
             row.project_uuid = incoming.project_uuid
+            row.note = incoming.note
             row.updated_at = incoming.updated_at
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
@@ -1665,6 +1811,8 @@ def push_sync_state(
                 name=incoming.name,
                 color=incoming.color,
                 archived=incoming.archived,
+                rate=incoming.rate,
+                currency=incoming.currency,
                 updated_at=incoming.updated_at,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
@@ -1673,6 +1821,8 @@ def push_sync_state(
             row.name = incoming.name
             row.color = incoming.color
             row.archived = incoming.archived
+            row.rate = incoming.rate
+            row.currency = incoming.currency
             row.updated_at = incoming.updated_at
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
@@ -1718,12 +1868,15 @@ def get_daily_hours(
         )
         .all()
     )
+    tz = report_timezone()
     daily_totals: Dict[str, float] = {}
     for shift in shifts:
         if not shift.end_time:
             continue
-        start = datetime.fromisoformat(shift.start_time)
-        end = datetime.fromisoformat(shift.end_time)
+        start = to_local_naive(shift.start_time, tz)
+        end = to_local_naive(shift.end_time, tz)
+        if start is None or end is None or end < start:
+            continue
         duration_hours = (end - start).total_seconds() / 3600
         date_str = start.strftime("%Y-%m-%d")
         daily_totals[date_str] = daily_totals.get(date_str, 0) + duration_hours

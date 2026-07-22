@@ -28,7 +28,8 @@ pub fn init_db() -> Result<(), String> {
             deleted_at TEXT,
             auto_closed_at TEXT,
             started_from TEXT,
-            last_active_at TEXT
+            last_active_at TEXT,
+            note TEXT
         );
         CREATE TABLE IF NOT EXISTS off_days (
             date TEXT PRIMARY KEY,
@@ -44,7 +45,9 @@ pub fn init_db() -> Result<(), String> {
             archived INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
-            deleted_at TEXT
+            deleted_at TEXT,
+            rate TEXT,
+            currency TEXT
         );
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
@@ -91,10 +94,15 @@ fn migrate_sync_columns(c: &Connection) -> Result<(), String> {
     ensure_column("shifts", "auto_closed_at", "TEXT")?;
     ensure_column("shifts", "started_from", "TEXT")?;
     ensure_column("shifts", "last_active_at", "TEXT")?;
+    // Report metadata (0.9.0): free-text note per shift (synced).
+    ensure_column("shifts", "note", "TEXT")?;
     ensure_column("off_days", "uuid", "TEXT")?;
     ensure_column("off_days", "updated_at", "TEXT")?;
     ensure_column("off_days", "deleted", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column("off_days", "deleted_at", "TEXT")?;
+    // Report metadata (0.9.0): per-project billing rate + currency (synced).
+    ensure_column("projects", "rate", "TEXT")?;
+    ensure_column("projects", "currency", "TEXT")?;
 
     let now = sync_now();
     // Backfill identity + timestamps for rows created before sync existed.
@@ -145,6 +153,7 @@ pub struct Shift {
     pub project_uuid: Option<String>,
     pub started_from: Option<String>,
     pub last_active_at: Option<String>,
+    pub note: Option<String>,
 }
 
 /// Result of a retro-close: the shift the app couldn't cleanly clock out was
@@ -158,7 +167,7 @@ pub struct StaleClose {
 pub fn get_active_shift_row() -> Result<Option<Shift>, String> {
     let c = conn()?;
     let mut stmt = c
-        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at FROM shifts WHERE end_time IS NULL AND deleted = 0")
+        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at, note FROM shifts WHERE end_time IS NULL AND deleted = 0")
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
         .query_map([], |row| {
@@ -169,6 +178,7 @@ pub fn get_active_shift_row() -> Result<Option<Shift>, String> {
                 project_uuid: row.get(3)?,
                 started_from: row.get(4)?,
                 last_active_at: row.get(5)?,
+                note: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -268,7 +278,7 @@ pub fn end_shift_row() -> Result<bool, String> {
 pub fn get_all_shifts_rows() -> Result<Vec<Shift>, String> {
     let c = conn()?;
     let mut stmt = c
-        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at FROM shifts WHERE deleted = 0 ORDER BY start_time DESC")
+        .prepare("SELECT id, start_time, end_time, project_uuid, started_from, last_active_at, note FROM shifts WHERE deleted = 0 ORDER BY start_time DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |row| {
@@ -279,17 +289,30 @@ pub fn get_all_shifts_rows() -> Result<Vec<Shift>, String> {
                 project_uuid: row.get(3)?,
                 started_from: row.get(4)?,
                 last_active_at: row.get(5)?,
+                note: row.get(6)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
 }
 
-pub fn add_shift_manual_row(start_time: &str, end_time: &str) -> Result<(), String> {
+pub fn add_shift_manual_row(start_time: &str, end_time: &str, note: Option<&str>) -> Result<(), String> {
     let c = conn()?;
     c.execute(
-        "INSERT INTO shifts (uuid, start_time, end_time, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, 0)",
-        params![new_uuid(), start_time, end_time, sync_now()],
+        "INSERT INTO shifts (uuid, start_time, end_time, note, updated_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        params![new_uuid(), start_time, end_time, note, sync_now()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set (or clear) the free-text note on a shift, bumping updated_at so the
+/// change wins the last-write-wins merge on the next sync.
+pub fn set_shift_note_row(shift_id: i64, note: Option<&str>) -> Result<(), String> {
+    let c = conn()?;
+    c.execute(
+        "UPDATE shifts SET note = ?1, updated_at = ?2 WHERE id = ?3",
+        params![note, sync_now(), shift_id],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -352,6 +375,8 @@ pub struct Project {
     pub name: String,
     pub color: Option<String>,
     pub archived: bool,
+    pub rate: Option<String>,
+    pub currency: Option<String>,
 }
 
 /// The sticky "current project" that new clock-ins are attributed to.
@@ -364,7 +389,7 @@ pub fn get_projects_rows() -> Result<Vec<Project>, String> {
     let c = conn()?;
     let mut stmt = c
         .prepare(
-            "SELECT uuid, name, color, archived FROM projects \
+            "SELECT uuid, name, color, archived, rate, currency FROM projects \
              WHERE deleted = 0 ORDER BY name COLLATE NOCASE",
         )
         .map_err(|e| e.to_string())?;
@@ -375,6 +400,8 @@ pub fn get_projects_rows() -> Result<Vec<Project>, String> {
                 name: row.get(1)?,
                 color: row.get(2)?,
                 archived: row.get::<_, i64>(3)? != 0,
+                rate: row.get(4)?,
+                currency: row.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -395,6 +422,8 @@ pub fn create_project_row(name: &str, color: Option<&str>) -> Result<Project, St
         name: name.to_string(),
         color: color.map(|s| s.to_string()),
         archived: false,
+        rate: None,
+        currency: None,
     })
 }
 
@@ -403,11 +432,14 @@ pub fn update_project_row(
     name: &str,
     color: Option<&str>,
     archived: bool,
+    rate: Option<&str>,
+    currency: Option<&str>,
 ) -> Result<(), String> {
     let c = conn()?;
     c.execute(
-        "UPDATE projects SET name = ?2, color = ?3, archived = ?4, updated_at = ?5 WHERE uuid = ?1",
-        params![uuid, name, color, archived as i64, sync_now()],
+        "UPDATE projects SET name = ?2, color = ?3, archived = ?4, rate = ?5, currency = ?6, \
+         updated_at = ?7 WHERE uuid = ?1",
+        params![uuid, name, color, archived as i64, rate, currency, sync_now()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -684,6 +716,7 @@ pub struct SyncShift {
     pub start_time: String,
     pub end_time: Option<String>,
     pub project_uuid: Option<String>,
+    pub note: Option<String>,
     pub updated_at: String,
     pub deleted: bool,
     pub deleted_at: Option<String>,
@@ -706,6 +739,8 @@ pub struct SyncProject {
     pub name: String,
     pub color: Option<String>,
     pub archived: bool,
+    pub rate: Option<String>,
+    pub currency: Option<String>,
     pub updated_at: String,
     pub deleted: bool,
     pub deleted_at: Option<String>,
@@ -717,7 +752,7 @@ pub fn get_all_shifts_for_sync() -> Result<Vec<SyncShift>, String> {
     let mut stmt = c
         .prepare(
             "SELECT uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at, \
-             auto_closed_at, started_from FROM shifts WHERE uuid IS NOT NULL",
+             auto_closed_at, started_from, note FROM shifts WHERE uuid IS NOT NULL",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -732,6 +767,7 @@ pub fn get_all_shifts_for_sync() -> Result<Vec<SyncShift>, String> {
                 deleted_at: row.get(6)?,
                 auto_closed_at: row.get(7)?,
                 started_from: row.get(8)?,
+                note: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -779,7 +815,7 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
         None => {
             c.execute(
                 "INSERT INTO shifts (uuid, start_time, end_time, project_uuid, updated_at, deleted, deleted_at, \
-                 auto_closed_at, started_from) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 auto_closed_at, started_from, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     shift.uuid,
                     shift.start_time,
@@ -789,7 +825,8 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
                     shift.deleted as i64,
                     shift.deleted_at,
                     shift.auto_closed_at,
-                    shift.started_from
+                    shift.started_from,
+                    shift.note
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -797,8 +834,8 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
         Some(local) if shift.updated_at > local => {
             c.execute(
                 "UPDATE shifts SET start_time = ?2, end_time = ?3, project_uuid = ?4, updated_at = ?5, \
-                 deleted = ?6, deleted_at = ?7, auto_closed_at = ?8, started_from = COALESCE(started_from, ?9) \
-                 WHERE uuid = ?1",
+                 deleted = ?6, deleted_at = ?7, auto_closed_at = ?8, started_from = COALESCE(started_from, ?9), \
+                 note = ?10 WHERE uuid = ?1",
                 params![
                     shift.uuid,
                     shift.start_time,
@@ -808,7 +845,8 @@ pub fn apply_synced_shift(shift: &SyncShift) -> Result<(), String> {
                     shift.deleted as i64,
                     shift.deleted_at,
                     shift.auto_closed_at,
-                    shift.started_from
+                    shift.started_from,
+                    shift.note
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -868,7 +906,7 @@ pub fn get_all_projects_for_sync() -> Result<Vec<SyncProject>, String> {
     let c = conn()?;
     let mut stmt = c
         .prepare(
-            "SELECT uuid, name, color, archived, updated_at, deleted, deleted_at \
+            "SELECT uuid, name, color, archived, updated_at, deleted, deleted_at, rate, currency \
              FROM projects WHERE uuid IS NOT NULL",
         )
         .map_err(|e| e.to_string())?;
@@ -882,6 +920,8 @@ pub fn get_all_projects_for_sync() -> Result<Vec<SyncProject>, String> {
                 updated_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 deleted: row.get::<_, i64>(5)? != 0,
                 deleted_at: row.get(6)?,
+                rate: row.get(7)?,
+                currency: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -904,8 +944,8 @@ pub fn apply_synced_project(project: &SyncProject) -> Result<(), String> {
     match local_updated {
         None => {
             c.execute(
-                "INSERT INTO projects (uuid, name, color, archived, updated_at, deleted, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO projects (uuid, name, color, archived, updated_at, deleted, deleted_at, rate, currency) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     project.uuid,
                     project.name,
@@ -913,7 +953,9 @@ pub fn apply_synced_project(project: &SyncProject) -> Result<(), String> {
                     project.archived as i64,
                     project.updated_at,
                     project.deleted as i64,
-                    project.deleted_at
+                    project.deleted_at,
+                    project.rate,
+                    project.currency
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -921,7 +963,7 @@ pub fn apply_synced_project(project: &SyncProject) -> Result<(), String> {
         Some(local) if project.updated_at > local => {
             c.execute(
                 "UPDATE projects SET name = ?2, color = ?3, archived = ?4, updated_at = ?5, \
-                 deleted = ?6, deleted_at = ?7 WHERE uuid = ?1",
+                 deleted = ?6, deleted_at = ?7, rate = ?8, currency = ?9 WHERE uuid = ?1",
                 params![
                     project.uuid,
                     project.name,
@@ -929,7 +971,9 @@ pub fn apply_synced_project(project: &SyncProject) -> Result<(), String> {
                     project.archived as i64,
                     project.updated_at,
                     project.deleted as i64,
-                    project.deleted_at
+                    project.deleted_at,
+                    project.rate,
+                    project.currency
                 ],
             )
             .map_err(|e| e.to_string())?;

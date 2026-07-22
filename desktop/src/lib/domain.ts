@@ -3,6 +3,7 @@ export type ShiftRecord = {
     startTime: string;
     endTime: string | null;
     projectUuid?: string | null;
+    note?: string | null;
 };
 
 /** A shift the app retro-closed to its last active time after a missed clock-out. */
@@ -16,6 +17,8 @@ export type ProjectRecord = {
     name: string;
     color: string | null;
     archived: boolean;
+    rate?: string | null;
+    currency?: string | null;
 };
 
 export type OffDayRecord = {

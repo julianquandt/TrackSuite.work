@@ -8,8 +8,8 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 from app_server import limiter
-from app_server.main import app, get_db
-from app_server.models import Base, RecoveryCode, User, UserSession
+from app_server.main import app, get_db, report_timezone
+from app_server.models import Base, RecoveryCode, Shift, User, UserSession
 
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
@@ -670,6 +670,56 @@ def test_daily_hours_aggregation():
     assert data["2026-03-20"] == 4.5
 
 
+def test_daily_hours_tolerates_mixed_timezone_frames(monkeypatch):
+    """Desktop writes naive local timestamps, the web app writes UTC ("Z").
+    A shift started on one and closed on the other has mixed frames; the
+    aggregation must still answer instead of raising (500), reading the naive
+    half as local time the way the clients' ``new Date(...)`` does."""
+    monkeypatch.setenv("WORK_TIME_REPORT_TIMEZONE", "Europe/Berlin")
+    report_timezone.cache_clear()
+
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    created = client.post(
+        "/shifts/", json={"start_time": "2026-07-15T09:00:00"}, headers=headers
+    )
+    shift_id = created.json()["id"]
+    client.put(
+        f"/shifts/{shift_id}",
+        json={"start_time": "2026-07-15T09:00:00", "end_time": "2026-07-15T17:00:00Z"},
+        headers=headers,
+    )
+
+    response = client.get("/stats/daily-hours/", headers=headers)
+    assert response.status_code == 200
+    # 09:00 local → 17:00Z (19:00 local in July) = 10h, not 8h.
+    assert response.json()["2026-07-15"] == 10.0
+    report_timezone.cache_clear()
+
+
+def test_daily_hours_skips_unparseable_timestamps(monkeypatch):
+    """One corrupt row must not take the whole aggregation down."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    client.post(
+        "/shifts/",
+        json={"start_time": "2026-07-16T08:00:00", "end_time": "2026-07-16T12:00:00"},
+        headers=headers,
+    )
+    db = TestingSessionLocal()
+    db.add(
+        Shift(user_id=1, uuid="corrupt", start_time="not-a-timestamp", end_time="also-not")
+    )
+    db.commit()
+    db.close()
+
+    response = client.get("/stats/daily-hours/", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"2026-07-16": 4.0}
+
+
 def test_sync_reconciles_multiple_open_shifts():
     """A cross-device race / old client can leave several shifts open at once.
     The server must keep only the most recently started one open and auto-close
@@ -829,3 +879,134 @@ def test_started_from_is_stored_and_round_trips():
     by_uuid = {s["uuid"]: s for s in resp.json()["shifts"]}
     assert by_uuid["d1"]["started_from"] == "desktop"
     assert by_uuid["w1"]["started_from"] == "web"
+
+
+def test_shift_note_is_stored_and_round_trips():
+    """A shift's free-text note persists on create/update and through sync."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    created = client.post(
+        "/shifts/",
+        json={"uuid": "n1", "start_time": "2026-04-01T08:00:00",
+              "end_time": "2026-04-01T09:00:00", "note": "Fixed the sync bug"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["note"] == "Fixed the sync bug"
+    shift_id = created.json()["id"]
+
+    # Editing the note updates it.
+    updated = client.put(
+        f"/shifts/{shift_id}",
+        json={"start_time": "2026-04-01T08:00:00",
+              "end_time": "2026-04-01T09:00:00", "note": "Fixed the sync bug + tests"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["note"] == "Fixed the sync bug + tests"
+
+    # Sync carries the note.
+    payload = {
+        "shifts": [{
+            "uuid": "n2", "start_time": "2026-04-02T08:00:00",
+            "end_time": "2026-04-02T09:00:00",
+            "updated_at": "2026-04-02T09:00:00.000000+00:00",
+            "note": "wrote docs",
+        }],
+        "off_days": [], "projects": [],
+    }
+    resp = client.post("/sync/", json=payload, headers=headers)
+    assert resp.status_code == 200
+    by_uuid = {s["uuid"]: s for s in resp.json()["shifts"]}
+    assert by_uuid["n2"]["note"] == "wrote docs"
+    assert by_uuid["n1"]["note"] == "Fixed the sync bug + tests"
+
+
+def test_project_rate_and_currency_round_trip():
+    """Per-project billing (rate + currency) persists via REST and sync."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    created = client.post(
+        "/projects/",
+        json={"uuid": "p1", "name": "Client A", "rate": "80.00", "currency": "EUR"},
+        headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["rate"] == "80.00"
+    assert created.json()["currency"] == "EUR"
+    project_id = created.json()["id"]
+
+    updated = client.put(
+        f"/projects/{project_id}",
+        json={"rate": "90.00", "currency": "USD"},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["rate"] == "90.00"
+    assert updated.json()["currency"] == "USD"
+
+    # Sync carries billing info both ways.
+    payload = {
+        "shifts": [], "off_days": [],
+        "projects": [{
+            "uuid": "p2", "name": "Client B", "rate": "120", "currency": "GBP",
+            "updated_at": "2026-04-02T09:00:00.000000+00:00",
+        }],
+    }
+    resp = client.post("/sync/", json=payload, headers=headers)
+    assert resp.status_code == 200
+    by_uuid = {p["uuid"]: p for p in resp.json()["projects"]}
+    assert by_uuid["p2"]["rate"] == "120"
+    assert by_uuid["p2"]["currency"] == "GBP"
+    assert by_uuid["p1"]["rate"] == "90.00"
+
+
+def test_report_profile_round_trips_encrypted():
+    """The report profile is stored encrypted and returned decrypted."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    # No profile initially.
+    empty = client.get("/profile/", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json()["profile"] is None
+
+    profile = {
+        "name": "Julian Quandt",
+        "company": "ACME GmbH",
+        "default_currency": "EUR",
+        "custom_fields": [{"label": "VAT", "value": "DE123"}],
+    }
+    saved = client.put("/profile/", json={"profile": profile}, headers=headers)
+    assert saved.status_code == 200
+    assert saved.json()["profile"] == profile
+    assert saved.json()["profile_updated_at"]
+
+    fetched = client.get("/profile/", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["profile"] == profile
+
+    # It is genuinely encrypted at rest (not stored as readable JSON).
+    db = TestingSessionLocal()
+    try:
+        row = db.query(User).first()
+        assert row.profile_encrypted
+        assert row.profile_encrypted.startswith("fernet$")
+        assert "ACME GmbH" not in row.profile_encrypted
+    finally:
+        db.close()
+
+
+def test_report_profile_is_per_user():
+    """One user cannot read another user's profile."""
+    _, first, _ = _register_and_enroll("owner@example.com")
+    _, second, _ = _register_and_enroll("other@example.com")
+    first_headers = _auth_headers(first.json()["access_token"])
+    second_headers = _auth_headers(second.json()["access_token"])
+
+    client.put("/profile/", json={"profile": {"name": "Owner"}}, headers=first_headers)
+
+    assert client.get("/profile/", headers=second_headers).json()["profile"] is None
+    assert client.get("/profile/", headers=first_headers).json()["profile"]["name"] == "Owner"

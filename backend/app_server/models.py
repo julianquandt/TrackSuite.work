@@ -15,6 +15,11 @@ class User(Base):
     pending_totp_secret: Mapped[str | None] = mapped_column(nullable=True)
     mfa_enrolled_at: Mapped[str | None] = mapped_column(nullable=True)
     created_at: Mapped[str] = mapped_column(nullable=False)
+    # Report profile (name, company, letterhead, custom fields, default
+    # currency) — a JSON blob, Fernet-encrypted at rest. Last-write-wins by
+    # profile_updated_at (canonical UTC microsecond timestamp).
+    profile_encrypted: Mapped[str | None] = mapped_column(nullable=True)
+    profile_updated_at: Mapped[str | None] = mapped_column(nullable=True)
 
 
 class ApiKey(Base):
@@ -72,6 +77,8 @@ class Shift(Base):
     end_time: Mapped[str | None] = mapped_column(nullable=True)
     # Optional project attribution (uuid of a Project row; NULL = unassigned).
     project_uuid: Mapped[str | None] = mapped_column(index=True, nullable=True)
+    # Optional free-text description of what was worked on (shown in reports).
+    note: Mapped[str | None] = mapped_column(nullable=True)
     # Sync metadata (canonical UTC microsecond timestamps).
     updated_at: Mapped[str | None] = mapped_column(nullable=True)
     deleted: Mapped[bool] = mapped_column(nullable=False, default=False)
@@ -95,6 +102,11 @@ class Project(Base):
     name: Mapped[str] = mapped_column(nullable=False)
     color: Mapped[str | None] = mapped_column(nullable=True)
     archived: Mapped[bool] = mapped_column(nullable=False, default=False)
+    # Optional billing info for reports: hourly `rate` (stored as a string to
+    # avoid float rounding) in `currency`. NULL currency = use the account's
+    # default currency from the report profile.
+    rate: Mapped[str | None] = mapped_column(nullable=True)
+    currency: Mapped[str | None] = mapped_column(nullable=True)
     # Sync metadata (canonical UTC microsecond timestamps).
     updated_at: Mapped[str | None] = mapped_column(nullable=True)
     deleted: Mapped[bool] = mapped_column(nullable=False, default=False)

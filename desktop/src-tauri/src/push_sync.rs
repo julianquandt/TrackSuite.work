@@ -23,6 +23,8 @@ struct RemoteSyncShift {
     #[serde(default)]
     project_uuid: Option<String>,
     #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
     updated_at: String,
     #[serde(default)]
     deleted: bool,
@@ -54,6 +56,10 @@ struct RemoteSyncProject {
     color: Option<String>,
     #[serde(default)]
     archived: bool,
+    #[serde(default)]
+    rate: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
     #[serde(default)]
     updated_at: String,
     #[serde(default)]
@@ -161,6 +167,7 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
                 "start_time": s.start_time,
                 "end_time": s.end_time,
                 "project_uuid": s.project_uuid,
+                "note": s.note,
                 "updated_at": s.updated_at,
                 "deleted": s.deleted,
                 "deleted_at": s.deleted_at,
@@ -189,6 +196,8 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
                 "name": p.name,
                 "color": p.color,
                 "archived": p.archived,
+                "rate": p.rate,
+                "currency": p.currency,
                 "updated_at": p.updated_at,
                 "deleted": p.deleted,
                 "deleted_at": p.deleted_at,
@@ -225,6 +234,8 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
             name: project.name.clone(),
             color: project.color.clone(),
             archived: project.archived,
+            rate: project.rate.clone(),
+            currency: project.currency.clone(),
             updated_at: project.updated_at.clone(),
             deleted: project.deleted,
             deleted_at: project.deleted_at.clone(),
@@ -236,6 +247,7 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
             start_time: shift.start_time.clone(),
             end_time: shift.end_time.clone(),
             project_uuid: shift.project_uuid.clone(),
+            note: shift.note.clone(),
             updated_at: shift.updated_at.clone(),
             deleted: shift.deleted,
             deleted_at: shift.deleted_at.clone(),

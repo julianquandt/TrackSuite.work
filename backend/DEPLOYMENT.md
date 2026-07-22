@@ -92,6 +92,12 @@ Environment="WORK_TIME_JWT_SECRET=<your-64-char-hex-secret>"
 Environment="WORK_TIME_ENCRYPTION_KEY=<your-fernet-key>"
 ```
 
+If the server's own timezone differs from the one you track time in — a UTC VPS serving a Europe/Berlin user, say — set `WORK_TIME_REPORT_TIMEZONE` to your IANA zone. The desktop app stores wall-clock timestamps without an offset, and `/stats/daily-hours/` needs the zone to read them back into the right day and duration:
+
+```ini
+Environment="WORK_TIME_REPORT_TIMEZONE=Europe/Berlin"
+```
+
 If Apache runs on the same machine and proxies locally to `127.0.0.1`, you can leave `WORK_TIME_TRUSTED_PROXIES` unset. If you later put TrackSuite.work behind a different reverse proxy address, set `WORK_TIME_TRUSTED_PROXIES` accordingly so auth throttling uses the real client IP.
 
 Then start the service:
