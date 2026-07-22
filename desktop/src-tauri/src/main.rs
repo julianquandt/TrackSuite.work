@@ -166,6 +166,23 @@ fn is_self_updatable() -> bool {
     }
 }
 
+/// Whether this install is managed by our apt repository — i.e. the user added
+/// the source list from the download page. The .list file is world-readable and
+/// we run unconfined as the user, so this is a plain read (no sudo). When true,
+/// updates come via `apt upgrade`, so the UI points there instead of fetching a
+/// .deb. A false positive is harmless: if the repo is configured, apt upgrades it.
+#[tauri::command]
+fn is_apt_managed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/etc/apt/sources.list.d/tracksuite-work.list").exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Open a URL or local file path in the system default handler (browser for
 /// URLs, package installer for a downloaded .deb/.rpm).
 #[tauri::command]
@@ -397,6 +414,7 @@ fn main() {
             heartbeat_active_shift,
             reconcile_stale_desktop_shift,
             is_self_updatable,
+            is_apt_managed,
             open_url,
             download_update_package,
             save_download_file,

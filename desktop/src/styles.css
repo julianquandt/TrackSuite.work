@@ -757,6 +757,7 @@ td {
     text-decoration: underline;
     opacity: 0.8;
 }
+.update-bar .update-alt-hint { opacity: 0.75; font-size: 0.9rem; margin-left: 4px; }
 
 /* ── Onboarding ──────────────────────────────────────────────────── */
 

@@ -613,6 +613,8 @@ app.innerHTML = `
   <div id="update-bar" class="update-bar" style="display:none">
     <span id="update-msg">A new version is available!</span>
     <button id="btn-update">Install &amp; Restart</button>
+    <span id="update-alt-hint" class="update-alt-hint" style="display:none"></span>
+    <button id="btn-update-alt" style="display:none"></button>
     <button id="btn-dismiss-update" class="btn-link">Dismiss</button>
   </div>
   <main class="shell">
@@ -2924,6 +2926,14 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.9.2",
+    date: "2026-07-22",
+    title: "Smarter updates on apt",
+    changes: [
+      "If you installed from the apt repository, the update banner now points you to a normal system update (with a one-click copy of the exact command) instead of downloading a .deb — with a “download the .deb instead” fallback just in case.",
+    ],
+  },
+  {
     version: "0.9.1",
     date: "2026-07-22",
     title: "Paint your off days",
@@ -3076,14 +3086,43 @@ async function checkForUpdates() {
     const bar = document.getElementById("update-bar")!;
     const msg = document.getElementById("update-msg")!;
     const installBtn = document.getElementById("btn-update") as HTMLButtonElement;
+    const altHint = document.getElementById("update-alt-hint")!;
+    const altBtn = document.getElementById("btn-update-alt") as HTMLButtonElement;
     const dismissBtn = document.getElementById("btn-dismiss-update")!;
     bar.style.display = "";
+    installBtn.disabled = false;
+    altHint.style.display = "none";
+    altBtn.style.display = "none";
     dismissBtn.onclick = () => { bar.style.display = "none"; };
 
+    // The "download the package + open the system installer" flow, reused by the
+    // plain .deb/.rpm branch and the apt fallback button.
+    const wireDownloadDeb = (btn: HTMLButtonElement, label: string) => {
+      btn.textContent = label;
+      btn.onclick = async () => {
+        btn.disabled = true;
+        msg.textContent = "Downloading…";
+        try {
+          const path = await invoke<string>("download_update_package");
+          msg.textContent = "Downloaded — opening installer…";
+          await invoke("open_url", { url: path });
+          btn.textContent = "Open installer";
+          btn.disabled = false;
+          btn.onclick = () => void invoke("open_url", { url: path });
+        } catch {
+          msg.textContent = `Couldn't download automatically — get v${update.version} from the releases page.`;
+          btn.textContent = "Open Releases";
+          btn.disabled = false;
+          btn.onclick = () => void invoke("open_url", { url: RELEASES_URL });
+        }
+      };
+    };
+
     // Tauri can self-update an AppImage/.dmg/Windows installer, but not a
-    // package-managed .deb/.rpm — attempting that just hangs on an unwritable
-    // /usr, so we download the package and hand it to the system installer.
+    // package-managed .deb/.rpm. apt-managed installs update via `apt upgrade`,
+    // so we point there (with a .deb fallback) rather than fetching a package.
     const selfUpdatable = await invoke<boolean>("is_self_updatable").catch(() => true);
+    const aptManaged = !selfUpdatable && await invoke<boolean>("is_apt_managed").catch(() => false);
 
     if (selfUpdatable) {
       msg.textContent = `Update available: v${update.version}`;
@@ -3101,26 +3140,27 @@ async function checkForUpdates() {
           installBtn.onclick = () => void invoke("open_url", { url: RELEASES_URL });
         }
       };
-    } else {
-      msg.textContent = `Update available: v${update.version}`;
-      installBtn.textContent = "Download update";
+    } else if (aptManaged) {
+      const cmd = "sudo apt update && sudo apt install --only-upgrade track-suite-work";
+      msg.textContent = `v${update.version} is available — it'll arrive with your next system update, or update now manually:`;
+      installBtn.textContent = "Copy command";
       installBtn.onclick = async () => {
-        installBtn.disabled = true;
-        msg.textContent = "Downloading…";
         try {
-          const path = await invoke<string>("download_update_package");
-          msg.textContent = "Downloaded — opening installer…";
-          await invoke("open_url", { url: path });
-          installBtn.textContent = "Open installer";
-          installBtn.disabled = false;
-          installBtn.onclick = () => void invoke("open_url", { url: path });
+          await navigator.clipboard.writeText(cmd);
+          installBtn.textContent = "Copied ✓";
+          setTimeout(() => { installBtn.textContent = "Copy command"; }, 2000);
         } catch {
-          msg.textContent = `Couldn't download automatically — get v${update.version} from the releases page.`;
-          installBtn.textContent = "Open Releases";
-          installBtn.disabled = false;
-          installBtn.onclick = () => void invoke("open_url", { url: RELEASES_URL });
+          msg.textContent = cmd; // clipboard blocked — show it to copy by hand
         }
       };
+      // False-positive escape hatch: repo configured but installed some other way.
+      altHint.textContent = "Not installed via apt?";
+      altHint.style.display = "";
+      altBtn.style.display = "";
+      wireDownloadDeb(altBtn, "Download the .deb");
+    } else {
+      msg.textContent = `Update available: v${update.version}`;
+      wireDownloadDeb(installBtn, "Download update");
     }
   } catch { /* non-critical */ }
 }

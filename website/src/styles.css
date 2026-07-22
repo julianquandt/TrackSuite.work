@@ -1837,9 +1837,25 @@ button[type="submit"] {
 .update-list li { font-size: 0.9rem; line-height: 1.55; color: var(--text-secondary); }
 .update-tag { display: inline-block; font-family: var(--font-mono); font-size: 0.62rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; margin-right: 0.5rem; border: 1px solid var(--border-subtle); }
 .update-auto .update-tag { color: var(--proj-c1); border-color: var(--proj-c1); }
+.update-apt .update-tag { color: var(--proj-c3); border-color: var(--proj-c3); }
 .update-assisted .update-tag { color: var(--proj-c2); border-color: var(--proj-c2); }
 .update-soon .update-tag { color: var(--text-tertiary); }
-.update-placeholder { display: block; margin-top: 0.3rem; font-style: italic; color: var(--text-tertiary); font-size: 0.82rem; }
+.apt-setup { margin: 1.6rem auto 0; max-width: 640px; text-align: left; }
+.apt-setup-title { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.7rem; }
+/* Three separated, copy-paste steps (page + .deb dialog). */
+.apt-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.85rem; }
+.apt-steps li { display: flex; flex-direction: column; gap: 0.35rem; }
+.apt-step-label { font-size: 0.76rem; font-weight: 600; color: var(--text-secondary); }
+.apt-steps pre { background: #11151c; color: #e6edf3; border-radius: 8px; padding: 0.7rem 0.9rem; overflow-x: auto; font-size: 0.72rem; line-height: 1.5; margin: 0; }
+.apt-steps code { font-family: var(--font-mono); white-space: pre; }
+
+/* .deb download → apt-nudge dialog */
+.deb-dialog { max-width: 620px; width: calc(100% - 2rem); border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--bg-panel); color: var(--text-primary); padding: 1.75rem; }
+.deb-dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
+.deb-dialog h3 { margin: 0 0 0.6rem; font-size: 1.2rem; }
+.deb-dialog > p { color: var(--text-secondary); font-size: 0.92rem; line-height: 1.55; margin: 0 0 1.1rem; }
+.deb-dialog .apt-steps { margin-bottom: 1.3rem; }
+.deb-dialog-actions { display: flex; justify-content: flex-end; gap: 0.75rem; flex-wrap: wrap; }
 
 /* ── Keyframes ────────────────────────────────────────────────────── */
 @keyframes mtl-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }

@@ -73,9 +73,12 @@ async function populateDownloads(): Promise<void> {
                 .sort((a, b) => p.exts.indexOf(extOf(a.name)) - p.exts.indexOf(extOf(b.name)));
             const mine = p.key === userOS;
             const btns = items.length
-                ? items.map((a, i) =>
-                    `<a class="btn ${i === 0 ? "btn-primary" : "btn-outline"} download-btn" href="${a.browser_download_url}" target="_blank" rel="noopener">${assetLabel(a.name)}</a>`
-                  ).join("")
+                ? items.map((a, i) => {
+                    // Route .deb clicks through the apt-nudge dialog first.
+                    const isDeb = a.name.toLowerCase().endsWith(".deb");
+                    const cls = `btn ${i === 0 ? "btn-primary" : "btn-outline"} download-btn${isDeb ? " deb-download" : ""}`;
+                    return `<a class="${cls}" href="${a.browser_download_url}" target="_blank" rel="noopener">${assetLabel(a.name)}</a>`;
+                  }).join("")
                 : `<span class="download-empty">Not in this release</span>`;
             return `<div class="download-card${mine ? " download-card-mine" : ""}">
                 <div class="download-card-head">${p.icon}<h3>${p.title}${mine ? `<span class="download-badge">Your system</span>` : ""}</h3></div>
@@ -144,6 +147,21 @@ function miniTimeline(opts: { live?: boolean; note?: string } = {}): string {
         ${liveBlock}
         ${note}
     </div>`;
+}
+
+// The apt setup as three separate, copy-paste steps. Reused on the download
+// section and in the .deb confirmation dialog.
+function aptStepsHtml(): string {
+    const key = "https://julianquandt.github.io/TrackSuite.work/apt/tracksuite-work.asc";
+    const url = "https://julianquandt.github.io/TrackSuite.work/apt";
+    return `<ol class="apt-steps">
+        <li><span class="apt-step-label">1 · Add the signing key</span>
+            <pre><code>curl -fsSL ${key} | sudo gpg --dearmor -o /usr/share/keyrings/tracksuite-work.gpg</code></pre></li>
+        <li><span class="apt-step-label">2 · Add the repository</span>
+            <pre><code>echo "deb [signed-by=/usr/share/keyrings/tracksuite-work.gpg] ${url} stable main" | sudo tee /etc/apt/sources.list.d/tracksuite-work.list</code></pre></li>
+        <li><span class="apt-step-label">3 · Install</span>
+            <pre><code>sudo apt update &amp;&amp; sudo apt install track-suite-work</code></pre></li>
+    </ol>`;
 }
 
 export function renderLanding(app: HTMLElement): void {
@@ -351,9 +369,14 @@ export function renderLanding(app: HTMLElement): void {
                 <h3>Staying up to date</h3>
                 <ul class="update-list">
                     <li class="update-auto"><span class="update-tag">Automatic</span> Windows, macOS and the Linux <strong>AppImage</strong> update themselves in the background.</li>
-                    <li class="update-assisted"><span class="update-tag">Assisted</span> The <strong>.deb</strong> and <strong>.rpm</strong> packages don't self-update: the app downloads the new package and opens it in your system installer.</li>
-                    <li class="update-soon"><span class="update-tag">Coming soon</span> A signed <strong>apt repository</strong> so Debian/Ubuntu can update with <code>apt upgrade</code>, and the <strong>Flatpak</strong> on Flathub. <span class="update-placeholder">apt setup instructions will appear here.</span></li>
+                    <li class="update-apt"><span class="update-tag">apt</span> On <strong>Debian / Ubuntu</strong>, add our repository once and update with a normal <code>apt upgrade</code>.</li>
+                    <li class="update-assisted"><span class="update-tag">Manual</span> The direct <strong>.deb</strong> / <strong>.rpm</strong> downloads open your system installer (no self-update) — handy if you'd rather not add a repo.</li>
+                    <li class="update-soon"><span class="update-tag">Coming soon</span> The <strong>Flatpak</strong> on Flathub.</li>
                 </ul>
+                <div class="apt-setup">
+                    <p class="apt-setup-title">Debian / Ubuntu — set up apt</p>
+                    ${aptStepsHtml()}
+                </div>
             </div>
         </section>
 
@@ -378,6 +401,16 @@ export function renderLanding(app: HTMLElement): void {
             </div>
         </section>
 
+        <dialog id="deb-apt-dialog" class="deb-dialog">
+            <h3>Get automatic updates with apt</h3>
+            <p>The <code>.deb</code> installs fine, but it won't update itself — you'd download a fresh one each release. On Debian/Ubuntu we recommend adding our apt repository instead, so updates arrive with a normal <code>apt upgrade</code>.</p>
+            ${aptStepsHtml()}
+            <div class="deb-dialog-actions">
+                <a id="deb-proceed" class="btn btn-outline" href="" target="_blank" rel="noopener">Just download the .deb</a>
+                <button id="deb-done" class="btn btn-primary" type="button">I'll use apt</button>
+            </div>
+        </dialog>
+
         <footer class="site-footer">
             <p>&copy; ${new Date().getFullYear()} TrackSuite.work OSS. Under MIT License.</p>
         </footer>
@@ -390,6 +423,20 @@ export function renderLanding(app: HTMLElement): void {
             document.getElementById("downloads")?.scrollIntoView({ behavior: "smooth", block: "start" });
         });
     });
+
+    // Nudge .deb downloaders toward apt (which auto-updates) before the direct
+    // download. Delegated on the grid, which populateDownloads refills.
+    const debDialog = document.getElementById("deb-apt-dialog") as HTMLDialogElement | null;
+    document.getElementById("download-grid")?.addEventListener("click", (e) => {
+        const link = (e.target as HTMLElement).closest<HTMLAnchorElement>(".deb-download");
+        if (!link || !debDialog) return;
+        e.preventDefault();
+        const proceed = document.getElementById("deb-proceed") as HTMLAnchorElement | null;
+        if (proceed) proceed.href = link.href;
+        debDialog.showModal();
+    });
+    document.getElementById("deb-done")?.addEventListener("click", () => debDialog?.close());
+    document.getElementById("deb-proceed")?.addEventListener("click", () => debDialog?.close());
 
     void populateDownloads();
     observeReveals();
