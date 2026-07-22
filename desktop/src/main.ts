@@ -317,19 +317,6 @@ function inclusiveDateRange(startDate: string, endDate: string): string[] {
   return dates;
 }
 
-async function toggleOffDays(dates: string[]) {
-  const current = new Set((await offDays.getOffDays()).map((item) => item.date));
-  for (const date of dates) {
-    if (current.has(date)) {
-      await offDays.removeOffDay(date);
-      current.delete(date);
-    } else {
-      await offDays.addOffDay(date);
-      current.add(date);
-    }
-  }
-}
-
 function setScheduleStatus(message: string) {
   document.getElementById("schedule-status")!.textContent = message;
 }
@@ -712,6 +699,7 @@ app.innerHTML = `
           <h2>Recent shifts</h2>
           <div class="btn-row">
             <button class="btn btn-sm" id="btn-add-shift">+ Add shift</button>
+            <button class="btn btn-sm" id="btn-jump-offdays" title="Jump to the off-days calendar">Off days ↓</button>
             <button class="btn btn-sm" id="btn-export">Export CSV</button>
             <button class="btn btn-sm" id="btn-import">Import CSV</button>
           </div>
@@ -726,21 +714,20 @@ app.innerHTML = `
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel" id="offdays-panel">
         <div class="panel-header">
           <h2>Off days</h2>
           <div class="btn-row offcal-nav">
             <button class="btn btn-sm" id="offcal-prev" aria-label="Previous month">‹</button>
             <span class="offcal-title" id="offcal-title"></span>
             <button class="btn btn-sm" id="offcal-next" aria-label="Next month">›</button>
-            <button class="btn btn-sm" id="btn-add-offday">Manage</button>
           </div>
         </div>
         <div class="calendar-days-header">
           <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
         </div>
         <div class="calendar-grid" id="offcal-grid"></div>
-        <p class="muted offcal-hint">Click a day to toggle it as an off day. Use “Manage” for bulk ranges.</p>
+        <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Click a single day to toggle it.</p>
       </section>
     </div>
 
@@ -1032,28 +1019,6 @@ app.innerHTML = `
     <div class="btn-row modal-actions">
       <button class="btn btn-ghost" type="button" id="btn-close-projects">Done</button>
     </div>
-  </dialog>
-
-  <!-- Add off-day dialog -->
-  <dialog id="dlg-offday" class="modal modal-wide">
-    <form id="form-offday">
-      <h3>Manage off days</h3>
-      <p class="modal-note">Toggle a single date, or choose a start and end date to toggle an entire range.</p>
-      <p id="offday-form-error" class="modal-error" hidden></p>
-      <div class="modal-grid">
-        <label>Start date
-          <input type="text" id="inp-offday-start" placeholder="2026-04-01" inputmode="numeric" autocomplete="off" spellcheck="false" required>
-        </label>
-        <label>End date
-          <input type="text" id="inp-offday-end" placeholder="2026-04-03" inputmode="numeric" autocomplete="off" spellcheck="false">
-        </label>
-      </div>
-      <div class="btn-row modal-actions">
-        <button class="btn" type="submit" value="single">Toggle day</button>
-        <button class="btn btn-primary" type="submit" value="range">Toggle range</button>
-        <button class="btn btn-ghost" type="button" id="btn-cancel-offday">Cancel</button>
-      </div>
-    </form>
   </dialog>
 
   <!-- Onboarding dialog -->
@@ -2015,20 +1980,80 @@ function renderOffdayCalendar() {
     const cell = document.createElement("div");
     cell.textContent = String(day);
     const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    cell.dataset.date = dateKey;
     if (dateKey === todayStr) cell.classList.add("cal-today");
-    const isOff = offDayDatesCache.has(dateKey);
-    if (isOff) cell.classList.add("cal-offday");
-    cell.title = isOff ? "Off day — click to remove" : "Click to mark as an off day";
-    cell.addEventListener("click", async () => {
-      try {
-        if (isOff) await offDays.removeOffDay(dateKey);
-        else await offDays.addOffDay(dateKey);
-        await refresh();
-        performSync();
-      } catch (err) { console.error("Failed to toggle off day", err); }
-    });
+    if (offDayDatesCache.has(dateKey)) cell.classList.add("cal-offday");
     grid.appendChild(cell);
   }
+}
+
+// Drag-to-paint off days on the calendar. The cell you press sets the mode
+// (press an empty day → add across the drag; press an off day → clear across
+// it); a plain click is just a one-day range. Wired once — the #offcal-grid node
+// persists across re-renders (renderOffdayCalendar only swaps its innerHTML).
+let offDragActive = false;
+let offDragMode: "add" | "remove" = "add";
+let offDragAnchor: string | null = null;
+let offDragCurrent: string | null = null;
+
+async function applyOffDays(dates: string[], mode: "add" | "remove") {
+  for (const d of dates) {
+    const isOff = offDayDatesCache.has(d);
+    if (mode === "add" && !isOff) await offDays.addOffDay(d);
+    else if (mode === "remove" && isOff) await offDays.removeOffDay(d);
+  }
+}
+
+function paintOffDragPreview() {
+  const grid = document.getElementById("offcal-grid");
+  if (!grid || !offDragAnchor || !offDragCurrent) return;
+  const range = new Set(inclusiveDateRange(offDragAnchor, offDragCurrent));
+  grid.querySelectorAll<HTMLElement>("[data-date]").forEach((cell) => {
+    const inRange = range.has(cell.dataset.date!);
+    cell.classList.toggle("cal-drag-add", inRange && offDragMode === "add");
+    cell.classList.toggle("cal-drag-remove", inRange && offDragMode === "remove");
+  });
+}
+
+async function endOffDrag() {
+  if (!offDragActive) return;
+  offDragActive = false;
+  const anchor = offDragAnchor;
+  const current = offDragCurrent;
+  offDragAnchor = offDragCurrent = null;
+  if (!anchor || !current) return;
+  try {
+    await applyOffDays(inclusiveDateRange(anchor, current), offDragMode);
+    await refresh(); // re-renders the calendar, clearing the preview classes
+    performSync();
+  } catch (err) {
+    console.error("Failed to apply off days", err);
+    renderOffdayCalendar(); // at least clear the preview highlight
+  }
+}
+
+function initOffdayCalendar() {
+  const grid = document.getElementById("offcal-grid");
+  if (!grid) return;
+  const cellDate = (e: Event): string | null =>
+    (e.target as HTMLElement)?.closest<HTMLElement>("[data-date]")?.dataset.date ?? null;
+  grid.addEventListener("mousedown", (e) => {
+    const d = cellDate(e);
+    if (!d) return;
+    e.preventDefault(); // don't text-select while dragging
+    offDragActive = true;
+    offDragAnchor = offDragCurrent = d;
+    offDragMode = offDayDatesCache.has(d) ? "remove" : "add";
+    paintOffDragPreview();
+  });
+  grid.addEventListener("mouseover", (e) => {
+    if (!offDragActive) return;
+    const d = cellDate(e);
+    if (!d) return;
+    offDragCurrent = d;
+    paintOffDragPreview();
+  });
+  window.addEventListener("mouseup", () => { void endOffDrag(); });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2789,47 +2814,12 @@ document.getElementById("offcal-next")!.addEventListener("click", () => {
   offCalMonth++; if (offCalMonth > 11) { offCalMonth = 0; offCalYear++; }
   renderOffdayCalendar();
 });
-document.getElementById("btn-add-offday")!.addEventListener("click", () => {
-  clearDialogError("offday-form-error");
-  (document.getElementById("inp-offday-start") as HTMLInputElement).value = localDateKey(new Date());
-  (document.getElementById("inp-offday-end") as HTMLInputElement).value = "";
-  (document.getElementById("dlg-offday") as HTMLDialogElement).showModal();
-  (document.getElementById("inp-offday-start") as HTMLInputElement).focus();
-});
-(document.getElementById("btn-cancel-offday") as HTMLButtonElement).addEventListener("click", () => {
-  (document.getElementById("dlg-offday") as HTMLDialogElement).close("cancel");
-});
-(document.getElementById("dlg-offday") as HTMLDialogElement).addEventListener("close", () => {
-  clearDialogError("offday-form-error");
-});
-(document.getElementById("form-offday") as HTMLFormElement).addEventListener("submit", async (e) => {
-  e.preventDefault();
-  clearDialogError("offday-form-error");
+// Drag-to-paint off days on the calendar (replaces the old bulk-range dialog).
+initOffdayCalendar();
 
-  const submitter = (e as SubmitEvent).submitter as HTMLButtonElement | null;
-  const mode = submitter?.value ?? "single";
-  const startDate = normalizeDateInputValue((document.getElementById("inp-offday-start") as HTMLInputElement).value);
-  const endDateRaw = (document.getElementById("inp-offday-end") as HTMLInputElement).value;
-
-  if (!startDate) {
-    setDialogError("offday-form-error", "Use YYYY-MM-DD for dates.");
-    return;
-  }
-
-  const endDate = endDateRaw.trim() ? normalizeDateInputValue(endDateRaw) : null;
-  if (endDateRaw.trim() && !endDate) {
-    setDialogError("offday-form-error", "Use YYYY-MM-DD for dates.");
-    return;
-  }
-
-  const dates = mode === "range"
-    ? inclusiveDateRange(startDate, endDate || startDate)
-    : [startDate];
-
-  await toggleOffDays(dates);
-  (document.getElementById("dlg-offday") as HTMLDialogElement).close(mode);
-  await refresh();
-  performSync();
+// "Off days ↓" next to Add shift scrolls the dashboard to the calendar.
+document.getElementById("btn-jump-offdays")!.addEventListener("click", () => {
+  document.getElementById("offdays-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
 });
 
 (document.getElementById("btn-close-projects") as HTMLButtonElement).addEventListener("click", () => {
@@ -2933,6 +2923,17 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "0.9.1",
+    date: "2026-07-22",
+    title: "Paint your off days",
+    changes: [
+      "Off days moved to the dashboard, where you now paint them straight on the calendar: press a day and drag to mark a stretch off — drag over existing off days to clear them, or click a single day to toggle it. The old range dialog is gone.",
+      "New “Off days ↓” button next to Add shift jumps you to the calendar.",
+      "On Debian/Ubuntu you can now install from an apt repository and get updates with a normal apt upgrade — see the download page.",
+      "Fixed off-day cells that could be unreadable on some colour themes.",
+    ],
+  },
   {
     version: "0.9.0",
     date: "2026-07-22",

@@ -302,7 +302,7 @@ export function renderTracker(app: HTMLElement): void {
                         <button class="btn btn-primary" id="btn-clock-action" type="button">Clock In</button>
                         <button class="btn btn-danger" id="btn-clock-discard" type="button" style="display:none;">Discard Current</button>
                         <button class="btn btn-outline" id="btn-add-manual" type="button">Log Shift Manually</button>
-                        <button class="btn btn-outline" id="btn-manage-offdays" type="button">Manage Off Days</button>
+                        <button class="btn btn-outline" id="btn-jump-offdays" type="button" title="Jump to the off-days calendar">Off days ↓</button>
                     </div>
 
                     <div class="progress-container">
@@ -384,6 +384,23 @@ export function renderTracker(app: HTMLElement): void {
                             </tbody>
                         </table>
                     </div>
+                </section>
+
+                <!-- Scheduled off days: monthly calendar (drag to paint) -->
+                <section class="dash-section" id="offday-calendar-panel">
+                    <div class="section-row" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                        <h3>Scheduled Off Days</h3>
+                        <div class="offcal-nav">
+                            <button type="button" class="btn btn-outline btn-small" id="offcal-prev" aria-label="Previous month">‹</button>
+                            <span class="offcal-title" id="offcal-title"></span>
+                            <button type="button" class="btn btn-outline btn-small" id="offcal-next" aria-label="Next month">›</button>
+                        </div>
+                    </div>
+                    <div class="calendar-days-header" style="display:grid; grid-template-columns:repeat(7, 1fr); text-align:center; font-weight:700; font-size:0.7rem; color:var(--text-secondary); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.05em;">
+                        <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+                    </div>
+                    <div class="calendar-grid" id="offcal-grid" style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px;"></div>
+                    <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Click a single day to toggle it.</p>
                 </section>
             </div>
 
@@ -472,22 +489,6 @@ export function renderTracker(app: HTMLElement): void {
                     </div>
                 </div>
 
-                <!-- Scheduled off days: monthly calendar (moved to the bottom) -->
-                <div class="chart-panel" id="offday-calendar-panel">
-                    <div class="section-row" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                        <h3>Scheduled Off Days</h3>
-                        <div class="offcal-nav">
-                            <button type="button" class="btn btn-outline btn-small" id="offcal-prev" aria-label="Previous month">‹</button>
-                            <span class="offcal-title" id="offcal-title"></span>
-                            <button type="button" class="btn btn-outline btn-small" id="offcal-next" aria-label="Next month">›</button>
-                        </div>
-                    </div>
-                    <div class="calendar-days-header" style="display:grid; grid-template-columns:repeat(7, 1fr); text-align:center; font-weight:700; font-size:0.7rem; color:var(--text-secondary); margin-bottom:8px; text-transform:uppercase; letter-spacing:0.05em;">
-                        <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
-                    </div>
-                    <div class="calendar-grid" id="offcal-grid" style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px;"></div>
-                    <p class="muted offcal-hint">Click a day to toggle it as an off day. Use “Manage Off Days” for bulk ranges.</p>
-                </div>
             </div>
 
             <!-- ═══ Tab: Settings ═══ -->
@@ -585,40 +586,6 @@ export function renderTracker(app: HTMLElement): void {
             </form>
         </dialog>
 
-        <!-- Off Day Dialog -->
-        <dialog id="dlg-offday" class="modal modal-wide" style="max-width: 440px;">
-            <div style="padding: 4px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px;">
-                    <h3 style="margin:0;">Manage Off Days</h3>
-                    <button class="btn btn-ghost" type="button" id="btn-cancel-offday" style="padding: 4px 8px; font-size:1.5rem; line-height:1; border:none; background:none; cursor:pointer; color:var(--text-secondary);">&times;</button>
-                </div>
-                <p class="modal-note" style="margin-bottom: 16px;">Click the start date, then the end date of a range. Click "Confirm Changes" to apply.</p>
-                
-                <div class="calendar-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 16px;">
-                    <button class="btn btn-outline btn-small" id="btn-cal-prev" type="button" style="padding: 4px 10px;">&lt;</button>
-                    <span id="cal-month-title" style="font-weight:700; font-size:1.1rem; color:var(--text-primary);">July 2026</span>
-                    <button class="btn btn-outline btn-small" id="btn-cal-next" type="button" style="padding: 4px 10px;">&gt;</button>
-                </div>
-                
-                <div class="calendar-days-header" style="display:grid; grid-template-columns:repeat(7, 1fr); text-align:center; font-weight:700; font-size:0.75rem; color:var(--text-secondary); margin-bottom:8px; text-transform: uppercase; letter-spacing: 0.05em;">
-                    <div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div>
-                </div>
-                
-                <div class="calendar-grid" id="calendar-days-grid" style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px; min-height: 200px; margin-bottom: 16px;">
-                    <!-- Rendered dynamically -->
-                </div>
-
-                <div id="calendar-selection-status" style="font-size:0.85rem; color:var(--text-secondary); margin-bottom: 16px; min-height: 1.25rem;">
-                    No range selected.
-                </div>
-
-                <div class="btn-row modal-actions" style="display:flex; gap:8px; justify-content:flex-end;">
-                    <button class="btn btn-ghost btn-small" type="button" id="btn-cal-clear" style="padding: 6px 12px;">Clear</button>
-                    <button class="btn btn-primary btn-small" type="button" id="btn-cal-confirm" disabled style="padding: 6px 12px;">Confirm Changes</button>
-                </div>
-            </div>
-        </dialog>
-
         <!-- Manage Projects Dialog -->
         <dialog id="dlg-projects" class="modal modal-wide">
             <h3>Manage Projects</h3>
@@ -639,14 +606,10 @@ export function renderTracker(app: HTMLElement): void {
     const clockBtn = document.getElementById("btn-clock-action") as HTMLButtonElement;
     const discardBtn = document.getElementById("btn-clock-discard") as HTMLButtonElement;
     const addManualBtn = document.getElementById("btn-add-manual") as HTMLButtonElement;
-    const manageOffdaysBtn = document.getElementById("btn-manage-offdays") as HTMLButtonElement;
 
     const dlgShift = document.getElementById("dlg-shift") as HTMLDialogElement;
     const formShift = document.getElementById("form-shift") as HTMLFormElement;
     const btnCancelShift = document.getElementById("btn-cancel-shift") as HTMLButtonElement;
-
-    const dlgOffday = document.getElementById("dlg-offday") as HTMLDialogElement;
-    const btnCancelOffday = document.getElementById("btn-cancel-offday") as HTMLButtonElement;
 
     const tabLinks = document.querySelectorAll(".tab-link");
     const tabPages = document.querySelectorAll(".tab-page");
@@ -1595,11 +1558,6 @@ export function renderTracker(app: HTMLElement): void {
 
     btnCancelShift.addEventListener("click", () => dlgShift.close());
 
-    let calYear = new Date().getFullYear();
-    let calMonth = new Date().getMonth();
-    let selectionStart: string | null = null;
-    let selectionEnd: string | null = null;
-
     const monthNames = [
         "January", "February", "March", "April", "May", "June",
         "July", "August", "September", "October", "November", "December"
@@ -1617,92 +1575,8 @@ export function renderTracker(app: HTMLElement): void {
         return dates;
     }
 
-    function updateCalendarView() {
-        const grid = document.getElementById("calendar-days-grid");
-        const title = document.getElementById("cal-month-title");
-        if (!grid || !title) return;
-
-        title.textContent = `${monthNames[calMonth]} ${calYear}`;
-        grid.innerHTML = "";
-
-        const firstDay = new Date(calYear, calMonth, 1);
-        let startOffset = firstDay.getDay();
-        startOffset = startOffset === 0 ? 6 : startOffset - 1;
-
-        const numDays = new Date(calYear, calMonth + 1, 0).getDate();
-        const offDayDates = new Map(offDaysCached.map(o => [o.date, o.id]));
-        const todayStr = localDateKey(new Date());
-
-        for (let i = 0; i < startOffset; i++) {
-            const emptyCell = document.createElement("div");
-            emptyCell.className = "cal-empty";
-            grid.appendChild(emptyCell);
-        }
-
-        for (let day = 1; day <= numDays; day++) {
-            const cell = document.createElement("div");
-            cell.textContent = String(day);
-
-            const mStr = String(calMonth + 1).padStart(2, "0");
-            const dStr = String(day).padStart(2, "0");
-            const dateKey = `${calYear}-${mStr}-${dStr}`;
-
-            if (dateKey === todayStr) {
-                cell.classList.add("cal-today");
-            }
-
-            const offDayId = offDayDates.get(dateKey);
-            if (offDayId !== undefined) {
-                cell.classList.add("cal-offday");
-            }
-
-            if (selectionStart !== null && selectionEnd !== null) {
-                if (dateKey >= selectionStart && dateKey <= selectionEnd) {
-                    cell.classList.add("cal-selected");
-                }
-            }
-
-            cell.addEventListener("click", () => {
-                if (selectionStart === null) {
-                    selectionStart = dateKey;
-                    selectionEnd = dateKey;
-                } else if (selectionStart !== null && selectionEnd === selectionStart) {
-                    selectionEnd = dateKey;
-                    if (selectionEnd < selectionStart) {
-                        const tmp = selectionStart;
-                        selectionStart = selectionEnd;
-                        selectionEnd = tmp;
-                    }
-                } else {
-                    selectionStart = dateKey;
-                    selectionEnd = dateKey;
-                }
-                updateCalendarView();
-            });
-
-            grid.appendChild(cell);
-        }
-
-        // Update Selection Status and Buttons
-        const statusEl = document.getElementById("calendar-selection-status");
-        const confirmBtn = document.getElementById("btn-cal-confirm") as HTMLButtonElement;
-
-        if (statusEl && confirmBtn) {
-            if (selectionStart === null || selectionEnd === null) {
-                statusEl.textContent = "No range selected. Click a start date, then end date.";
-                confirmBtn.disabled = true;
-            } else {
-                const rangeDates = getDatesInRange(selectionStart, selectionEnd);
-                const toAdd = rangeDates.filter(d => !offDayDates.has(d));
-                const toRemove = rangeDates.filter(d => offDayDates.has(d));
-                statusEl.textContent = `Selected: ${selectionStart} to ${selectionEnd} (${rangeDates.length} days: ${toAdd.length} to add, ${toRemove.length} to remove).`;
-                confirmBtn.disabled = false;
-            }
-        }
-    }
-
-    // Inline monthly off-day calendar on the Statistics tab. Clicking a day
-    // toggles it; bulk ranges still go through the "Manage Off Days" modal.
+    // Inline monthly off-day calendar on the dashboard. Drag across days to
+    // paint them (see initOffdayCalendar); a single click toggles one day.
     function renderOffdayCalendar() {
         const grid = document.getElementById("offcal-grid");
         const title = document.getElementById("offcal-title");
@@ -1724,17 +1598,9 @@ export function renderTracker(app: HTMLElement): void {
             const cell = document.createElement("div");
             cell.textContent = String(day);
             const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+            cell.dataset.date = dateKey;
             if (dateKey === todayStr) cell.classList.add("cal-today");
-            const offId = offDayIds.get(dateKey);
-            if (offId !== undefined) cell.classList.add("cal-offday");
-            cell.title = offId !== undefined ? "Off day — click to remove" : "Click to mark as an off day";
-            cell.addEventListener("click", async () => {
-                try {
-                    if (offId !== undefined) await deleteOffDay(offId);
-                    else await createOffDay(dateKey);
-                    await refreshData();
-                } catch (err) { console.error("Failed to toggle off day", err); }
-            });
+            if (offDayIds.has(dateKey)) cell.classList.add("cal-offday");
             grid.appendChild(cell);
         }
     }
@@ -1747,68 +1613,74 @@ export function renderTracker(app: HTMLElement): void {
         renderOffdayCalendar();
     });
 
-    manageOffdaysBtn.addEventListener("click", () => {
-        calYear = new Date().getFullYear();
-        calMonth = new Date().getMonth();
-        selectionStart = null;
-        selectionEnd = null;
-        updateCalendarView();
-        dlgOffday.showModal();
-    });
+    // Drag-to-paint off days: press a day and drag to select a range. The day you
+    // press sets the mode (press an empty day → add across the drag; press an off
+    // day → clear it); a plain click is a one-day range.
+    let offDragActive = false;
+    let offDragMode: "add" | "remove" = "add";
+    let offDragAnchor: string | null = null;
+    let offDragCurrent: string | null = null;
 
-    btnCancelOffday.addEventListener("click", () => dlgOffday.close());
+    const offRange = (a: string, b: string): string[] => (a <= b ? getDatesInRange(a, b) : getDatesInRange(b, a));
 
-    document.getElementById("btn-cal-prev")?.addEventListener("click", () => {
-        calMonth--;
-        if (calMonth < 0) {
-            calMonth = 11;
-            calYear--;
+    async function applyOffDays(dates: string[], mode: "add" | "remove") {
+        const offIds = new Map(offDaysCached.map(o => [o.date, o.id]));
+        for (const d of dates) {
+            const offId = offIds.get(d);
+            if (mode === "add" && offId === undefined) await createOffDay(d);
+            else if (mode === "remove" && offId !== undefined) await deleteOffDay(offId);
         }
-        updateCalendarView();
-    });
+    }
 
-    document.getElementById("btn-cal-next")?.addEventListener("click", () => {
-        calMonth++;
-        if (calMonth > 11) {
-            calMonth = 0;
-            calYear++;
-        }
-        updateCalendarView();
-    });
+    function paintOffDragPreview() {
+        const grid = document.getElementById("offcal-grid");
+        if (!grid || !offDragAnchor || !offDragCurrent) return;
+        const range = new Set(offRange(offDragAnchor, offDragCurrent));
+        grid.querySelectorAll<HTMLElement>("[data-date]").forEach(cell => {
+            const inRange = range.has(cell.dataset.date!);
+            cell.classList.toggle("cal-drag-add", inRange && offDragMode === "add");
+            cell.classList.toggle("cal-drag-remove", inRange && offDragMode === "remove");
+        });
+    }
 
-    document.getElementById("btn-cal-clear")?.addEventListener("click", () => {
-        selectionStart = null;
-        selectionEnd = null;
-        updateCalendarView();
-    });
+    async function endOffDrag() {
+        if (!offDragActive) return;
+        offDragActive = false;
+        const anchor = offDragAnchor, current = offDragCurrent;
+        offDragAnchor = offDragCurrent = null;
+        if (!anchor || !current) return;
+        try {
+            await applyOffDays(offRange(anchor, current), offDragMode);
+            await refreshData(); // re-renders the calendar, clearing preview classes
+        } catch (err) { console.error("Failed to apply off days", err); }
+    }
 
-    const btnCalConfirm = document.getElementById("btn-cal-confirm") as HTMLButtonElement;
-    btnCalConfirm?.addEventListener("click", async () => {
-        if (!selectionStart || !selectionEnd) return;
-        btnCalConfirm.disabled = true;
-        btnCalConfirm.textContent = "Saving...";
+    const offcalGrid = document.getElementById("offcal-grid");
+    if (offcalGrid) {
+        const cellDate = (e: Event): string | null =>
+            (e.target as HTMLElement)?.closest<HTMLElement>("[data-date]")?.dataset.date ?? null;
+        offcalGrid.addEventListener("mousedown", (e) => {
+            const d = cellDate(e);
+            if (!d) return;
+            e.preventDefault(); // don't text-select while dragging
+            offDragActive = true;
+            offDragAnchor = offDragCurrent = d;
+            offDragMode = offDaysCached.some(o => o.date === d) ? "remove" : "add";
+            paintOffDragPreview();
+        });
+        offcalGrid.addEventListener("mouseover", (e) => {
+            if (!offDragActive) return;
+            const d = cellDate(e);
+            if (!d) return;
+            offDragCurrent = d;
+            paintOffDragPreview();
+        });
+        window.addEventListener("mouseup", () => { void endOffDrag(); });
+    }
 
-        const rangeDates = getDatesInRange(selectionStart, selectionEnd);
-        const offDayDates = new Map(offDaysCached.map(o => [o.date, o.id]));
-
-        for (const date of rangeDates) {
-            try {
-                const offDayId = offDayDates.get(date);
-                if (offDayId !== undefined) {
-                    await deleteOffDay(offDayId);
-                } else {
-                    await createOffDay(date);
-                }
-            } catch (err) {
-                console.error(`Failed to toggle off day for ${date}:`, err);
-            }
-        }
-
-        selectionStart = null;
-        selectionEnd = null;
-        await refreshData();
-        btnCalConfirm.textContent = "Confirm Changes";
-        dlgOffday.close();
+    // "Off days ↓" in the clock panel scrolls the dashboard to the calendar.
+    document.getElementById("btn-jump-offdays")?.addEventListener("click", () => {
+        document.getElementById("offday-calendar-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
 
     // Save Work Schedule
@@ -2408,7 +2280,6 @@ export function renderTracker(app: HTMLElement): void {
                 });
             });
         }
-        updateCalendarView();
     }
 
     // Run Initial Data Pull

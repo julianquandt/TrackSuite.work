@@ -1,103 +1,310 @@
+const PUBLIC_REPO = "julianquandt/TrackSuite.work";
+
+type GhAsset = { name: string; browser_download_url: string };
+type OS = "windows" | "macos" | "linux";
+
+// Platform groups, in the order their files should appear (primary first).
+const PLATFORMS: { key: OS; title: string; exts: string[]; icon: string }[] = [
+    {
+        key: "windows", title: "Windows", exts: [".exe", ".msi"],
+        icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>`,
+    },
+    {
+        key: "macos", title: "macOS", exts: [".dmg"],
+        icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="4" width="18" height="12" rx="2"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`,
+    },
+    {
+        key: "linux", title: "Linux", exts: [".appimage", ".deb", ".rpm", ".flatpak"],
+        icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="6 9 9 12 6 15"/><line x1="12" y1="15" x2="16" y2="15"/></svg>`,
+    },
+];
+
+function detectOS(): OS | "other" {
+    const ua = navigator.userAgent.toLowerCase();
+    if (ua.includes("windows")) return "windows";
+    if (ua.includes("mac os") || ua.includes("macintosh")) return "macos";
+    if (ua.includes("linux") || ua.includes("x11")) return "linux";
+    return "other";
+}
+
+function extOf(name: string): string {
+    const m = name.toLowerCase().match(/\.[a-z0-9]+$/);
+    return m ? m[0] : "";
+}
+
+function assetLabel(name: string): string {
+    const n = name.toLowerCase();
+    if (n.endsWith(".exe")) return "Windows installer (.exe)";
+    if (n.endsWith(".msi")) return "Windows (.msi)";
+    if (n.endsWith(".dmg")) {
+        if (n.includes("aarch64") || n.includes("arm64")) return "Apple Silicon (.dmg)";
+        if (n.includes("x64") || n.includes("x86_64") || n.includes("intel")) return "Intel (.dmg)";
+        return "macOS (.dmg)";
+    }
+    if (n.endsWith(".appimage")) return "AppImage (portable)";
+    if (n.endsWith(".deb")) return "Debian / Ubuntu (.deb)";
+    if (n.endsWith(".rpm")) return "Fedora / RHEL (.rpm)";
+    if (n.endsWith(".flatpak")) return "Flatpak";
+    return name;
+}
+
+// Populate the download grid from the latest GitHub release. Assets are versioned
+// (names change each release), so we resolve real download URLs at runtime rather
+// than hardcode them. Falls back to a single "latest release" button on any error
+// (rate limit, offline, or no published release yet).
+async function populateDownloads(): Promise<void> {
+    const grid = document.getElementById("download-grid");
+    const versionEl = document.getElementById("download-version");
+    if (!grid) return;
+    try {
+        const res = await fetch(`https://api.github.com/repos/${PUBLIC_REPO}/releases/latest`, {
+            headers: { Accept: "application/vnd.github+json" },
+        });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        const assets: GhAsset[] = Array.isArray(data.assets) ? data.assets : [];
+        const userOS = detectOS();
+        const ordered = [...PLATFORMS].sort((a, b) =>
+            (a.key === userOS ? -1 : 0) - (b.key === userOS ? -1 : 0));
+
+        grid.innerHTML = ordered.map((p) => {
+            const items = assets
+                .filter((a) => p.exts.includes(extOf(a.name)))
+                .sort((a, b) => p.exts.indexOf(extOf(a.name)) - p.exts.indexOf(extOf(b.name)));
+            const mine = p.key === userOS;
+            const btns = items.length
+                ? items.map((a, i) =>
+                    `<a class="btn ${i === 0 ? "btn-primary" : "btn-outline"} download-btn" href="${a.browser_download_url}" target="_blank" rel="noopener">${assetLabel(a.name)}</a>`
+                  ).join("")
+                : `<span class="download-empty">Not in this release</span>`;
+            return `<div class="download-card${mine ? " download-card-mine" : ""}">
+                <div class="download-card-head">${p.icon}<h3>${p.title}${mine ? `<span class="download-badge">Your system</span>` : ""}</h3></div>
+                <div class="download-card-btns">${btns}</div>
+            </div>`;
+        }).join("");
+
+        if (versionEl && data.tag_name) versionEl.textContent = `Latest release: ${data.tag_name}`;
+    } catch {
+        grid.innerHTML = `<a class="btn btn-primary" href="https://github.com/${PUBLIC_REPO}/releases/latest" target="_blank" rel="noopener">Download latest release</a>
+            <p class="download-empty">Couldn't load individual files just now — the latest release has installers for every platform.</p>`;
+    }
+}
+
+// Reveal-on-scroll for feature blocks. Honours reduced-motion by showing
+// everything immediately.
+function observeReveals(): void {
+    const reveals = Array.from(document.querySelectorAll<HTMLElement>(".reveal"));
+    if (!reveals.length) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduce || !("IntersectionObserver" in window)) {
+        reveals.forEach((el) => el.classList.add("in-view"));
+        return;
+    }
+    const io = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+            if (e.isIntersecting) { e.target.classList.add("in-view"); io.unobserve(e.target); }
+        }
+    }, { threshold: 0.25 });
+    reveals.forEach((el) => io.observe(el));
+}
+
+// The hero timeline's running block counts up from page load — a live, honest
+// timer, the way the app itself shows an open shift.
+let heroTimer: number | undefined;
+function startHeroTimer(): void {
+    const el = document.getElementById("hero-live-time");
+    if (!el) return;
+    if (heroTimer) window.clearInterval(heroTimer); // don't stack across re-renders
+    const start = Date.now() - 2 * 3600_000 - 47 * 60_000; // seed at ~2h47m so it reads full
+    const tick = () => {
+        const s = Math.floor((Date.now() - start) / 1000);
+        const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+        const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+        const ss = String(s % 60).padStart(2, "0");
+        el.textContent = `${hh}:${mm}:${ss}`;
+    };
+    tick();
+    heroTimer = window.setInterval(tick, 1000);
+}
+
+// A mini day-timeline (colored project blocks + a live one). Reused in the hero
+// and feature visuals; blocks grow in on load/reveal.
+function miniTimeline(opts: { live?: boolean; note?: string } = {}): string {
+    const note = opts.note
+        ? `<span class="mtl-note" style="left:41%"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>${opts.note}</span>`
+        : "";
+    const liveBlock = opts.live
+        ? `<span class="mtl-block mtl-live" style="left:80%;width:15%"></span>`
+        : `<span class="mtl-block mtl-c1" style="left:80%;width:11%"></span>`;
+    return `<div class="mtl-track">
+        <span class="mtl-block mtl-c1" style="left:0%;width:23%"></span>
+        <span class="mtl-block mtl-c2" style="left:25%;width:13%"></span>
+        <span class="mtl-block mtl-c3" style="left:40%;width:28%"></span>
+        <span class="mtl-block mtl-c2" style="left:70%;width:8%"></span>
+        ${liveBlock}
+        ${note}
+    </div>`;
+}
+
 export function renderLanding(app: HTMLElement): void {
     app.innerHTML = `
         <section class="hero">
-            <h1>Track your work time,<br><span>effortlessly.</span></h1>
+            <span class="hero-eyebrow">Time tracking · menu bar &amp; browser</span>
+            <h1>Your workday, on <span>one clear timeline.</span></h1>
             <p>
-                TrackSuite.work lives in your system menu. Clock in seamlessly,
-                visualize your balance, and keep your data exactly where you want it.
+                Clock in from your menu bar or your browser. TrackSuite.work tracks
+                your hours offline, lets you assign them to projects on a visual
+                timeline, and turns them into reports — with sync only if you want it.
             </p>
             <div class="hero-actions">
-                <a href="#/register" class="btn btn-primary">Use Hosted Version</a>
-                <a href="#/docs" class="btn btn-outline">Self-Host Docs</a>
+                <a href="#/register" class="btn btn-primary">Open the web app</a>
+                <a href="#/" class="btn btn-outline scroll-downloads">Download for Desktop</a>
             </div>
-        </section>
 
-        <section class="features-container" id="features">
-            <div class="features-grid">
-                <div class="feature-cell">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                    <h3>Native Integration</h3>
-                    <p>Starts instantly from your macOS menu bar or Windows tray. No heavy Electron wrappers or browser tabs.</p>
+            <div class="hero-stage" aria-hidden="true">
+                <div class="hero-tl-head">
+                    <span class="hero-tl-day">Today</span>
+                    <span class="hero-tl-live"><span class="rec-dot"></span>Tracking <b id="hero-live-time">02:47:00</b></span>
                 </div>
-                <div class="feature-cell">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
-                    <h3>Backend Optional</h3>
-                    <p>TrackSuite.work works 100% offline. A backend is only needed if you want to sync between multiple machines.</p>
-                </div>
-                <div class="feature-cell">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-                    <h3>Privacy First</h3>
-                    <p>By default, your data never leaves your computer. You choose if and where to sync your work history.</p>
-                </div>
-                <div class="feature-cell">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-                    <h3>True Ownership</h3>
-                    <p>Whether you use our cloud or your own VPS, your database belongs to you. No vendor lock-in.</p>
+                <div class="hero-tl-ticks"><span>09:00</span><span>11:00</span><span>13:00</span><span>15:00</span><span>now</span></div>
+                ${miniTimeline({ live: true, note: "client call" })}
+                <div class="hero-tl-legend">
+                    <span><i class="dot dot-c1"></i>Acme</span>
+                    <span><i class="dot dot-c2"></i>Internal</span>
+                    <span><i class="dot dot-c3"></i>Design</span>
                 </div>
             </div>
         </section>
 
-        <style>
-            .pathway-section {
-                padding: 8rem 2rem;
-                border-top: 1px solid var(--border-subtle);
-                max-width: 1100px;
-                margin: 0 auto;
-            }
-            .pathway-row {
-                display: flex;
-                gap: 4rem;
-                margin-bottom: 6rem;
-                align-items: flex-start;
-            }
-            .pathway-row:last-child { margin-bottom: 0; }
-            .pathway-meta {
-                flex: 0 0 240px;
-                padding-top: 0.5rem;
-            }
-            .pathway-number {
-                display: block;
-                font-family: var(--font-mono);
-                font-size: 0.75rem;
-                color: var(--text-tertiary);
-                margin-bottom: 1rem;
-                letter-spacing: 0.1em;
-            }
-            .pathway-title {
-                font-size: 1.5rem;
-                font-weight: 600;
-                margin-bottom: 1rem;
-            }
-            .pathway-content {
-                flex: 1;
-                font-size: 1.125rem;
-                line-height: 1.6;
-            }
-            .pathway-actions {
-                margin-top: 2rem;
-                display: flex;
-                gap: 1rem;
-            }
-            @media (max-width: 768px) {
-                .pathway-row { flex-direction: column; gap: 1rem; margin-bottom: 4rem; }
-                .pathway-meta { flex: none; }
-            }
-        </style>
+        <!-- Web vs desktop: two ways to run the same tracker -->
+        <section class="section ways">
+            <div class="section-header">
+                <h2>Two ways to use it</h2>
+                <p>Same account, same timeline. Pick whichever fits the moment — or use both.</p>
+            </div>
+            <div class="ways-grid">
+                <article class="way-card">
+                    <div class="way-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="2" y1="8" x2="22" y2="8"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                    </div>
+                    <h3>Web app</h3>
+                    <p>Nothing to install. Open it in any browser, clock in, and your timeline is there — handy for trying it out or working from a machine that isn't yours. Backed by a server you choose: our cloud, or your own.</p>
+                    <a href="#/register" class="btn btn-primary btn-small">Open the web app</a>
+                </article>
+                <article class="way-card">
+                    <div class="way-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 6h16"/><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 21h6"/><circle cx="6" cy="4" r="1"/></svg>
+                    </div>
+                    <h3>Desktop app</h3>
+                    <p>A tiny menu-bar / tray companion that starts instantly and keeps running in the background. Tracks 100% offline with a local database; sync is optional. Windows, macOS and Linux.</p>
+                    <a href="#/" class="btn btn-outline btn-small scroll-downloads">Download for Desktop</a>
+                </article>
+            </div>
+        </section>
 
-        <section class="pathway-section">
-            <div class="section-header" style="text-align: left; margin-left: 0; max-width: 800px;">
-                <h2 style="font-size: 3rem; margin-bottom: 4rem;">Choose your infrastructure.</h2>
+        <!-- Feature showcase -->
+        <section class="section feats">
+            <div class="section-header">
+                <h2>Built around your day</h2>
+                <p>Every feature works toward one thing: an accurate, honest record of where your time went.</p>
+            </div>
+            <div class="feat-list">
+                <article class="feat reveal">
+                    <div class="feat-visual feat-visual-clock">
+                        <div class="fv-clock"><span class="rec-dot"></span><span class="fv-time">01:12:38</span></div>
+                        <div class="fv-caption">Menu bar · Tray · Browser</div>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>Clock in from anywhere</h3>
+                        <p>Start the timer from the menu bar, the tray, or a browser tab. It keeps counting even offline, and your running session shows live on the timeline.</p>
+                    </div>
+                </article>
+
+                <article class="feat feat-reverse reveal">
+                    <div class="feat-visual feat-visual-tl">
+                        <div class="fv-tl-ticks"><span>09</span><span>12</span><span>15</span><span>18</span></div>
+                        ${miniTimeline({ note: "kickoff notes" })}
+                        <div class="fv-brush">🖌 note brush</div>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>A visual timeline you can edit</h3>
+                        <p>Drag across your day to assign work to projects. Switched tasks a lot? Paint one note across several blocks with the note brush instead of typing them one at a time.</p>
+                    </div>
+                </article>
+
+                <article class="feat reveal">
+                    <div class="feat-visual feat-visual-bars">
+                        <div class="fv-bars">
+                            <span class="fv-bar" style="--h:42%"><i class="fv-seg fv-c3" style="height:60%"></i><i class="fv-seg fv-c1" style="height:40%"></i></span>
+                            <span class="fv-bar" style="--h:70%"><i class="fv-seg fv-c1" style="height:55%"></i><i class="fv-seg fv-c2" style="height:45%"></i></span>
+                            <span class="fv-bar" style="--h:55%"><i class="fv-seg fv-c1" style="height:100%"></i></span>
+                            <span class="fv-bar" style="--h:88%"><i class="fv-seg fv-c1" style="height:70%"></i><i class="fv-seg fv-c3" style="height:30%"></i></span>
+                            <span class="fv-bar" style="--h:64%"><i class="fv-seg fv-c2" style="height:100%"></i></span>
+                        </div>
+                        <div class="fv-balance">Balance <b>+2h 40m</b></div>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>Trends &amp; overtime at a glance</h3>
+                        <p>See worked-versus-target and your running balance. Click any bar — even weeks back — to open that day and backfill or fix it, right there.</p>
+                    </div>
+                </article>
+
+                <article class="feat feat-reverse reveal">
+                    <div class="feat-visual feat-visual-doc">
+                        <div class="fv-doc">
+                            <div class="fv-doc-head"><span class="fv-doc-brand"></span><span class="fv-doc-meta"></span></div>
+                            <div class="fv-doc-row"><span></span><b></b></div>
+                            <div class="fv-doc-row"><span></span><b></b></div>
+                            <div class="fv-doc-row"><span></span><b></b></div>
+                            <div class="fv-doc-total"><span>Total</span><b>€ 3,240</b></div>
+                        </div>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>Client-ready reports</h3>
+                        <p>Turn tracked hours into a client report (hours × rate) or a timesheet. Add a letterhead and per-project rates, then print to PDF or export CSV.</p>
+                    </div>
+                </article>
+
+                <article class="feat reveal">
+                    <div class="feat-visual feat-visual-sync">
+                        <div class="fv-dev fv-dev-a"><span class="fv-dev-scr"></span></div>
+                        <div class="fv-sync-line"><span class="fv-sync-pulse"></span></div>
+                        <div class="fv-dev fv-dev-b"><span class="fv-dev-scr"></span></div>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>Sync only if you want</h3>
+                        <p>Everything works 100% offline. Turn on encrypted sync and one timeline follows you across every device — last write wins, no conflicts to babysit.</p>
+                    </div>
+                </article>
+
+                <article class="feat feat-reverse reveal">
+                    <div class="feat-visual feat-visual-own">
+                        <svg class="fv-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/><circle cx="12" cy="16" r="1.3"/></svg>
+                    </div>
+                    <div class="feat-copy">
+                        <h3>Your data stays yours</h3>
+                        <p>Local-first by default — your database lives on your machine. Use our cloud, or self-host the open-source FastAPI backend on your own box and hold the keys.</p>
+                    </div>
+                </article>
+            </div>
+        </section>
+
+        <!-- Infrastructure choice -->
+        <section class="section pathway-section">
+            <div class="section-header" style="text-align:left; margin-left:0; max-width:800px;">
+                <h2 style="font-size:2.5rem; margin-bottom:0;">Choose your infrastructure.</h2>
+                <p style="margin-top:1rem;">The app is the same everywhere. What changes is where your data lives.</p>
             </div>
 
             <div class="pathway-row">
                 <div class="pathway-meta">
                     <span class="pathway-number">LEVEL 01</span>
-                    <h3 class="pathway-title">Local Solo</h3>
+                    <h3 class="pathway-title">Local solo</h3>
                 </div>
                 <div class="pathway-content">
-                    <p>The purest way to use TrackSuite.work. Your database lives on your disk, and your data never touches a network cable. Perfect for single-machine setups where privacy is the only priority.</p>
+                    <p>The purest way to use TrackSuite.work. Run the desktop app entirely on your machine — its database lives on your disk and never touches a network cable. No account, no server, nothing to trust. Prefer the browser? The web app needs a backend, so pick a cloud below.</p>
                     <div class="pathway-actions">
-                         <span class="btn btn-outline" style="cursor: default; opacity: 0.7;">No Account Needed</span>
+                        <a href="#/" class="btn btn-outline scroll-downloads">Download for Desktop</a>
                     </div>
                 </div>
             </div>
@@ -105,12 +312,12 @@ export function renderLanding(app: HTMLElement): void {
             <div class="pathway-row">
                 <div class="pathway-meta">
                     <span class="pathway-number">LEVEL 02</span>
-                    <h3 class="pathway-title">TrackSuite.work Cloud</h3>
+                    <h3 class="pathway-title">TrackSuite.work cloud</h3>
                 </div>
                 <div class="pathway-content">
-                    <p>Instant synchronization across macOS, Windows, and Linux. We provide the encrypted bridge between your devices, so your work balance is always accurate no matter where you clock in.</p>
+                    <p>Instant sync across macOS, Windows, Linux and the web app. Create an account and we run the encrypted bridge between your devices, so your balance is always right no matter where you clock in. Nothing to deploy.</p>
                     <div class="pathway-actions">
-                        <a href="#/register" class="btn btn-primary">Start Syncing</a>
+                        <a href="#/register" class="btn btn-primary">Start syncing</a>
                     </div>
                 </div>
             </div>
@@ -118,50 +325,73 @@ export function renderLanding(app: HTMLElement): void {
             <div class="pathway-row">
                 <div class="pathway-meta">
                     <span class="pathway-number">LEVEL 03</span>
-                    <h3 class="pathway-title">Self-Hosted</h3>
+                    <h3 class="pathway-title">Self-hosted</h3>
                 </div>
                 <div class="pathway-content">
-                    <p>For teams and power users. Deploy our lightweight FastAPI backend to your own VPS or homelab. You own the hardware, the database backups, and the encryption keys.</p>
+                    <p>For teams and power users. Deploy the lightweight FastAPI backend to your own VPS or homelab — it serves the web app and syncs every desktop client. You own the hardware, the backups and the encryption keys.</p>
                     <div class="pathway-actions">
-                        <a href="#/docs" class="btn btn-outline">Read Deployment Guide</a>
+                        <a href="#/docs" class="btn btn-outline">Read the deployment guide</a>
                     </div>
                 </div>
             </div>
         </section>
 
+        <section class="downloads" id="downloads">
+            <h2>Download for Desktop</h2>
+            <p>Native apps for Windows, macOS, and Linux. Start tracking locally today — no backend setup required.</p>
+            <div class="download-grid" id="download-grid">
+                <p class="download-loading" id="download-loading">Fetching the latest release…</p>
+            </div>
+            <div class="download-links">
+                <a href="https://github.com/${PUBLIC_REPO}/releases" class="btn btn-outline" target="_blank" rel="noopener">See all versions</a>
+            </div>
+            <p class="download-note" id="download-version"></p>
+
+            <div class="update-info">
+                <h3>Staying up to date</h3>
+                <ul class="update-list">
+                    <li class="update-auto"><span class="update-tag">Automatic</span> Windows, macOS and the Linux <strong>AppImage</strong> update themselves in the background.</li>
+                    <li class="update-assisted"><span class="update-tag">Assisted</span> The <strong>.deb</strong> and <strong>.rpm</strong> packages don't self-update: the app downloads the new package and opens it in your system installer.</li>
+                    <li class="update-soon"><span class="update-tag">Coming soon</span> A signed <strong>apt repository</strong> so Debian/Ubuntu can update with <code>apt upgrade</code>, and the <strong>Flatpak</strong> on Flathub. <span class="update-placeholder">apt setup instructions will appear here.</span></li>
+                </ul>
+            </div>
+        </section>
+
         <section class="section" style="background: var(--bg-surface);">
             <div class="section-header">
-                <h2 style="font-size: 1.5rem; margin-bottom: 0.5rem;">Under the Hood</h2>
+                <h2 style="font-size: 1.5rem; margin-bottom: 0.5rem;">Under the hood</h2>
                 <p>Technical details for the engineering-minded.</p>
             </div>
             <div class="split-grid">
                 <div class="info-block" style="background: transparent; border: none; padding: 0;">
                     <ul>
-                        <li><strong>Tauri Client:</strong> The desktop app runs natively using Tauri (Rust), dramatically lowering memory footprint versus Chromium-based web wrappers.</li>
-                        <li><strong>Offline-First:</strong> The app performs all logging and calculations locally. All features work without an active network connection.</li>
+                        <li><strong>Tauri client:</strong> the desktop app runs natively via Tauri (Rust), for a fraction of the memory of a Chromium wrapper.</li>
+                        <li><strong>Offline-first:</strong> all logging and calculations happen locally. Every feature works without a network connection.</li>
                     </ul>
                 </div>
                 <div class="info-block" style="background: transparent; border: none; padding: 0;">
                     <ul>
-                        <li><strong>Optional FastAPI Backend:</strong> An asynchronous Python service that acts purely as a synchronization bridge for the local databases.</li>
-                        <li><strong>Zero-Overhead Sync:</strong> Syncing is done via efficient JSON payloads over HTTPS, secured by JWT authentication.</li>
+                        <li><strong>Optional FastAPI backend:</strong> a small async Python service that acts purely as a sync bridge between local databases.</li>
+                        <li><strong>Zero-overhead sync:</strong> compact JSON over HTTPS, secured with JWT — last-write-wins, no merge conflicts.</li>
                     </ul>
                 </div>
             </div>
-        </section>
-
-        <section class="downloads" id="downloads">
-            <h2>Download TrackSuite.work</h2>
-            <p>Desktop apps for Windows, macOS, and Linux. Start tracking locally today — no backend setup required.</p>
-            <div class="download-links">
-                <a href="https://github.com/julianquandt/TrackSuite.work/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">Download latest release</a>
-                <a href="https://github.com/julianquandt/TrackSuite.work/releases" class="btn btn-outline" target="_blank" rel="noopener">All releases</a>
-            </div>
-            <p class="download-note">Windows (installer) · macOS (.dmg) · Linux (.deb / AppImage)</p>
         </section>
 
         <footer class="site-footer">
             <p>&copy; ${new Date().getFullYear()} TrackSuite.work OSS. Under MIT License.</p>
         </footer>
     `;
+
+    // Smooth-scroll any in-page "Download for Desktop" links to the section.
+    app.querySelectorAll<HTMLAnchorElement>(".scroll-downloads").forEach((a) => {
+        a.addEventListener("click", (e) => {
+            e.preventDefault();
+            document.getElementById("downloads")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+    });
+
+    void populateDownloads();
+    observeReveals();
+    startHeroTimer();
 }

@@ -4,9 +4,10 @@ import { isFullMode } from "./mode";
 export function renderNav(app: HTMLElement): void {
     const token = getToken();
     const reportsLink = isFullMode() ? `<a href="#/reports">Reports</a>` : "";
+    const downloadBtn = `<a href="#/" id="nav-download" class="btn btn-outline btn-small">Download</a>`;
     const navRight = token
-        ? `<a href="#/tracker">Tracker</a>${reportsLink}<a href="#/docs">Docs</a><a href="#/dashboard">Dashboard</a><a href="#/" id="nav-logout">Logout</a>`
-        : `<a href="#/docs">Docs</a><a href="#/login">Login</a><a href="#/register" class="btn btn-primary btn-small">Sign Up</a>`;
+        ? `<a href="#/tracker">Tracker</a>${reportsLink}<a href="#/docs">Docs</a><a href="#/dashboard">Dashboard</a>${downloadBtn}<a href="#/" id="nav-logout">Logout</a>`
+        : `<a href="#/docs">Docs</a>${downloadBtn}<a href="#/login">Login</a><a href="#/register" class="btn btn-primary btn-small">Sign Up</a>`;
 
     const nav = document.createElement("nav");
     nav.className = "site-nav";
@@ -59,6 +60,22 @@ export function renderNav(app: HTMLElement): void {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", e => {
         if (!localStorage.getItem("theme")) {
             updateTheme(e.matches ? "dark" : "light");
+        }
+    });
+
+    // "Download for Desktop" scrolls to the downloads section on the landing page
+    // (routing to #/ first if we're elsewhere, since the section only exists there).
+    const downloadLink = nav.querySelector("#nav-download");
+    downloadLink?.addEventListener("click", (e) => {
+        e.preventDefault();
+        const scrollToDownloads = () =>
+            document.getElementById("downloads")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        const h = window.location.hash;
+        if ((h === "" || h === "#/" || h === "#") && document.getElementById("downloads")) {
+            scrollToDownloads();
+        } else {
+            window.location.hash = "#/";
+            setTimeout(scrollToDownloads, 80); // wait for the landing route to render
         }
     });
 

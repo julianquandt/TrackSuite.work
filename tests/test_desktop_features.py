@@ -302,12 +302,13 @@ def test_desktop_sync_uses_native_command_instead_of_http_plugin():
 
 
 def test_off_day_range_ui_present():
-    """Desktop UI supports toggling a range of off-days, not just single dates."""
+    """Desktop supports marking a range of off-days — now drag-to-paint on the
+    calendar (replaced the start/end range dialog in 0.9.1)."""
     src = _read("desktop/src/main.ts")
-    assert "inp-offday-start" in src
-    assert "inp-offday-end" in src
-    assert "Toggle range" in src
-    assert "inclusiveDateRange" in src
+    assert "inclusiveDateRange" in src      # a dragged range is still computed
+    assert "applyOffDays" in src            # add/remove across the range
+    assert "paintOffDragPreview" in src     # live drag-selection preview
+    assert "offDragMode" in src
 
 
 def test_linux_suspend_listener_uses_tauri_runtime():

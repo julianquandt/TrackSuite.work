@@ -4921,7 +4921,7 @@ dependencies = [
 
 [[package]]
 name = "tracksuite-work-desktop"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "block",
  "chrono",

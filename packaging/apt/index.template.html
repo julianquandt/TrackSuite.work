@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TrackSuite.work — apt repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; max-width: 760px; margin: 0 auto; padding: 3rem 1.25rem 5rem; line-height: 1.6; }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  .lede { color: #6b7280; margin-top: 0; }
+  h2 { font-size: 1.05rem; margin-top: 2.4rem; }
+  pre { background: #11151c; color: #e6edf3; padding: 1rem 1.1rem; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  a { color: #2563eb; }
+  .note { font-size: 0.9rem; color: #6b7280; }
+</style>
+</head>
+<body>
+  <h1>TrackSuite.work — apt repository</h1>
+  <p class="lede">Install the desktop app on Debian / Ubuntu and get updates with <code>apt&nbsp;upgrade</code>.</p>
+
+  <h2>1. Add the signing key</h2>
+  <pre><code>curl -fsSL __URL__/tracksuite-work.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/tracksuite-work.gpg</code></pre>
+
+  <h2>2. Add the repository</h2>
+  <pre><code>echo "deb [signed-by=/usr/share/keyrings/tracksuite-work.gpg] __URL__ stable main" \
+  | sudo tee /etc/apt/sources.list.d/tracksuite-work.list</code></pre>
+
+  <h2>3. Install</h2>
+  <pre><code>sudo apt update
+sudo apt install __PKG__</code></pre>
+
+  <p class="note">Future updates arrive with your normal <code>sudo apt update &amp;&amp; sudo apt upgrade</code>.
+  Prefer not to add a repo? Grab the <code>.deb</code>, AppImage, <code>.rpm</code> or Flatpak from the
+  <a href="https://github.com/julianquandt/TrackSuite.work/releases/latest">latest release</a>.</p>
+</body>
+</html>
