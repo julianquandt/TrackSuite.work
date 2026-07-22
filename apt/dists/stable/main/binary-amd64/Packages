@@ -14,3 +14,19 @@ SHA512: cc9e386cec9b23fc05d63c16eeddb0e81882438d065f40e09ae1ef576c71eac6f405102c
 Description: Cross-platform work time tracking desktop app
  (none)
 
+Package: track-suite-work
+Architecture: amd64
+Version: 0.9.2
+Priority: optional
+Maintainer: TrackSuite.work
+Installed-Size: 7968
+Depends: libappindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/TrackSuite.work_0.9.2_amd64.deb
+Size: 3752392
+MD5sum: 7020fb6c03abea2e88e9df31cd013499
+SHA1: a9fb804bdb8e23cac0d07f9b5293fcd7de504a86
+SHA256: 9c16cf31bf832e4dd29e01d56aa8971f988f630406bd7a618bc70ece1fbaa985
+SHA512: a36d8fadc9c1fb847dd7401b2a2ce5f1af5c3bc69929e9ee6c905ca8d40cedf3e47541e3acb8f04bd629709433bed807c68969b6c1380bb3b62cdb6b9d6b15eb
+Description: Cross-platform work time tracking desktop app
+ (none)
+
