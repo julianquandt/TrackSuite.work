@@ -477,3 +477,16 @@ export function getProfile() {
 export function saveProfile(profile: ReportProfile) {
     return request<ProfileResponse>("PUT", "/profile/", { profile });
 }
+
+export interface WorkScheduleResponse {
+    schedule: Record<string, number> | null;
+    schedule_updated_at: string | null;
+}
+
+export function getRemoteSchedule() {
+    return request<WorkScheduleResponse>("GET", "/work-schedule/");
+}
+
+export function saveRemoteSchedule(schedule: Record<string, number>) {
+    return request<WorkScheduleResponse>("PUT", "/work-schedule/", { schedule });
+}

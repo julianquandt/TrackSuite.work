@@ -1506,6 +1506,11 @@ button[type="submit"] {
 .offcal-nav { display: flex; align-items: center; gap: 8px; }
 .offcal-title { min-width: 8.5rem; text-align: center; font-weight: 600; font-size: 0.9rem; }
 .offcal-hint { margin: 10px 0 0; font-size: 0.75rem; }
+/* The panel is full-width, but aspect-ratio:1 cells would then be huge squares.
+   Cap the calendar width so day cells stay a sensible size. */
+#offday-calendar-panel .calendar-days-header,
+#offday-calendar-panel .calendar-grid { max-width: 480px; }
+#offday-calendar-panel .calendar-grid div { font-size: 0.8rem; }
 
 /* ── Reports page ─────────────────────────────────────────────────── */
 .reports-page { max-width: 900px; margin: 0 auto; padding: 24px 16px; }

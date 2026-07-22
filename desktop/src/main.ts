@@ -21,7 +21,7 @@ import {
 } from "./lib/domain";
 import { DEFAULT_WORK_SCHEDULE, getAdjustedWeeklyTargetHours, getTargetHoursForDate, getWeeklyTargetHours } from "./lib/workSchedule";
 import { isFullMode, loadMode, setModePersisted } from "./lib/mode";
-import { getRemoteProfile, saveRemoteProfile, type ReportProfile } from "./lib/api";
+import { getRemoteProfile, saveRemoteProfile, getRemoteSchedule, saveRemoteSchedule, type ReportProfile } from "./lib/api";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("App root not found");
@@ -2577,6 +2577,54 @@ WORKDAY_KEYS.forEach((day) => {
   });
 });
 
+// ── Work-schedule sync (server = cross-device source of truth) ───────
+// The schedule used to be device-local, so web and desktop could disagree
+// (mismatched overtime). It now round-trips through the server with LWW. Wire
+// format is the flat {mon..sun} object (config.dailyHours), matching the web app.
+async function persistScheduleRemote(config: WorkScheduleConfig) {
+  const sync = await settings.getSyncConfig();
+  if (!sync) return; // sync not configured: local save only
+  await settings.setWorkScheduleUpdatedAt(new Date().toISOString()); // provisional
+  try {
+    const res = await saveRemoteSchedule(sync.serverUrl, sync.apiKey, config.dailyHours as unknown as Record<string, number>);
+    if (res.ok && res.data?.schedule_updated_at) {
+      await settings.setWorkScheduleUpdatedAt(res.data.schedule_updated_at);
+    }
+  } catch { /* offline: local save stands; next reconcile pushes it */ }
+}
+
+// Reconcile local vs server on boot. Only push the local schedule if the user
+// has actually saved one, so a default never clobbers the server.
+async function reconcileScheduleRemote() {
+  const sync = await settings.getSyncConfig();
+  if (!sync) return;
+  let res;
+  try { res = await getRemoteSchedule(sync.serverUrl, sync.apiKey); } catch { return; }
+  if (!res.ok) return;
+  const remote = res.data;
+  const localTs = await settings.getWorkScheduleUpdatedAt();
+  const localExplicit = await settings.hasExplicitWorkSchedule();
+  if (remote?.schedule && remote.schedule_updated_at) {
+    if (!localExplicit || !localTs || remote.schedule_updated_at > localTs) {
+      await settings.saveWorkSchedule({ dailyHours: remote.schedule } as unknown as WorkScheduleConfig);
+      await settings.setWorkScheduleUpdatedAt(remote.schedule_updated_at);
+      currentWorkSchedule = await settings.getWorkSchedule();
+      setWorkScheduleInputs(currentWorkSchedule);
+      renderWorkScheduleSummary(currentWorkSchedule);
+      updateHolidayToggleLabel();
+      await refresh();
+      await refreshStats();
+      return;
+    }
+  }
+  if (localExplicit) {
+    try {
+      const put = await saveRemoteSchedule(sync.serverUrl, sync.apiKey, currentWorkSchedule.dailyHours as unknown as Record<string, number>);
+      if (put.ok && put.data?.schedule_updated_at) await settings.setWorkScheduleUpdatedAt(put.data.schedule_updated_at);
+    } catch { /* offline: retry next boot */ }
+  }
+}
+
 document.getElementById("btn-save-schedule")!.addEventListener("click", async () => {
   const config = readWorkScheduleFromInputs();
 
@@ -2589,6 +2637,7 @@ document.getElementById("btn-save-schedule")!.addEventListener("click", async ()
   currentWorkSchedule = {
     dailyHours: { ...config.dailyHours },
   };
+  void persistScheduleRemote(currentWorkSchedule);
   renderWorkScheduleSummary(currentWorkSchedule);
   updateHolidayToggleLabel();
   setScheduleStatus("Saved ✓");
@@ -2894,6 +2943,7 @@ const CHANGELOG: ChangelogEntry[] = [
       "Shift notes everywhere: jot what you worked on. On a multi-project day, use the 🖌 note brush to paint one note across several timeline blocks, or press Enter/↓ to carry a note down the sessions list.",
       "The timeline now shows your running shift as a live block that grows in real time, instead of appearing only after you clock out.",
       "Backfill older days: click any bar in the Statistics trend chart to open that day's editor — week and month bars zoom in first, with a breadcrumb to step back out. No more being stuck on the current week.",
+      "Your weekly work schedule now syncs across devices, so hours targets and overtime match everywhere (and survive a browser reset).",
     ],
   },
   {
@@ -3438,6 +3488,8 @@ loadMode()
     await checkStaleAndRecover();
     refresh();
     performSync();
+    // Pull the shared work schedule (may adopt a newer server copy and re-render).
+    void reconcileScheduleRemote();
     maybeShowOnboarding();
     void maybeShowWhatsNew();
     checkForUpdates();

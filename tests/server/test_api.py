@@ -1010,3 +1010,38 @@ def test_report_profile_is_per_user():
 
     assert client.get("/profile/", headers=second_headers).json()["profile"] is None
     assert client.get("/profile/", headers=first_headers).json()["profile"]["name"] == "Owner"
+
+
+def test_work_schedule_round_trips_and_stamps_updated_at():
+    """The work schedule round-trips and gets a server updated_at."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    empty = client.get("/work-schedule/", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json()["schedule"] is None
+    assert empty.json()["schedule_updated_at"] is None
+
+    schedule = {"mon": 7.2, "tue": 7.2, "wed": 7.2, "thu": 7.2, "fri": 7.2, "sat": 0, "sun": 0}
+    saved = client.put("/work-schedule/", json={"schedule": schedule}, headers=headers)
+    assert saved.status_code == 200
+    assert saved.json()["schedule"] == schedule
+    assert saved.json()["schedule_updated_at"]
+
+    fetched = client.get("/work-schedule/", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["schedule"] == schedule
+    assert fetched.json()["schedule_updated_at"] == saved.json()["schedule_updated_at"]
+
+
+def test_work_schedule_is_per_user():
+    """One user cannot read another user's work schedule."""
+    _, first, _ = _register_and_enroll("owner@example.com")
+    _, second, _ = _register_and_enroll("other@example.com")
+    first_headers = _auth_headers(first.json()["access_token"])
+    second_headers = _auth_headers(second.json()["access_token"])
+
+    client.put("/work-schedule/", json={"schedule": {"mon": 8}}, headers=first_headers)
+
+    assert client.get("/work-schedule/", headers=second_headers).json()["schedule"] is None
+    assert client.get("/work-schedule/", headers=first_headers).json()["schedule"]["mon"] == 8

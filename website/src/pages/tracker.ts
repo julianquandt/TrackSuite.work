@@ -12,6 +12,8 @@ import {
     createProject,
     updateProject,
     deleteProject,
+    getRemoteSchedule,
+    saveRemoteSchedule,
     type ShiftItem,
     type OffDayItem,
     type ProjectItem
@@ -664,6 +666,48 @@ export function renderTracker(app: HTMLElement): void {
     };
     fillScheduleInputs();
 
+    // ── Work-schedule sync (server is the cross-device source of truth) ──
+    // The schedule lived only in localStorage, so it differed per device (and
+    // was lost on a storage reset). Now it round-trips through the server with
+    // last-write-wins, keyed by a stored server timestamp.
+    const SCHEDULE_TS_KEY = "tracksuite.schedule.updatedAt";
+
+    async function persistSchedule(schedule: WorkSchedule) {
+        saveWorkSchedule(schedule);
+        currentSchedule = schedule;
+        localStorage.setItem(SCHEDULE_TS_KEY, new Date().toISOString()); // provisional
+        const resp = await saveRemoteSchedule(schedule as unknown as Record<string, number>);
+        if (resp.ok && resp.data?.schedule_updated_at) {
+            localStorage.setItem(SCHEDULE_TS_KEY, resp.data.schedule_updated_at);
+        }
+    }
+
+    // Reconcile local vs server on boot. Only push the local schedule if the user
+    // actually saved one (a bare localStorage default must not clobber the server).
+    async function reconcileSchedule() {
+        const resp = await getRemoteSchedule();
+        if (!resp.ok) return; // offline / unauthenticated: keep local
+        const remote = resp.data;
+        const localTs = localStorage.getItem(SCHEDULE_TS_KEY);
+        const localExplicit = localStorage.getItem("tracksuite.schedule") !== null;
+        if (remote?.schedule && remote.schedule_updated_at) {
+            if (!localExplicit || !localTs || remote.schedule_updated_at > localTs) {
+                saveWorkSchedule(remote.schedule as unknown as WorkSchedule);
+                localStorage.setItem(SCHEDULE_TS_KEY, remote.schedule_updated_at);
+                currentSchedule = loadWorkSchedule();
+                fillScheduleInputs();
+                void refreshData();
+                return;
+            }
+        }
+        if (localExplicit) {
+            const put = await saveRemoteSchedule(currentSchedule as unknown as Record<string, number>);
+            if (put.ok && put.data?.schedule_updated_at) {
+                localStorage.setItem(SCHEDULE_TS_KEY, put.data.schedule_updated_at);
+            }
+        }
+    }
+
     // Averages and trends triggers
     const statsUnitEl = document.getElementById("stats-unit") as HTMLSelectElement;
     const statsCountEl = document.getElementById("stats-count") as HTMLInputElement;
@@ -725,6 +769,17 @@ export function renderTracker(app: HTMLElement): void {
         link.addEventListener("click", () => {
             const btn = link as HTMLButtonElement;
             const target = btn.dataset.target;
+            // The trend drill borrows the timeline-editor panel into the Statistics
+            // tab; send it home before showing any other tab (esp. the dashboard,
+            // which owns it), or it gets stranded in the hidden stats slot.
+            if (target !== "statistics") {
+                restoreEditorHome();
+                trendDrillStack = [];
+                drillDay = null;
+                const empty = document.getElementById("trend-drill-empty");
+                if (empty) empty.hidden = false;
+                syncDrillUI();
+            }
             tabLinks.forEach(l => l.classList.remove("active"));
             btn.classList.add("active");
 
@@ -1767,8 +1822,7 @@ export function renderTracker(app: HTMLElement): void {
             sat: parseFloat((document.getElementById("cfg-hours-sat") as HTMLInputElement).value) || 0,
             sun: parseFloat((document.getElementById("cfg-hours-sun") as HTMLInputElement).value) || 0
         };
-        saveWorkSchedule(schedule);
-        currentSchedule = schedule;
+        void persistSchedule(schedule);
 
         const savedText = document.getElementById("schedule-status-text")!;
         savedText.style.display = "inline";
@@ -2359,4 +2413,6 @@ export function renderTracker(app: HTMLElement): void {
 
     // Run Initial Data Pull
     refreshData();
+    // Pull the shared work schedule (may adopt a newer server copy and re-render).
+    void reconcileSchedule();
 }

@@ -630,6 +630,8 @@ td {
     font-weight: 700; font-size: 0.68rem; color: var(--text-muted);
     margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em;
 }
+/* Cap width so aspect-ratio:1 cells don't become huge squares in a wide panel. */
+.calendar-days-header, .calendar-grid { max-width: 460px; }
 .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; user-select: none; }
 .calendar-grid div {
     display: flex; align-items: center; justify-content: center; aspect-ratio: 1;

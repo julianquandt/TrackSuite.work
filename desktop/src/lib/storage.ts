@@ -60,6 +60,10 @@ export interface SettingsRepository {
     saveAutoResumeConfig(config: AutoResumeConfig): Promise<void>;
     getWorkSchedule(): Promise<WorkScheduleConfig>;
     saveWorkSchedule(config: WorkScheduleConfig): Promise<void>;
+    // Work-schedule sync bookkeeping (last-write-wins vs the server).
+    hasExplicitWorkSchedule(): Promise<boolean>;
+    getWorkScheduleUpdatedAt(): Promise<string | null>;
+    setWorkScheduleUpdatedAt(ts: string): Promise<void>;
 }
 
 // ── Tauri-backed implementations ────────────────────────────────────
@@ -244,5 +248,14 @@ export const settings: SettingsRepository = {
     async saveWorkSchedule(config) {
         const normalized = normalizeWorkSchedule(config);
         await setConfigValue("work_schedule", JSON.stringify(normalized));
+    },
+    async hasExplicitWorkSchedule() {
+        return (await getConfigValue("work_schedule")) !== null;
+    },
+    async getWorkScheduleUpdatedAt() {
+        return await getConfigValue("work_schedule_updated_at");
+    },
+    async setWorkScheduleUpdatedAt(ts) {
+        await setConfigValue("work_schedule_updated_at", ts);
     },
 };

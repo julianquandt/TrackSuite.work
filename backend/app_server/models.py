@@ -20,6 +20,10 @@ class User(Base):
     # profile_updated_at (canonical UTC microsecond timestamp).
     profile_encrypted: Mapped[str | None] = mapped_column(nullable=True)
     profile_updated_at: Mapped[str | None] = mapped_column(nullable=True)
+    # Weekly work schedule (target hours per weekday) — a small JSON object,
+    # stored in the clear. Last-write-wins by work_schedule_updated_at.
+    work_schedule: Mapped[str | None] = mapped_column(nullable=True)
+    work_schedule_updated_at: Mapped[str | None] = mapped_column(nullable=True)
 
 
 class ApiKey(Base):

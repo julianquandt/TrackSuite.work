@@ -135,10 +135,32 @@ fi
 echo "--------------------------------------------------"
 echo "Deployment successful!"
 echo ""
-echo "Next steps:"
-echo "  1. Generate a JWT secret:         python3 -c \"import secrets; print(secrets.token_hex(32))\""
-echo "  2. Generate an encryption key:    python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
-echo "  3. Edit the service file:         sudo nano /etc/systemd/system/work-time-backend.service"
-echo "     Set WORK_TIME_JWT_SECRET and WORK_TIME_ENCRYPTION_KEY to the generated values."
-echo "     Keep User/Group aligned with APP_USER/APP_GROUP (${APP_USER}:${APP_GROUP})."
-echo "  4. Start the service:             sudo systemctl daemon-reload && sudo systemctl enable --now work-time-backend"
+
+# ── Restart the backend so the new code actually takes effect ─────
+# This script only updates files (code, venv, frontend). The running Python
+# process keeps serving the OLD code — and its startup migrations don't run —
+# until it is restarted. A repeat deploy therefore serves a fresh frontend
+# against a stale backend (new routes 404, new columns missing) unless we
+# restart here. Auto-restart when we can (root + systemd + the unit already
+# installed); otherwise print the exact command / first-time setup steps.
+SERVICE="work-time-backend"
+if command -v systemctl >/dev/null 2>&1 && systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "Restarting ${SERVICE} (loads new code, runs startup migrations)..."
+        systemctl daemon-reload
+        systemctl restart "${SERVICE}"
+        echo "Restarted. Recent status:"
+        systemctl --no-pager --lines=0 status "${SERVICE}" || true
+    else
+        echo "Backend code updated — restart it to load the new code + migrations:"
+        echo "  sudo systemctl restart ${SERVICE}"
+    fi
+else
+    echo "First-time setup — the ${SERVICE} service isn't installed yet:"
+    echo "  1. Generate a JWT secret:         python3 -c \"import secrets; print(secrets.token_hex(32))\""
+    echo "  2. Generate an encryption key:    python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    echo "  3. Edit the service file:         sudo nano /etc/systemd/system/work-time-backend.service"
+    echo "     Set WORK_TIME_JWT_SECRET and WORK_TIME_ENCRYPTION_KEY to the generated values."
+    echo "     Keep User/Group aligned with APP_USER/APP_GROUP (${APP_USER}:${APP_GROUP})."
+    echo "  4. Start the service:             sudo systemctl daemon-reload && sudo systemctl enable --now ${SERVICE}"
+fi

@@ -210,6 +210,11 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE users ADD COLUMN profile_encrypted VARCHAR NULL"))
         if "profile_updated_at" not in user_columns:
             conn.execute(text("ALTER TABLE users ADD COLUMN profile_updated_at VARCHAR NULL"))
+        # Synced weekly work schedule (0.9.1): target hours per weekday.
+        if "work_schedule" not in user_columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN work_schedule VARCHAR NULL"))
+        if "work_schedule_updated_at" not in user_columns:
+            conn.execute(text("ALTER TABLE users ADD COLUMN work_schedule_updated_at VARCHAR NULL"))
 
         backfill_ts = sync_now()
         # Backfill identity + timestamps for pre-existing rows.
@@ -837,6 +842,22 @@ class ProfileResponse(BaseModel):
 
 class ProfileUpdate(BaseModel):
     profile: Dict[str, Any]
+
+
+# The weekly work schedule is a small JSON object of target hours per weekday
+# (e.g. {"mon": 7.2, ..., "sun": 0}). Stored in the clear; last-write-wins by
+# work_schedule_updated_at. Kept separate from the report profile so a device
+# can sync its schedule without touching the (encrypted) letterhead.
+WORK_SCHEDULE_MAX_BYTES = 4 * 1024
+
+
+class WorkScheduleResponse(BaseModel):
+    schedule: Optional[Dict[str, Any]] = None
+    schedule_updated_at: Optional[str] = None
+
+
+class WorkScheduleUpdate(BaseModel):
+    schedule: Dict[str, Any]
 
 
 # ── Full-state sync schemas ──────────────────────────────────────────
@@ -1523,6 +1544,45 @@ def update_profile(
     user.profile_updated_at = sync_now()
     db.commit()
     return ProfileResponse(profile=body.profile, profile_updated_at=user.profile_updated_at)
+
+
+# ── Work-schedule endpoints ──────────────────────────────────────────
+
+
+@app.get("/work-schedule/", response_model=WorkScheduleResponse)
+def get_work_schedule(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not user.work_schedule:
+        return WorkScheduleResponse(schedule=None, schedule_updated_at=None)
+    try:
+        schedule = json.loads(user.work_schedule)
+    except Exception:
+        # Corrupt blob: surface as empty rather than 500; the client can re-save.
+        return WorkScheduleResponse(schedule=None, schedule_updated_at=user.work_schedule_updated_at)
+    return WorkScheduleResponse(schedule=schedule, schedule_updated_at=user.work_schedule_updated_at)
+
+
+@app.put("/work-schedule/", response_model=WorkScheduleResponse)
+def update_work_schedule(
+    body: WorkScheduleUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    raw = json.dumps(body.schedule, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > WORK_SCHEDULE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Work schedule is too large.")
+    user.work_schedule = raw
+    user.work_schedule_updated_at = sync_now()
+    db.commit()
+    return WorkScheduleResponse(schedule=body.schedule, schedule_updated_at=user.work_schedule_updated_at)
 
 
 # ── Project endpoints ────────────────────────────────────────────────

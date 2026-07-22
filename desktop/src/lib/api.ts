@@ -115,3 +115,16 @@ export function getRemoteProfile(serverUrl: string, apiKey: string) {
 export function saveRemoteProfile(serverUrl: string, apiKey: string, profile: ReportProfile) {
     return request<RemoteProfile>("PUT", serverUrl, "/profile/", { apiKey, body: { profile } });
 }
+
+export type RemoteSchedule = {
+    schedule: Record<string, number> | null;
+    schedule_updated_at: string | null;
+};
+
+export function getRemoteSchedule(serverUrl: string, apiKey: string) {
+    return request<RemoteSchedule>("GET", serverUrl, "/work-schedule/", { apiKey });
+}
+
+export function saveRemoteSchedule(serverUrl: string, apiKey: string, schedule: Record<string, number>) {
+    return request<RemoteSchedule>("PUT", serverUrl, "/work-schedule/", { apiKey, body: { schedule } });
+}
