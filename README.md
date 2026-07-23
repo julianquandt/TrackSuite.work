@@ -1,32 +1,63 @@
 # TrackSuite.work
 
-A **local-first**, cross-platform work-time tracker for Windows, macOS, and Linux — with an optional, self-hostable sync backend and a companion web app.
+**Track your work hours with one click — on your desktop or in the browser.**
 
-Track your hours with one click, organize time into projects, and see where it went — all stored locally on your machine. If you want your data on more than one device (or a browser), run the small sync server and everything stays in sync, end to end, with last-write-wins conflict resolution.
+### → [tracksuite-work.julianquandt.com](https://tracksuite-work.julianquandt.com)
 
-## Features
+TrackSuite.work is a simple, private time tracker. Clock in when you start working, clock out when you stop, and see exactly where your hours went — organized by project, week, and day. Your data stays on your machine unless you choose to sync it.
 
-- **One-click clock in/out** from the app or the system tray.
-- **Projects** — tag time to projects, switch mid-shift (auto-splits the session), quick-switch with number keys, and retag past time on a draggable day timeline.
-- **Off-days & work schedules** — set per-day target hours and scheduled off-days.
-- **Statistics** — weekly and trend charts, stacked by project, plus a per-project hours breakdown.
-- **Local-first** — the desktop app is fully functional with **no account and no server**. Your data lives in a local SQLite database.
-- **Optional multi-device sync** — a self-hosted FastAPI backend keeps desktop and web in sync (bidirectional, last-write-wins, tombstone-aware). Accounts are protected with **TOTP two-factor auth**.
-- **In-app auto-updates** on Windows, macOS, and the Linux AppImage.
+## What you can do
+
+- **Clock in and out in one click** — from the app window or right from your system tray, without breaking your flow.
+- **Organize time by project** — tag your hours, switch projects mid-shift (it splits the session for you), and jump between projects with number keys.
+- **Fix the past** — forgot to tag some time? Drag across a visual day timeline to reassign it after the fact.
+- **Set your schedule** — define target hours per day and mark scheduled off-days, so you can see how you're tracking against your own goals.
+- **See where your time goes** — weekly and trend charts broken down by project, plus a clear per-project hours summary.
+- **Work anywhere** — use the downloadable desktop app, the web app, or both together.
+
+## Two ways to use it
+
+**Desktop app** — the full experience, works completely offline, no account needed. Your data lives in a local database on your computer. Available for **Windows, macOS, and Linux**.
+
+**Web app** — track your time from any browser, nothing to install.
+
+Want your hours on more than one device? Sign in and everything syncs automatically between the desktop app and the web — with a sensible "most recent change wins" rule so nothing gets lost.
+
+👉 **Get started at [tracksuite-work.julianquandt.com](https://tracksuite-work.julianquandt.com)** — download links, install instructions (including apt for Debian/Ubuntu), and the web app are all there.
 
 ## Download
 
-Grab the latest desktop build from the [**Releases**](https://github.com/julianquandt/TrackSuite.work/releases/latest) page:
+The website has guided install instructions for every platform. If you'd rather grab a file directly, the latest desktop builds are on the [**Releases**](https://github.com/julianquandt/TrackSuite.work/releases/latest) page:
 
 - **Windows** — installer (`.exe`)
 - **macOS** — `.dmg`
-- **Linux** — `.deb`, `.rpm`, `.AppImage`, or Flatpak
+- **Linux** — apt repository (recommended, auto-updating), `.deb`, `.rpm`, or `.AppImage`
 
-The app works standalone; no account or server needed unless you want sync.
+The desktop app updates itself on Windows, macOS, and the Linux AppImage. Installed via apt? Updates arrive with your normal system updates.
 
-## Self-hosting the sync backend (optional)
+## Your data, your control
 
-Only needed if you want to sync across devices or use the web app. The backend is a small FastAPI service backed by SQLite. Full instructions — including Apache reverse-proxy config, systemd unit, TLS, and first-user setup — are in **[backend/DEPLOYMENT.md](backend/DEPLOYMENT.md)**.
+- **Private by default.** The desktop app works with **no account and no server** — nothing leaves your machine.
+- **Sync only if you want it.** Multi-device sync is entirely optional and runs on a server you host yourself.
+- **Secure when synced.** Accounts use two-factor authentication (TOTP), and every record is tied to its owner.
+
+---
+
+## For developers & self-hosters
+
+<details>
+<summary><strong>Architecture overview</strong></summary>
+
+- **Desktop app** — [Tauri](https://tauri.app) 2 (Rust) with a TypeScript UI and a local SQLite database. It's the source of truth on your machine and works entirely offline.
+- **Web app** — a Vite + TypeScript single-page app.
+- **Sync backend** — a small FastAPI service backed by SQLite. When configured, the desktop app reconciles its full local state with the server using **last-write-wins per record**; deletions propagate as **tombstones**, so nothing silently reappears.
+- **Security** — passwords are hashed with Argon2, TOTP secrets are encrypted at rest, sessions use short-lived JWTs with hashed refresh tokens, and every record is scoped to its owner.
+
+</details>
+
+### Self-hosting the sync backend (optional)
+
+Only needed if you want to sync across devices or use the web app on your own infrastructure. The backend is a small FastAPI service backed by SQLite. Full instructions — including Apache reverse-proxy config, systemd unit, TLS, and first-user setup — are in **[backend/DEPLOYMENT.md](backend/DEPLOYMENT.md)**.
 
 In short:
 
@@ -39,13 +70,7 @@ sudo ./backend/deploy.sh main
 
 You supply two secrets via environment variables (a JWT signing secret and a Fernet encryption key — the service refuses to start with defaults), point the desktop app at your server URL + a sync API key, and you're done.
 
-## How it works
-
-- **Local-first storage.** The desktop app (Tauri + Rust + SQLite) is the source of truth on your machine and works entirely offline.
-- **Optional sync.** When configured, the app reconciles its full local state with the server using last-write-wins per record; deletions propagate as tombstones, so nothing silently reappears.
-- **Security.** Passwords are hashed with Argon2, TOTP secrets are encrypted at rest, sessions use short-lived JWTs with hashed refresh tokens, and every record is scoped to its owner. See the deployment guide for hardening notes.
-
-## Building from source
+### Building from source
 
 - **Desktop app** (`desktop/`): [Tauri](https://tauri.app) 2 + TypeScript. `npm install && npm run tauri build`. Requires the Rust toolchain and the platform's WebView dependencies.
 - **Web app** (`website/`): Vite + TypeScript. `npm install && npm run build`.
