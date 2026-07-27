@@ -2,7 +2,7 @@
 
 **Track your work hours with one click — on your desktop or in the browser.**
 
-### → [tracksuite-work.julianquandt.com](https://tracksuite-work.julianquandt.com)
+### → [tracksuite.work](https://tracksuite.work)
 
 TrackSuite.work is a simple, private time tracker. Clock in when you start working, clock out when you stop, and see exactly where your hours went — organized by project, week, and day. Your data stays on your machine unless you choose to sync it.
 
@@ -23,7 +23,7 @@ TrackSuite.work is a simple, private time tracker. Clock in when you start worki
 
 Want your hours on more than one device? Sign in and everything syncs automatically between the desktop app and the web — with a sensible "most recent change wins" rule so nothing gets lost.
 
-👉 **Get started at [tracksuite-work.julianquandt.com](https://tracksuite-work.julianquandt.com)** — download links, install instructions (including apt for Debian/Ubuntu), and the web app are all there.
+👉 **Get started at [tracksuite.work](https://tracksuite.work)** — download links, install instructions (including apt for Debian/Ubuntu), and the web app are all there.
 
 ## Download
 
@@ -70,6 +70,29 @@ sudo ./backend/deploy.sh main
 
 You supply two secrets via environment variables (a JWT signing secret and a Fernet encryption key — the service refuses to start with defaults), point the desktop app at your server URL + a sync API key, and you're done.
 
+**Pick a signup policy.** A fresh instance accepts registrations from anyone who can reach it, which is rarely what you want on your own server:
+
+```ini
+# Just me: no signup form; create the account over SSH (see below).
+WORK_TIME_SIGNUP_MODE=closed
+WORK_TIME_MAX_USERS=1
+
+# My team: colleagues enrol themselves, nobody else can.
+WORK_TIME_SIGNUP_MODE=restricted
+WORK_TIME_SIGNUP_ALLOWED_DOMAINS=acme.com
+WORK_TIME_SIGNUP_INVITE_CODES=a-long-random-string
+```
+
+On a closed instance, accounts are created from the terminal — it prints a QR code, setup key and recovery codes, and needs no mail provider:
+
+```bash
+sudo -u www-data ./venv_server/bin/python -m app_server.cli create-user --email me@example.com
+```
+
+**You get the app, not our marketing** — the tracker, dashboard and reports. The tracksuite.work landing page and download section are never part of your build, so `/` goes straight to the tracker. Nothing to configure.
+
+Copy `website/.env.example` to `website/.env.local` if you publish your instance, to set the operator details for your own imprint and privacy policy.
+
 ### Building from source
 
 - **Desktop app** (`desktop/`): [Tauri](https://tauri.app) 2 + TypeScript. `npm install && npm run tauri build`. Requires the Rust toolchain and the platform's WebView dependencies.
@@ -78,4 +101,4 @@ You supply two secrets via environment variables (a JWT signing secret and a Fer
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Run it, fork it, rename it, sell it.

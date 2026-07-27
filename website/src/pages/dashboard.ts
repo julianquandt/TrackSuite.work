@@ -1,10 +1,13 @@
 import QRCode from "qrcode";
 
 import {
+    changePassword,
     clearSession,
     confirmMfaReset,
     createApiKey,
+    deleteAccount,
     deleteApiKey,
+    exportAccountData,
     getEmailFromToken,
     getRecoveryCodeStatus,
     getToken,
@@ -160,6 +163,76 @@ export function renderDashboard(app: HTMLElement): void {
                     <div class="btn-row auth-action-row">
                         <button class="btn btn-outline" id="recovery-copy-btn" type="button">Copy Recovery Codes</button>
                     </div>
+                </div>
+            </section>
+
+            <section class="dash-section">
+                <div class="section-row">
+                    <div>
+                        <h3>Your Data</h3>
+                        <p>Export a copy of everything stored for your account, or change your password. Password changes sign out all other browser sessions.</p>
+                    </div>
+                </div>
+
+                <div class="settings-grid">
+                    <div class="settings-card">
+                        <h4>Export My Data</h4>
+                        <p class="settings-copy">Download a machine-readable JSON file with your account details, shifts, projects, off-days, report profile, and sessions.</p>
+                        <div class="form-error" id="export-error"></div>
+                        <button class="btn btn-primary" id="export-data-btn" type="button">Download My Data</button>
+                    </div>
+
+                    <div class="settings-card">
+                        <h4>Change Password</h4>
+                        <p class="settings-copy">Requires your current password and an authenticator code. All other browser sessions are signed out.</p>
+                        <div class="form-error" id="password-error"></div>
+                        <div class="form-success" id="password-success"></div>
+                        <form id="password-form">
+                            <div class="form-group">
+                                <label for="password-current">Current Password</label>
+                                <input type="password" id="password-current" autocomplete="current-password" />
+                            </div>
+                            <div class="form-group">
+                                <label for="password-new">New Password</label>
+                                <input type="password" id="password-new" autocomplete="new-password" minlength="8" />
+                            </div>
+                            <div class="form-group">
+                                <label for="password-otp">Authenticator Code</label>
+                                <input type="text" id="password-otp" placeholder="123456" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" />
+                            </div>
+                            <button class="btn btn-primary" type="submit">Change Password</button>
+                        </form>
+                    </div>
+                </div>
+            </section>
+
+            <section class="dash-section danger-zone">
+                <div class="section-row">
+                    <div>
+                        <h3>Delete Account</h3>
+                        <p>Permanently delete your account and <strong>all</strong> of your data. This cannot be undone.</p>
+                    </div>
+                </div>
+
+                <div class="settings-card">
+                    <h4>This is irreversible</h4>
+                    <p class="settings-copy">Every shift, project, off-day, report profile, session, and API key will be permanently erased. Export your data first if you want a copy. Requires your password and an authenticator code, plus typing <span class="mono">DELETE</span> to confirm.</p>
+                    <div class="form-error" id="delete-error"></div>
+                    <form id="delete-form">
+                        <div class="form-group">
+                            <label for="delete-password">Password</label>
+                            <input type="password" id="delete-password" autocomplete="current-password" />
+                        </div>
+                        <div class="form-group">
+                            <label for="delete-otp">Authenticator Code</label>
+                            <input type="text" id="delete-otp" placeholder="123456" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" />
+                        </div>
+                        <div class="form-group">
+                            <label for="delete-confirm">Type DELETE to confirm</label>
+                            <input type="text" id="delete-confirm" placeholder="DELETE" autocomplete="off" />
+                        </div>
+                        <button class="btn btn-danger" type="submit">Permanently Delete My Account</button>
+                    </form>
                 </div>
             </section>
         </div>
@@ -555,6 +628,126 @@ export function renderDashboard(app: HTMLElement): void {
         window.setTimeout(() => {
             recoveryCopyBtn.textContent = "Copy Recovery Codes";
         }, 2000);
+    });
+
+    // ── Data & account: export, change password, delete ──────────────
+    const exportBtn = document.getElementById("export-data-btn") as HTMLButtonElement;
+    const exportErrorEl = document.getElementById("export-error")!;
+    const passwordForm = document.getElementById("password-form") as HTMLFormElement;
+    const passwordCurrentInput = document.getElementById("password-current") as HTMLInputElement;
+    const passwordNewInput = document.getElementById("password-new") as HTMLInputElement;
+    const passwordOtpInput = document.getElementById("password-otp") as HTMLInputElement;
+    const passwordErrorEl = document.getElementById("password-error")!;
+    const passwordSuccessEl = document.getElementById("password-success")!;
+    const deleteForm = document.getElementById("delete-form") as HTMLFormElement;
+    const deletePasswordInput = document.getElementById("delete-password") as HTMLInputElement;
+    const deleteOtpInput = document.getElementById("delete-otp") as HTMLInputElement;
+    const deleteConfirmInput = document.getElementById("delete-confirm") as HTMLInputElement;
+    const deleteErrorEl = document.getElementById("delete-error")!;
+
+    exportBtn.addEventListener("click", async () => {
+        exportErrorEl.classList.remove("visible");
+        exportBtn.disabled = true;
+        exportBtn.textContent = "Preparing…";
+        try {
+            const response = await exportAccountData();
+            if (!response.ok) {
+                showMessage(exportErrorEl, "Export failed. Please try again.");
+                return;
+            }
+            const blob = new Blob([JSON.stringify(response.data, null, 2)], {
+                type: "application/json",
+            });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            const stamp = new Date().toISOString().slice(0, 10);
+            link.download = `tracksuite-export-${stamp}.json`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+        } catch {
+            showMessage(exportErrorEl, "Network error. Please verify your connection.");
+        } finally {
+            exportBtn.disabled = false;
+            exportBtn.textContent = "Download My Data";
+        }
+    });
+
+    passwordForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        passwordErrorEl.classList.remove("visible");
+        passwordSuccessEl.classList.remove("visible");
+
+        const current = passwordCurrentInput.value;
+        const next = passwordNewInput.value;
+        const otp = passwordOtpInput.value.trim();
+        if (!current || next.length < 8 || !/^\d{6}$/.test(otp)) {
+            showMessage(passwordErrorEl, "Enter your current password, a new password (8+ chars), and a valid 6-digit code.");
+            return;
+        }
+
+        const submitButton = passwordForm.querySelector('button[type="submit"]') as HTMLButtonElement;
+        submitButton.disabled = true;
+        submitButton.textContent = "Changing…";
+        try {
+            const response = await changePassword(current, next, otp);
+            if (response.ok || response.status === 204) {
+                passwordCurrentInput.value = "";
+                passwordNewInput.value = "";
+                passwordOtpInput.value = "";
+                showMessage(passwordSuccessEl, "Password changed. Other browser sessions were signed out.");
+                await loadSessions();
+            } else {
+                const detail = (response.data as unknown as { detail?: string })?.detail ?? "Password change failed.";
+                showMessage(passwordErrorEl, detail);
+            }
+        } catch {
+            showMessage(passwordErrorEl, "Network error. Please verify your connection.");
+        } finally {
+            submitButton.disabled = false;
+            submitButton.textContent = "Change Password";
+        }
+    });
+
+    deleteForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        deleteErrorEl.classList.remove("visible");
+
+        const password = deletePasswordInput.value;
+        const otp = deleteOtpInput.value.trim();
+        if (!password || !/^\d{6}$/.test(otp)) {
+            showMessage(deleteErrorEl, "Enter your password and a valid 6-digit authenticator code.");
+            return;
+        }
+        if (deleteConfirmInput.value.trim() !== "DELETE") {
+            showMessage(deleteErrorEl, 'Type DELETE (in capitals) to confirm.');
+            return;
+        }
+        if (!window.confirm("This permanently deletes your account and ALL your data. This cannot be undone. Continue?")) {
+            return;
+        }
+
+        const submitButton = deleteForm.querySelector('button[type="submit"]') as HTMLButtonElement;
+        submitButton.disabled = true;
+        submitButton.textContent = "Deleting…";
+        try {
+            const response = await deleteAccount(password, otp);
+            if (response.ok || response.status === 204) {
+                clearSession();
+                window.alert("Your account and all data have been permanently deleted.");
+                navigate("#/login");
+            } else {
+                const detail = (response.data as unknown as { detail?: string })?.detail ?? "Account deletion failed.";
+                showMessage(deleteErrorEl, detail);
+            }
+        } catch {
+            showMessage(deleteErrorEl, "Network error. Please verify your connection.");
+        } finally {
+            submitButton.disabled = false;
+            submitButton.textContent = "Permanently Delete My Account";
+        }
     });
 
     void loadKeys();

@@ -35,4 +35,14 @@ desktop/src-tauri/target/
 # Website build outputs
 website/node_modules/
 website/dist/
+# Per-deployment build config (operator/legal details, app-only profile).
+# Untracked on purpose so it survives the git checkout a deploy performs.
+website/.env.local
+website/.env.*.local
 packaging/linux/tracksuite-work.julianquandt.com.conf
+
+# Internal security audit / vulnerability roadmap — never commit (keep local only)
+conductor/SECURITY_AUDIT_*.md
+
+# Personal server runbook — local reference only, never commit/push
+backend/SERVER_RUNBOOK.md

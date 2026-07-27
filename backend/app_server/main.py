@@ -1,8 +1,12 @@
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 import json
+import logging
 import os
+import threading
+import time
 import uuid as uuid_lib
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,10 +14,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, func, or_, text
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.responses import JSONResponse
 
@@ -28,17 +32,23 @@ from .auth import (
     generate_recovery_codes,
     generate_refresh_token,
     generate_session_id,
+    generate_token,
     generate_totp_secret,
     hash_api_key,
+    hash_email,
     hash_password,
     hash_recovery_code,
     hash_refresh_token,
+    hash_token,
     is_encrypted_secret,
+    needs_reencryption,
     validate_auth_configuration,
     verify_password,
     verify_recovery_code,
     verify_totp,
+    verify_totp_step,
 )
+from . import instance, mailer, releases
 from .models import (
     ApiKey,
     AuthRateLimit,
@@ -65,6 +75,9 @@ engine = create_engine(
 def _set_sqlite_pragma(dbapi_conn, connection_record):
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
+    # Overwrite freed pages so "deleted" plaintext isn't left recoverable in
+    # the DB file's free list (defence-in-depth for erasure / breach exposure).
+    cursor.execute("PRAGMA secure_delete=ON")
     cursor.close()
 
 
@@ -92,6 +105,71 @@ def new_uuid() -> str:
     return str(uuid_lib.uuid4())
 
 
+# ── Security/limits constants ────────────────────────────────────────
+PASSWORD_MAX_LENGTH = 1024
+# Bumped whenever the Terms/Privacy Policy materially change; recorded per user
+# at registration so you can prove which version each account accepted. Keep in
+# step with VITE_LEGAL_EFFECTIVE_DATE, the date shown on the published pages.
+CURRENT_TOS_VERSION = os.environ.get("WORK_TIME_TOS_VERSION", "2026-07-27")
+# Largest accepted request body (bytes). The desktop pushes its FULL local
+# state to /sync/ each time, so this must fit a heavy user's entire history
+# (tens of thousands of shifts) — it only exists to stop a memory-exhaustion
+# DoS (hundreds of MB) on the single worker, not to bound normal use.
+MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+# Field length caps for stored strings (defence against unbounded storage).
+MAX_NOTE_LENGTH = 10000
+MAX_NAME_LENGTH = 200
+MAX_UUID_LENGTH = 64
+MAX_TIMESTAMP_LENGTH = 40
+MAX_SHORT_FIELD_LENGTH = 64
+# How long tombstones (deleted rows) are retained before hard purge. Must be
+# comfortably longer than any realistic offline window for a sync client.
+TOMBSTONE_RETENTION_DAYS = 180
+# Absolute session lifetime cap regardless of refresh activity.
+SESSION_ABSOLUTE_MAX_DAYS = 90
+# Grace window in which replay of a just-rotated refresh token is treated as a
+# benign concurrent-refresh race (multi-tab / retry) rather than theft.
+REFRESH_REUSE_GRACE_SECONDS = 60
+# Grace period after a session expires/is revoked before its row (with IP + UA)
+# is purged.
+SESSION_PURGE_GRACE_DAYS = 30
+# Unconfirmed (never-enrolled) accounts are swept after this many hours.
+UNENROLLED_ACCOUNT_TTL_HOURS = 48
+# Email-verification link lifetime.
+EMAIL_VERIFICATION_TTL_HOURS = 24
+# Storage-limitation: warn an inactive account after this long, then delete it a
+# grace period after the warning email. Long by default so it rarely fires;
+# tune via env. Disabled entirely if the value is 0.
+INACTIVE_ACCOUNT_WARN_DAYS = int(os.environ.get("WORK_TIME_INACTIVE_WARN_DAYS", "0"))
+INACTIVE_ACCOUNT_DELETE_GRACE_DAYS = int(
+    os.environ.get("WORK_TIME_INACTIVE_DELETE_GRACE_DAYS", "30")
+)
+
+
+# ── Audit logging (breach-notification readiness, Art. 33/34) ─────────
+# Structured, PII-light security events to stdout/journald. Never logs
+# passwords, tokens, OTPs, or note/PII content — only the actor (user id),
+# client IP, and event name. Configure journald retention on the host.
+audit_logger = logging.getLogger("tracksuite.audit")
+if not audit_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    audit_logger.addHandler(_handler)
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
+
+
+def audit(event: str, *, user_id: Optional[int] = None, ip: Optional[str] = None, **fields) -> None:
+    parts = [f"event={event}"]
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if ip:
+        parts.append(f"ip={ip}")
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    audit_logger.info(" ".join(parts))
+
+
 def sync_ts_greater(a: Optional[str], b: Optional[str]) -> bool:
     """True if timestamp ``a`` is strictly newer than ``b`` (None = oldest)."""
     if a is None:
@@ -99,6 +177,27 @@ def sync_ts_greater(a: Optional[str], b: Optional[str]) -> bool:
     if b is None:
         return True
     return a > b
+
+
+def sanitized_sync_ts(value: Optional[str]) -> str:
+    """Clamp a client-supplied sync timestamp so it can't poison last-write-wins
+    (H4). An unparseable value, or one implausibly far in the future, is capped
+    to just past 'now' — a record can't win every future merge with 9999-... or
+    a non-ISO string that sorts above real timestamps."""
+    cap = datetime.now(timezone.utc) + timedelta(minutes=5)
+    parsed = None
+    if value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            parsed = None
+    if parsed is None:
+        return sync_now()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed > cap:
+        parsed = cap
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -216,6 +315,50 @@ def ensure_schema() -> None:
         if "work_schedule_updated_at" not in user_columns:
             conn.execute(text("ALTER TABLE users ADD COLUMN work_schedule_updated_at VARCHAR NULL"))
 
+        # Security/privacy hardening (0.9.3): encrypted-email lookup hash, TOTP
+        # replay guard, consent record.
+        user_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(users)"))
+        }
+        for col, ddl in (
+            ("email_hash", "VARCHAR NULL"),
+            ("last_totp_step", "INTEGER NULL"),
+            ("tos_accepted_at", "VARCHAR NULL"),
+            ("tos_version", "VARCHAR NULL"),
+            ("email_verified_at", "VARCHAR NULL"),
+            ("email_verification_hash", "VARCHAR NULL"),
+            ("email_verification_expires_at", "VARCHAR NULL"),
+            ("inactivity_warned_at", "VARCHAR NULL"),
+            ("password_reset_hash", "VARCHAR NULL"),
+            ("password_reset_expires_at", "VARCHAR NULL"),
+        ):
+            if col not in user_columns:
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
+                # Grandfather all pre-existing users as email-verified so the new
+                # login/enrollment gate never locks out established accounts.
+                if col == "email_verified_at":
+                    conn.execute(
+                        text("UPDATE users SET email_verified_at = created_at "
+                             "WHERE email_verified_at IS NULL")
+                    )
+
+        api_key_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(api_keys)"))
+        }
+        for col, ddl in (("last_used_at", "VARCHAR NULL"), ("expires_at", "VARCHAR NULL")):
+            if col not in api_key_columns:
+                conn.execute(text(f"ALTER TABLE api_keys ADD COLUMN {col} {ddl}"))
+
+        session_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(sessions)"))
+        }
+        for col, ddl in (
+            ("prev_refresh_token_hash", "VARCHAR NULL"),
+            ("absolute_expires_at", "VARCHAR NULL"),
+        ):
+            if col not in session_columns:
+                conn.execute(text(f"ALTER TABLE sessions ADD COLUMN {col} {ddl}"))
+
         backfill_ts = sync_now()
         # Backfill identity + timestamps for pre-existing rows.
         shift_ids = [
@@ -279,19 +422,88 @@ def ensure_schema() -> None:
             )
         )
 
-    with SessionLocal() as db:
-        migrated = False
-        for user in db.query(User).all():
-            if user.totp_secret and not is_encrypted_secret(user.totp_secret):
-                user.totp_secret = encrypt_secret(user.totp_secret)
-                if not user.mfa_enrolled_at:
-                    user.mfa_enrolled_at = user.created_at
-                migrated = True
-            if user.pending_totp_secret and not is_encrypted_secret(user.pending_totp_secret):
-                user.pending_totp_secret = encrypt_secret(user.pending_totp_secret)
-                migrated = True
-        if migrated:
-            db.commit()
+    _migrate_encrypt_at_rest()
+
+
+def _migrate_encrypt_at_rest() -> None:
+    """Encrypt pre-existing plaintext PII in place and backfill email hashes.
+
+    Runs at startup (synchronously, before the app serves) so an at-rest
+    guarantee applies to legacy rows, not just new writes. Idempotent: skips
+    already-encrypted values. Also re-encrypts anything still under an old key
+    (WORK_TIME_OLD_ENCRYPTION_KEYS) so a key rotation converges — after which
+    the old keys can be dropped. Raw SQL is used deliberately to bypass the
+    EncryptedString TypeDecorator and control exactly what is (re)written."""
+    with engine.begin() as conn:
+        # TOTP secrets (columns are plain String, encrypted via helpers).
+        for row in conn.execute(
+            text("SELECT id, totp_secret, pending_totp_secret, mfa_enrolled_at, created_at FROM users")
+        ).fetchall():
+            uid, totp, pending, enrolled, created = row
+            updates: dict[str, object] = {}
+            if totp and not is_encrypted_secret(totp):
+                updates["totp_secret"] = encrypt_secret(totp)
+                if not enrolled:
+                    updates["mfa_enrolled_at"] = created
+            elif needs_reencryption(totp):
+                updates["totp_secret"] = encrypt_secret(decrypt_secret(totp))
+            if pending and not is_encrypted_secret(pending):
+                updates["pending_totp_secret"] = encrypt_secret(pending)
+            elif needs_reencryption(pending):
+                updates["pending_totp_secret"] = encrypt_secret(decrypt_secret(pending))
+            if updates:
+                sets = ", ".join(f"{k} = :{k}" for k in updates)
+                conn.execute(text(f"UPDATE users SET {sets} WHERE id = :id"), {**updates, "id": uid})
+
+        # Email: encrypt + backfill the keyed lookup hash.
+        for uid, email, email_hash in conn.execute(
+            text("SELECT id, email, email_hash FROM users")
+        ).fetchall():
+            if email is None:
+                continue
+            plain = email if not is_encrypted_secret(email) else decrypt_secret(email)
+            updates = {}
+            if not is_encrypted_secret(email) or needs_reencryption(email):
+                updates["email"] = encrypt_secret(plain)
+            if not email_hash:
+                updates["email_hash"] = hash_email(plain)
+            if updates:
+                sets = ", ".join(f"{k} = :{k}" for k in updates)
+                conn.execute(text(f"UPDATE users SET {sets} WHERE id = :id"), {**updates, "id": uid})
+
+        # Free-text / identifying columns on other tables.
+        for table, col in (
+            ("shifts", "note"),
+            ("projects", "name"),
+            ("projects", "rate"),
+            ("api_keys", "name"),
+            ("sessions", "label"),
+            ("users", "work_schedule"),
+            ("users", "profile_encrypted"),
+        ):
+            for rid, value in conn.execute(
+                text(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != ''")
+            ).fetchall():
+                if not is_encrypted_secret(value):
+                    new_value = encrypt_secret(value)
+                elif needs_reencryption(value):
+                    new_value = encrypt_secret(decrypt_secret(value))
+                else:
+                    continue
+                conn.execute(
+                    text(f"UPDATE {table} SET {col} = :v WHERE id = :i"),
+                    {"v": new_value, "i": rid},
+                )
+
+        # Enforce email uniqueness on the hash column at the DB level for
+        # upgraded databases too (fresh tables get it from the model). Safe now
+        # that every existing row has a backfilled email_hash above.
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email_hash "
+                "ON users (email_hash)"
+            )
+        )
 
 
 ensure_schema()
@@ -311,7 +523,14 @@ def get_client_ip(request: Request) -> str:
     if client_host in trusted_proxies():
         forwarded = request.headers.get("x-forwarded-for", "").strip()
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            # Take the RIGHT-most hop that isn't itself a trusted proxy: that is
+            # the address our trusted proxy actually observed. The left-most
+            # entries are client-supplied and spoofable, so using them would let
+            # an attacker rotate a fake IP to evade per-IP throttling.
+            hops = [h.strip() for h in forwarded.split(",") if h.strip()]
+            for hop in reversed(hops):
+                if hop not in trusted_proxies():
+                    return hop
         real_ip = request.headers.get("x-real-ip", "").strip()
         if real_ip:
             return real_ip
@@ -324,6 +543,31 @@ def ip_rate_limit_key(request: Request) -> str:
 
 limiter = Limiter(key_func=ip_rate_limit_key)
 
+
+# ── Per-user in-process rate limiter for authenticated data endpoints ─────
+# The server runs a single worker, so an in-memory sliding window is sufficient
+# and avoids a DB write per request. Buckets reset on restart (acceptable for
+# abuse throttling). Keyed by authenticated user id so one user can't starve
+# others by hammering /sync/ (B7).
+_rate_buckets: dict[str, deque] = defaultdict(deque)
+_rate_lock = threading.Lock()
+
+
+def enforce_rate_limit(bucket: str, user_id: int, limit: int, window_seconds: int) -> None:
+    key = f"{bucket}:{user_id}"
+    now = time.monotonic()
+    cutoff = now - window_seconds
+    with _rate_lock:
+        times = _rate_buckets[key]
+        while times and times[0] < cutoff:
+            times.popleft()
+        if len(times) >= limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded. Please slow down.",
+            )
+        times.append(now)
+
 app = FastAPI(title="Work Time Tracker API")
 app.state.limiter = limiter
 
@@ -333,6 +577,25 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429, content={"detail": "Rate limit exceeded"}
     )
+
+
+@app.middleware("http")
+async def limit_request_body_size(request: Request, call_next):
+    """Reject oversized bodies before FastAPI buffers/parses them, so a single
+    huge POST to /sync/ can't exhaust the single worker's memory (B6). The
+    reverse proxy should also set LimitRequestBody as defence in depth."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413, content={"detail": "Request body too large"}
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"detail": "Invalid Content-Length header"}
+            )
+    return await call_next(request)
 
 
 def get_db():
@@ -418,6 +681,11 @@ def record_auth_flow_failure(db: Session, specs: list[tuple[str, int, int, int]]
 
 def clear_auth_flow_failures(db: Session, specs: list[tuple[str, int, int, int]]) -> None:
     for key, _, _, _ in specs:
+        # Keep the per-IP counter: clearing it on every success would let an
+        # attacker who succeeds each time (mass registration/enumeration from one
+        # IP) evade the durable per-IP cap (M3). Only account/combo keys clear.
+        if ":ip:" in key:
+            continue
         row = db.get(AuthRateLimit, key)
         if row is not None:
             db.delete(row)
@@ -427,8 +695,15 @@ def clear_auth_flow_failures(db: Session, specs: list[tuple[str, int, int, int]]
 def session_is_active(session: UserSession) -> bool:
     if session.revoked_at:
         return False
+    now = utcnow()
     expires_at = parse_timestamp(session.expires_at)
-    return bool(expires_at and expires_at > utcnow())
+    if not (expires_at and expires_at > now):
+        return False
+    # Absolute lifetime cap: a session can't be refreshed forever.
+    absolute_expires_at = parse_timestamp(session.absolute_expires_at)
+    if absolute_expires_at and absolute_expires_at <= now:
+        return False
+    return True
 
 
 def session_label_from_request(request: Request, explicit_label: Optional[str]) -> str:
@@ -478,6 +753,50 @@ def consume_recovery_code(db: Session, user_id: int, recovery_code: str) -> bool
     return False
 
 
+@lru_cache(maxsize=1)
+def _dummy_password_hash() -> str:
+    """A throwaway Argon2 hash used to spend the same CPU on a login for a
+    non-existent account as for a real one, so response timing doesn't reveal
+    which emails are registered (LOW-2)."""
+    return hash_password("timing-equalizer-not-a-real-password")
+
+
+def verify_login_password(user: Optional[User], password: str) -> bool:
+    """Constant-ish-time password check: always runs an Argon2 verify, even when
+    the account doesn't exist, to avoid an enumeration timing oracle."""
+    if user is None:
+        verify_password(password, _dummy_password_hash())
+        return False
+    return verify_password(password, user.password_hash)
+
+
+def require_email_verified(user: User) -> None:
+    """Block token issuance until the email address is confirmed (anti-squatting
+    + ensures we can reach the owner). Existing accounts were grandfathered
+    verified by the migration, so this only gates new registrations. Inactive
+    when no mail provider is configured (registrations auto-verify then)."""
+    if not mailer.mail_enabled():
+        return
+    if not user.email_verified_at:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verify your email address first — check your inbox for the confirmation link.",
+        )
+
+
+def verify_and_consume_totp(db: Session, user: User, code: str) -> bool:
+    """Verify a TOTP against the user's ACTIVE secret and reject replay of a
+    code already accepted within its window (M8). Persists the accepted step."""
+    step = verify_totp_step(code, user.totp_secret)
+    if step is None:
+        return False
+    if user.last_totp_step is not None and step <= user.last_totp_step:
+        return False  # already used this (or an earlier) code — replay
+    user.last_totp_step = step
+    db.commit()
+    return True
+
+
 def revoke_session(session: UserSession) -> None:
     if not session.revoked_at:
         session.revoked_at = to_iso(utcnow())
@@ -506,15 +825,19 @@ def create_session_tokens(
     now = utcnow()
     refresh_token = generate_refresh_token()
     refresh_token_hash = hash_refresh_token(refresh_token)
+    absolute_cap = now + timedelta(days=SESSION_ABSOLUTE_MAX_DAYS)
 
     if session is None:
+        rolling_expiry = now + timedelta(days=30)
         session = UserSession(
             id=generate_session_id(),
             user_id=user.id,
             refresh_token_hash=refresh_token_hash,
+            prev_refresh_token_hash=None,
             created_at=to_iso(now),
             last_used_at=to_iso(now),
-            expires_at=to_iso(now + timedelta(days=30)),
+            expires_at=to_iso(min(rolling_expiry, absolute_cap)),
+            absolute_expires_at=to_iso(absolute_cap),
             revoked_at=None,
             ip_address=get_client_ip(request),
             user_agent=request.headers.get("user-agent", "")[:255] or None,
@@ -522,9 +845,17 @@ def create_session_tokens(
         )
         db.add(session)
     else:
+        # Rotation: remember the outgoing token hash so a later replay of it is
+        # detected as theft (H2). The absolute cap set at creation is preserved.
+        session.prev_refresh_token_hash = session.refresh_token_hash
         session.refresh_token_hash = refresh_token_hash
         session.last_used_at = to_iso(now)
-        session.expires_at = to_iso(now + timedelta(days=30))
+        created_at = parse_timestamp(session.created_at) or now
+        hard_cap = parse_timestamp(session.absolute_expires_at) or (
+            created_at + timedelta(days=SESSION_ABSOLUTE_MAX_DAYS)
+        )
+        session.absolute_expires_at = to_iso(hard_cap)
+        session.expires_at = to_iso(min(now + timedelta(days=30), hard_cap))
         session.ip_address = get_client_ip(request)
         session.user_agent = request.headers.get("user-agent", "")[:255] or None
         session.label = session_label_from_request(request, label)
@@ -619,12 +950,20 @@ def get_current_user_id(
     db: Session = Depends(get_db),
 ) -> int:
     if bearer and bearer.credentials:
-        return get_current_bearer_context(request=request, bearer=bearer, db=db).user.id
+        uid = get_current_bearer_context(request=request, bearer=bearer, db=db).user.id
+        enforce_rate_limit("all", uid, limit=600, window_seconds=60)
+        return uid
 
     if x_api_key:
         hashed = hash_api_key(x_api_key)
         key_row = db.query(ApiKey).filter(ApiKey.key_hash == hashed).first()
         if key_row:
+            expires_at = parse_timestamp(key_row.expires_at)
+            if expires_at and expires_at <= utcnow():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="API key has expired",
+                )
             if request.method in ("POST", "PUT", "DELETE"):
                 app_version = request.headers.get("x-app-version")
                 if not is_version_at_least(app_version, "0.8.1"):
@@ -632,6 +971,10 @@ def get_current_user_id(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Desktop app upgrade required to v0.8.1 or newer to push data."
                     )
+            # Track usage so a leaked/stale key is visible to the owner.
+            key_row.last_used_at = to_iso(utcnow())
+            db.commit()
+            enforce_rate_limit("all", key_row.user_id, limit=600, window_seconds=60)
             return key_row.user_id
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -644,12 +987,21 @@ def get_current_user_id(
     )
 
 
+def limit_sync_push(user_id: int = Depends(get_current_user_id)) -> int:
+    """Tighter per-user cap for the expensive full-state sync merge."""
+    enforce_rate_limit("sync-push", user_id, limit=20, window_seconds=60)
+    return user_id
+
+
 # ── Pydantic schemas ────────────────────────────────────────────────
 
 
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
+    # Only consulted on instances running WORK_TIME_SIGNUP_MODE=restricted with
+    # invite codes configured; ignored otherwise.
+    invite_code: Optional[str] = Field(default=None, max_length=200)
 
 
 class ConfirmEnrollmentRequest(BaseModel):
@@ -697,8 +1049,18 @@ class AuthTokensResponse(BaseModel):
     session: SessionInfo
 
 
-class EnrollmentCompleteResponse(AuthTokensResponse):
+class EnrollmentCompleteResponse(BaseModel):
     recovery_codes: List[str]
+    # When email verification is still pending, no session is issued yet — the
+    # user activates the account via the verification link, then signs in.
+    verification_pending: bool = False
+    # Token fields are present only when the account is already active
+    # (verified, or a no-email deployment) — then the user is logged straight in.
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: str = "bearer"
+    expires_in: Optional[int] = None
+    session: Optional[SessionInfo] = None
 
 
 class LogoutAllResponse(BaseModel):
@@ -733,6 +1095,75 @@ class MfaResetConfirmRequest(BaseModel):
     otp: str
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=PASSWORD_MAX_LENGTH)
+    otp: str
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+    otp: str
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(max_length=256)
+
+
+class VerifyEmailResponse(BaseModel):
+    email: str
+    enrolled: bool
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str = Field(max_length=256)
+    new_password: str = Field(min_length=8, max_length=PASSWORD_MAX_LENGTH)
+    otp: Optional[str] = None
+    recovery_code: Optional[str] = None
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class GenericMessageResponse(BaseModel):
+    detail: str
+
+
+class InstanceConfigResponse(BaseModel):
+    instance_name: str
+    signup_mode: str
+    signup_open: bool
+    invite_required: bool
+    allowed_email_domains: List[str]
+    email_enabled: bool
+    tos_version: str
+
+
+class ReleaseAsset(BaseModel):
+    name: str
+    browser_download_url: str
+    size: int
+
+
+class LatestReleaseResponse(BaseModel):
+    tag_name: str
+    html_url: str
+    published_at: str
+    assets: List[ReleaseAsset]
+
+
+class TosStatusResponse(BaseModel):
+    current_version: str
+    accepted_version: Optional[str]
+    accepted_at: Optional[str]
+    acceptance_required: bool
+
+
+class AcceptTosRequest(BaseModel):
+    version: str = Field(max_length=64)
+
+
 class RegisterResponse(BaseModel):
     id: int
     email: str
@@ -742,7 +1173,7 @@ class RegisterResponse(BaseModel):
 
 
 class ApiKeyCreateRequest(BaseModel):
-    name: str
+    name: str = Field(max_length=MAX_NAME_LENGTH)
 
 
 class ApiKeyCreateResponse(BaseModel):
@@ -756,16 +1187,18 @@ class ApiKeyListItem(BaseModel):
     id: int
     name: str
     created_at: str
+    last_used_at: Optional[str] = None
+    expires_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
 class ShiftCreate(BaseModel):
-    start_time: str
-    end_time: Optional[str] = None
-    uuid: Optional[str] = None
-    project_uuid: Optional[str] = None
-    started_from: Optional[str] = None
-    note: Optional[str] = None
+    start_time: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
+    end_time: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
+    uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
+    project_uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
+    started_from: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    note: Optional[str] = Field(default=None, max_length=MAX_NOTE_LENGTH)
 
 
 class ShiftResponse(BaseModel):
@@ -784,19 +1217,19 @@ class ShiftResponse(BaseModel):
 
 
 class ProjectCreate(BaseModel):
-    name: str
-    color: Optional[str] = None
-    uuid: Optional[str] = None
-    rate: Optional[str] = None
-    currency: Optional[str] = None
+    name: str = Field(max_length=MAX_NAME_LENGTH)
+    color: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
+    rate: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    currency: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
 
 
 class ProjectUpdate(BaseModel):
-    name: Optional[str] = None
-    color: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=MAX_NAME_LENGTH)
+    color: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
     archived: Optional[bool] = None
-    rate: Optional[str] = None
-    currency: Optional[str] = None
+    rate: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    currency: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
 
 
 class ProjectResponse(BaseModel):
@@ -814,8 +1247,8 @@ class ProjectResponse(BaseModel):
 
 
 class OffDayCreate(BaseModel):
-    date: str
-    uuid: Optional[str] = None
+    date: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
+    uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
 
 
 class OffDayResponse(BaseModel):
@@ -864,42 +1297,48 @@ class WorkScheduleUpdate(BaseModel):
 
 
 class SyncShift(BaseModel):
-    uuid: str
-    start_time: str
-    end_time: Optional[str] = None
-    project_uuid: Optional[str] = None
-    note: Optional[str] = None
-    updated_at: str
+    uuid: str = Field(max_length=MAX_UUID_LENGTH)
+    start_time: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
+    end_time: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
+    project_uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
+    note: Optional[str] = Field(default=None, max_length=MAX_NOTE_LENGTH)
+    updated_at: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
     deleted: bool = False
-    deleted_at: Optional[str] = None
-    auto_closed_at: Optional[str] = None
-    started_from: Optional[str] = None
+    deleted_at: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
+    auto_closed_at: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
+    started_from: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
 
 
 class SyncOffDay(BaseModel):
-    uuid: str
-    date: str
-    updated_at: str
+    uuid: str = Field(max_length=MAX_UUID_LENGTH)
+    date: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
+    updated_at: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
     deleted: bool = False
-    deleted_at: Optional[str] = None
+    deleted_at: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
 
 
 class SyncProject(BaseModel):
-    uuid: str
-    name: str
-    color: Optional[str] = None
+    uuid: str = Field(max_length=MAX_UUID_LENGTH)
+    name: str = Field(max_length=MAX_NAME_LENGTH)
+    color: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
     archived: bool = False
-    rate: Optional[str] = None
-    currency: Optional[str] = None
-    updated_at: str
+    rate: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    currency: Optional[str] = Field(default=None, max_length=MAX_SHORT_FIELD_LENGTH)
+    updated_at: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
     deleted: bool = False
-    deleted_at: Optional[str] = None
+    deleted_at: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
+
+
+# Cap list sizes so a single push can't smuggle an unbounded number of rows.
+# High enough to hold a very long history (the client syncs full state), low
+# enough to bound worst-case work per request.
+MAX_SYNC_ITEMS = 200000
 
 
 class SyncPushRequest(BaseModel):
-    shifts: List[SyncShift] = []
-    off_days: List[SyncOffDay] = []
-    projects: List[SyncProject] = []
+    shifts: List[SyncShift] = Field(default=[], max_length=MAX_SYNC_ITEMS)
+    off_days: List[SyncOffDay] = Field(default=[], max_length=MAX_SYNC_ITEMS)
+    projects: List[SyncProject] = Field(default=[], max_length=MAX_SYNC_ITEMS)
 
 
 class SyncStateResponse(BaseModel):
@@ -937,12 +1376,189 @@ def build_auth_tokens_response(
     )
 
 
+# ── Data erasure & retention ─────────────────────────────────────────
+
+
+def hard_delete_user(db: Session, user_id: int) -> None:
+    """Irreversibly delete a user and every row scoped to them. No FK cascades
+    exist, so each table is cleared explicitly (GDPR Art. 17)."""
+    user = db.get(User, user_id)
+    # Capture the plaintext email before deletion — the auth rate-limit rows are
+    # keyed on the normalized email, so we need it to purge those too.
+    email = user.email.strip().lower() if user and user.email else None
+    db.query(Shift).filter(Shift.user_id == user_id).delete(synchronize_session=False)
+    db.query(OffDay).filter(OffDay.user_id == user_id).delete(synchronize_session=False)
+    db.query(Project).filter(Project.user_id == user_id).delete(synchronize_session=False)
+    db.query(ApiKey).filter(ApiKey.user_id == user_id).delete(synchronize_session=False)
+    db.query(RecoveryCode).filter(RecoveryCode.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserSession).filter(UserSession.user_id == user_id).delete(synchronize_session=False)
+    if user:
+        db.delete(user)
+    if email:
+        db.query(AuthRateLimit).filter(
+            AuthRateLimit.key.like(f"%:{email}:%"),
+        ).delete(synchronize_session=False)
+        db.query(AuthRateLimit).filter(
+            AuthRateLimit.key.like(f"%:{email}"),
+        ).delete(synchronize_session=False)
+    db.commit()
+
+
+def purge_expired_data() -> Dict[str, int]:
+    """Retention sweep (storage limitation): drop old tombstones, stale sessions
+    with their IP/UA, aged rate-limit rows, and never-enrolled accounts."""
+    counts: Dict[str, int] = {}
+    now = utcnow()
+    tomb_cutoff = to_iso(now - timedelta(days=TOMBSTONE_RETENTION_DAYS))
+    session_cutoff = to_iso(now - timedelta(days=SESSION_PURGE_GRACE_DAYS))
+    ratelimit_cutoff = to_iso(now - timedelta(days=1))
+    unenrolled_cutoff = to_iso(now - timedelta(hours=UNENROLLED_ACCOUNT_TTL_HOURS))
+    with SessionLocal() as db:
+        counts["shifts"] = db.query(Shift).filter(
+            Shift.deleted.is_(True), Shift.deleted_at < tomb_cutoff
+        ).delete(synchronize_session=False)
+        counts["projects"] = db.query(Project).filter(
+            Project.deleted.is_(True), Project.deleted_at < tomb_cutoff
+        ).delete(synchronize_session=False)
+        counts["off_days"] = db.query(OffDay).filter(
+            OffDay.deleted.is_(True), OffDay.deleted_at < tomb_cutoff
+        ).delete(synchronize_session=False)
+        # Sessions expired or revoked past the grace window (removes retained
+        # IP + user-agent, which are personal data).
+        counts["sessions"] = db.query(UserSession).filter(
+            or_(
+                UserSession.expires_at < session_cutoff,
+                UserSession.revoked_at < session_cutoff,
+            )
+        ).delete(synchronize_session=False)
+        # Aged auth rate-limit rows (they embed email + IP).
+        counts["rate_limits"] = db.query(AuthRateLimit).filter(
+            AuthRateLimit.window_started_at < ratelimit_cutoff
+        ).delete(synchronize_session=False)
+        db.commit()
+        # Incomplete accounts (not both enrolled AND verified) hold no data (login
+        # is gated on both), so sweeping them is safe and also auto-frees any
+        # email a squatter grabbed but never fully activated.
+        stale = db.query(User).filter(
+            or_(User.mfa_enrolled_at.is_(None), User.email_verified_at.is_(None)),
+            User.created_at < unenrolled_cutoff,
+        ).all()
+        counts["incomplete_users"] = len(stale)
+        for user in stale:
+            hard_delete_user(db, user.id)
+
+        # Storage limitation for long-inactive *active* accounts (opt-in; needs
+        # email so users can be warned first). Disabled unless WORK_TIME_INACTIVE
+        # _WARN_DAYS > 0. Warn once, then delete after a grace period if still
+        # inactive; a login in between clears the warning.
+        counts["inactivity_warned"] = 0
+        counts["inactivity_deleted"] = 0
+        if INACTIVE_ACCOUNT_WARN_DAYS > 0 and mailer.mail_enabled():
+            warn_cutoff = to_iso(now - timedelta(days=INACTIVE_ACCOUNT_WARN_DAYS))
+            candidates = db.query(User).filter(
+                User.mfa_enrolled_at.is_not(None),
+                User.email_verified_at.is_not(None),
+                User.inactivity_warned_at.is_(None),
+            ).all()
+            for user in candidates:
+                last_used = db.query(func.max(UserSession.last_used_at)).filter(
+                    UserSession.user_id == user.id
+                ).scalar()
+                last_activity = last_used or user.created_at
+                if last_activity < warn_cutoff:
+                    user.inactivity_warned_at = to_iso(now)
+                    mailer.send_inactivity_warning_email(
+                        user.email, INACTIVE_ACCOUNT_DELETE_GRACE_DAYS
+                    )
+                    counts["inactivity_warned"] += 1
+            db.commit()
+
+            delete_cutoff = to_iso(now - timedelta(days=INACTIVE_ACCOUNT_DELETE_GRACE_DAYS))
+            warned = db.query(User).filter(
+                User.inactivity_warned_at.is_not(None),
+                User.inactivity_warned_at < delete_cutoff,
+            ).all()
+            for user in warned:
+                last_used = db.query(func.max(UserSession.last_used_at)).filter(
+                    UserSession.user_id == user.id
+                ).scalar()
+                if not last_used or last_used < user.inactivity_warned_at:
+                    audit("inactivity_deleted", user_id=user.id)
+                    hard_delete_user(db, user.id)
+                    counts["inactivity_deleted"] += 1
+                else:
+                    user.inactivity_warned_at = None  # reactivated → clear warning
+                    db.commit()
+    # Drop accumulated per-user throttle buckets (ephemeral 60s-window counters);
+    # bounds memory for a long-running process with many distinct users.
+    with _rate_lock:
+        _rate_buckets.clear()
+    return counts
+
+
+_maintenance_stop = threading.Event()
+
+
+def _maintenance_loop() -> None:  # pragma: no cover - background timer
+    # Run soon after boot, then daily.
+    while not _maintenance_stop.wait(60):
+        try:
+            purge_expired_data()
+        except Exception:
+            pass
+        _maintenance_stop.wait(24 * 3600)
+
+
+def start_maintenance_thread() -> None:
+    if os.environ.get("WORK_TIME_DISABLE_MAINTENANCE") == "1":
+        return
+    thread = threading.Thread(target=_maintenance_loop, daemon=True)
+    thread.start()
+
+
 # ── Root ─────────────────────────────────────────────────────────────
 
 
 @app.get("/")
 async def read_root():
     return {"status": "ok", "message": "Work Time Tracker API"}
+
+
+@app.get("/meta/instance", response_model=InstanceConfigResponse)
+def get_instance_config(db: Session = Depends(get_db)):
+    """Public, non-secret description of how this deployment is configured.
+
+    The web app fetches this once at startup so one build can serve the public
+    site, a company instance (invite/domain-gated signup) and a single-user
+    instance (no signup at all). Invite codes are never exposed.
+    """
+    return InstanceConfigResponse(
+        **instance.public_config(
+            user_count=db.query(func.count(User.id)).scalar() or 0,
+            email_enabled=mailer.mail_enabled(),
+            tos_version=CURRENT_TOS_VERSION,
+        )
+    )
+
+
+@app.get("/meta/releases/latest", response_model=LatestReleaseResponse)
+def get_latest_release():
+    """Installer URLs for the download page, fetched server-side.
+
+    The browser must not call GitHub itself: that would transmit every
+    visitor's IP to a US company automatically on page load, and would need a
+    `connect-src` exception in the CSP. Cached, so one server call serves
+    everyone instead of each visitor spending the anonymous rate limit.
+    """
+    release = releases.latest_release()
+    if release is None:
+        # The download page falls back to a plain "latest release" link, which
+        # is why this is a soft 503 rather than an error worth alarming on.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Release information is temporarily unavailable.",
+        )
+    return LatestReleaseResponse(**release)
 
 
 # ── Auth endpoints ───────────────────────────────────────────────────
@@ -962,26 +1578,82 @@ def register(body: RegisterRequest, request: Request,
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Password must be at least 8 characters",
         )
-    if db.query(User).filter(User.email == body.email).first():
+    if len(body.password) > PASSWORD_MAX_LENGTH:
+        record_auth_flow_failure(db, specs)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Password must be at most {PASSWORD_MAX_LENGTH} characters",
+        )
+    existing = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+
+    # Instance policy (self-hosted single-user / company deployments) is checked
+    # BEFORE the duplicate-email check: on a closed instance every registration
+    # attempt must look identical, so a 409 can't be used to probe for accounts.
+    rejection = instance.signup_rejection_reason(
+        body.email,
+        body.invite_code,
+        user_count=db.query(func.count(User.id)).scalar() or 0,
+        creates_new_user=existing is None,
+    )
+    if rejection is not None:
+        record_auth_flow_failure(db, specs)
+        audit("register_rejected", ip=get_client_ip(request), mode=instance.signup_mode())
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=rejection)
+
+    if existing is not None and existing.mfa_enrolled_at and existing.email_verified_at:
+        # A *fully active* account (enrolled + verified) owns the address — that's
+        # the only thing that blocks it, and it's never reset (it may hold data).
+        # Send people to sign-in / password-reset instead. An incomplete account
+        # can't log in, so it has no data and is safely reset below — which is
+        # also how a squatter's unverified claim gets cleared. (In no-email
+        # deployments accounts auto-verify at registration, which is why the
+        # claim is on enrolled+verified, not verified alone.)
         record_auth_flow_failure(db, specs)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Email already registered",
+            detail="You already have an account with this email. Sign in, or reset your password.",
         )
 
     raw_totp_secret = generate_totp_secret()
-    user = User(
-        email=body.email,
-        password_hash=hash_password(body.password),
-        totp_secret="",
-        pending_totp_secret=encrypt_secret(raw_totp_secret),
-        mfa_enrolled_at=None,
-        created_at=to_iso(utcnow()),
-    )
-    db.add(user)
+    now = utcnow()
+    now_iso = to_iso(now)
+    # Without a mail provider we can't verify email, so auto-verify (the gate is
+    # simply inactive) — a self-hoster without Resend still onboards users.
+    verify_by_email = mailer.mail_enabled()
+
+    if existing is not None:
+        # Re-registration of an unverified (⇒ data-less) account: reset in place.
+        user = existing
+        user.password_hash = hash_password(body.password)
+        user.totp_secret = ""
+        user.pending_totp_secret = encrypt_secret(raw_totp_secret)
+        user.mfa_enrolled_at = None
+        user.last_totp_step = None
+        user.tos_accepted_at = now_iso
+        user.tos_version = CURRENT_TOS_VERSION
+        user.email_verified_at = None if verify_by_email else now_iso
+        user.email_verification_hash = None
+        user.email_verification_expires_at = None
+    else:
+        user = User(
+            email=body.email,
+            email_hash=hash_email(body.email),
+            password_hash=hash_password(body.password),
+            totp_secret="",
+            pending_totp_secret=encrypt_secret(raw_totp_secret),
+            mfa_enrolled_at=None,
+            created_at=now_iso,
+            tos_accepted_at=now_iso,
+            tos_version=CURRENT_TOS_VERSION,
+            email_verified_at=None if verify_by_email else now_iso,
+        )
+        db.add(user)
     db.commit()
     db.refresh(user)
     clear_auth_flow_failures(db, specs)
+    # NOTE: the verification email is sent after 2FA setup (confirm-enrollment),
+    # so a verification link only ever exists for an already-enrolled account.
+    audit("register", user_id=user.id, ip=get_client_ip(request))
     return RegisterResponse(
         id=user.id,
         email=user.email,
@@ -1001,40 +1673,173 @@ def confirm_enrollment(
     specs = build_auth_rate_limit_specs("enroll", body.email, get_client_ip(request))
     assert_auth_flow_allowed(db, specs)
 
-    user = db.query(User).filter(User.email == body.email).first()
-    if not user or not verify_password(body.password, user.password_hash):
+    user = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+    if not verify_login_password(user, body.password):
         record_auth_flow_failure(db, specs)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email, password, or authenticator code",
         )
 
-    if not user.pending_totp_secret:
+    # NOTE: email verification is NOT required here — 2FA is set up first, then
+    # the account is activated by verifying the email (verify-last).
+    if not user.mfa_enrolled_at and not user.pending_totp_secret:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No pending MFA enrollment was found for this account",
         )
 
-    if not verify_totp(body.otp, user.pending_totp_secret):
+    # Idempotent-ish: if already enrolled, verify against the active secret so a
+    # repeated call (double submit) doesn't error.
+    secret_to_check = user.pending_totp_secret or user.totp_secret
+    if not verify_totp(body.otp, secret_to_check):
         record_auth_flow_failure(db, specs)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email, password, or authenticator code",
         )
 
-    user.totp_secret = user.pending_totp_secret
-    user.pending_totp_secret = None
-    user.mfa_enrolled_at = to_iso(utcnow())
+    if user.pending_totp_secret:
+        user.totp_secret = user.pending_totp_secret
+        user.pending_totp_secret = None
+        user.mfa_enrolled_at = to_iso(utcnow())
+        user.last_totp_step = None
     db.commit()
 
     recovery_codes = replace_recovery_codes(db, user.id)
+    clear_auth_flow_failures(db, specs)
+    audit("enrollment_complete", user_id=user.id, ip=get_client_ip(request))
+
+    if not user.email_verified_at:
+        # Verify-last: send the activation email now (first time there's a link),
+        # and don't issue a session until the email is verified.
+        token = generate_token()
+        user.email_verification_hash = hash_token(token)
+        user.email_verification_expires_at = to_iso(
+            utcnow() + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
+        )
+        db.commit()
+        mailer.send_verification_email(user.email, token)
+        return EnrollmentCompleteResponse(recovery_codes=recovery_codes, verification_pending=True)
+
+    # Already verified (e.g. no-email deployment): log the user straight in.
     session, access_token, refresh_token = create_session_tokens(
         db, user, request, body.device_name
     )
-    clear_auth_flow_failures(db, specs)
     return EnrollmentCompleteResponse(
-        **build_auth_tokens_response(session, access_token, refresh_token).model_dump(),
         recovery_codes=recovery_codes,
+        **build_auth_tokens_response(session, access_token, refresh_token).model_dump(),
+    )
+
+
+@app.post("/auth/verify-email", response_model=VerifyEmailResponse)
+@limiter.limit("30/hour")
+def verify_email(body: VerifyEmailRequest, request: Request,
+                 db: Session = Depends(get_db)):
+    user = db.query(User).filter(
+        User.email_verification_hash == hash_token(body.token)
+    ).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or already-used verification link.",
+        )
+    expires_at = parse_timestamp(user.email_verification_expires_at)
+    if expires_at and expires_at <= utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification link has expired. Request a new one.",
+        )
+    user.email_verified_at = to_iso(utcnow())
+    user.email_verification_hash = None
+    user.email_verification_expires_at = None
+    db.commit()
+    audit("email_verified", user_id=user.id, ip=get_client_ip(request))
+    # Return the address + whether 2FA is still needed, so the client can move
+    # straight into authenticator setup for this account.
+    return VerifyEmailResponse(email=user.email, enrolled=bool(user.mfa_enrolled_at))
+
+
+@app.post("/auth/password-reset/request", response_model=GenericMessageResponse)
+@limiter.limit("5/hour")
+def request_password_reset(body: ResendVerificationRequest, request: Request,
+                           db: Session = Depends(get_db)):
+    """Email a password-reset link. Generic response either way (no enumeration).
+    Only fully-active accounts (verified + enrolled) get a link."""
+    user = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+    if user is not None and user.email_verified_at and user.mfa_enrolled_at:
+        token = generate_token()
+        user.password_reset_hash = hash_token(token)
+        user.password_reset_expires_at = to_iso(utcnow() + timedelta(hours=1))
+        db.commit()
+        mailer.send_password_reset_email(user.email, token)
+        audit("password_reset_requested", user_id=user.id, ip=get_client_ip(request))
+    return GenericMessageResponse(
+        detail="If that email has an account, a password-reset link is on its way."
+    )
+
+
+@app.post("/auth/password-reset/confirm", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("10/hour")
+def confirm_password_reset(body: PasswordResetConfirmRequest, request: Request,
+                           db: Session = Depends(get_db)):
+    """Set a new password from a reset link. Requires a second factor (current
+    authenticator code OR a recovery code) so a stolen inbox alone can't take
+    over the account. Revokes all sessions."""
+    user = db.query(User).filter(
+        User.password_reset_hash == hash_token(body.token)
+    ).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid or already-used reset link.",
+        )
+    expires_at = parse_timestamp(user.password_reset_expires_at)
+    if expires_at and expires_at <= utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reset link has expired. Request a new one.",
+        )
+
+    second_factor_ok = False
+    if body.otp and verify_totp(body.otp, user.totp_secret):
+        second_factor_ok = True
+    elif body.recovery_code and consume_recovery_code(db, user.id, body.recovery_code):
+        second_factor_ok = True
+    if not second_factor_ok:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Enter a valid authenticator code or a recovery code to reset your password.",
+        )
+
+    user.password_hash = hash_password(body.new_password)
+    user.password_reset_hash = None
+    user.password_reset_expires_at = None
+    user.last_totp_step = None
+    db.commit()
+    revoke_all_user_sessions(db, user.id)
+    audit("password_reset", user_id=user.id, ip=get_client_ip(request))
+    mailer.send_password_changed_email(user.email)
+    return None
+
+
+@app.post("/auth/resend-verification", response_model=GenericMessageResponse)
+@limiter.limit("5/hour")
+def resend_verification(body: ResendVerificationRequest, request: Request,
+                        db: Session = Depends(get_db)):
+    # Generic response either way so this doesn't reveal whether an address is
+    # registered or already verified.
+    user = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+    if user is not None and not user.email_verified_at:
+        token = generate_token()
+        user.email_verification_hash = hash_token(token)
+        user.email_verification_expires_at = to_iso(
+            utcnow() + timedelta(hours=EMAIL_VERIFICATION_TTL_HOURS)
+        )
+        db.commit()
+        mailer.send_verification_email(body.email, token)
+    return GenericMessageResponse(
+        detail="If that address needs verification, a new link is on its way."
     )
 
 
@@ -1045,13 +1850,16 @@ def login(body: LoginRequest, request: Request,
     specs = build_auth_rate_limit_specs("login", body.email, get_client_ip(request))
     assert_auth_flow_allowed(db, specs)
 
-    user = db.query(User).filter(User.email == body.email).first()
-    if not user or not verify_password(body.password, user.password_hash):
+    user = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+    if not verify_login_password(user, body.password):
         record_auth_flow_failure(db, specs)
+        audit("login_failed", user_id=user.id if user else None, ip=get_client_ip(request), reason="password")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email, password, or authenticator code",
         )
+
+    require_email_verified(user)
 
     if not user.totp_secret:
         raise HTTPException(
@@ -1059,8 +1867,9 @@ def login(body: LoginRequest, request: Request,
             detail="Complete MFA enrollment before logging in",
         )
 
-    if not verify_totp(body.otp, user.totp_secret):
+    if not verify_and_consume_totp(db, user, body.otp):
         record_auth_flow_failure(db, specs)
+        audit("login_failed", user_id=user.id, ip=get_client_ip(request), reason="otp")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email, password, or authenticator code",
@@ -1070,6 +1879,7 @@ def login(body: LoginRequest, request: Request,
         db, user, request, body.device_name
     )
     clear_auth_flow_failures(db, specs)
+    audit("login_success", user_id=user.id, ip=get_client_ip(request))
     return build_auth_tokens_response(session, access_token, refresh_token)
 
 
@@ -1083,13 +1893,15 @@ def login_with_recovery_code(
     specs = build_auth_rate_limit_specs("recovery-login", body.email, get_client_ip(request))
     assert_auth_flow_allowed(db, specs)
 
-    user = db.query(User).filter(User.email == body.email).first()
-    if not user or not verify_password(body.password, user.password_hash):
+    user = db.query(User).filter(User.email_hash == hash_email(body.email)).first()
+    if not verify_login_password(user, body.password):
         record_auth_flow_failure(db, specs)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email, password, or recovery code",
         )
+
+    require_email_verified(user)
 
     if not consume_recovery_code(db, user.id, body.recovery_code):
         record_auth_flow_failure(db, specs)
@@ -1112,10 +1924,37 @@ def refresh_auth_session(
     request: Request,
     db: Session = Depends(get_db),
 ):
+    presented_hash = hash_refresh_token(body.refresh_token)
     session = db.query(UserSession).filter(
-        UserSession.refresh_token_hash == hash_refresh_token(body.refresh_token)
+        UserSession.refresh_token_hash == presented_hash
     ).first()
-    if not session or not session_is_active(session):
+    if session is None:
+        # The presented token isn't current. If it matches a session's
+        # *previous* (already-rotated) hash, decide between a benign race and
+        # theft by how long ago rotation happened:
+        #   • within a short grace window → a concurrent refresh (two tabs, a
+        #     network retry): just 401 so the client re-authenticates, as before.
+        #   • after the grace window → a delayed replay of a rotated token, the
+        #     classic stolen-refresh signal: revoke the whole session family.
+        compromised = db.query(UserSession).filter(
+            UserSession.prev_refresh_token_hash == presented_hash
+        ).first()
+        if compromised is not None:
+            rotated_at = parse_timestamp(compromised.last_used_at)
+            recent = rotated_at and (utcnow() - rotated_at) < timedelta(
+                seconds=REFRESH_REUSE_GRACE_SECONDS
+            )
+            if not recent:
+                revoke_all_user_sessions(db, compromised.user_id)
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token reuse detected; all sessions were revoked. Please sign in again.",
+                )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
+    if not session_is_active(session):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token",
@@ -1183,6 +2022,183 @@ def logout_all(
 ):
     revoked = revoke_all_user_sessions(db, context.user.id)
     return LogoutAllResponse(revoked_sessions=revoked)
+
+
+@app.post("/auth/password", status_code=status.HTTP_204_NO_CONTENT)
+def change_password(
+    body: PasswordChangeRequest,
+    request: Request,
+    context: BearerSessionContext = Depends(get_current_bearer_context),
+    db: Session = Depends(get_db),
+):
+    """Change the account password (current password + OTP required). Revokes
+    every other session so a compromised password can't keep a foothold."""
+    if not verify_password(body.current_password, context.user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password or authenticator code",
+        )
+    # Session-authenticated sensitive action: plain TOTP check (no step-consume,
+    # so it doesn't collide with a login's code in the same window).
+    if not verify_totp(body.otp, context.user.totp_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password or authenticator code",
+        )
+    context.user.password_hash = hash_password(body.new_password)
+    email = context.user.email
+    db.commit()
+    revoke_all_user_sessions(db, context.user.id, except_session_id=context.session.id)
+    audit("password_changed", user_id=context.user.id, ip=get_client_ip(request))
+    mailer.send_password_changed_email(email)
+    return None
+
+
+@app.get("/account/export")
+def export_account_data(
+    request: Request,
+    context: BearerSessionContext = Depends(get_current_bearer_context),
+    db: Session = Depends(get_db),
+):
+    """Machine-readable export of everything held for the account (Art. 15/20).
+    Decrypted for the owner over their authenticated session."""
+    audit("account_export", user_id=context.user.id, ip=get_client_ip(request))
+    user = context.user
+    shifts = db.query(Shift).filter(Shift.user_id == user.id).all()
+    off_days = db.query(OffDay).filter(OffDay.user_id == user.id).all()
+    projects = db.query(Project).filter(Project.user_id == user.id).all()
+    sessions = db.query(UserSession).filter(UserSession.user_id == user.id).all()
+    api_keys = db.query(ApiKey).filter(ApiKey.user_id == user.id).all()
+
+    profile = None
+    if user.profile_encrypted:
+        try:
+            profile = json.loads(decrypt_secret(user.profile_encrypted))
+        except Exception:
+            profile = None
+    schedule = None
+    if user.work_schedule:
+        try:
+            schedule = json.loads(user.work_schedule)
+        except Exception:
+            schedule = None
+
+    return {
+        "exported_at": sync_now(),
+        "account": {
+            "id": user.id,
+            "email": user.email,
+            "created_at": user.created_at,
+            "mfa_enrolled_at": user.mfa_enrolled_at,
+            "tos_accepted_at": user.tos_accepted_at,
+            "tos_version": user.tos_version,
+        },
+        "report_profile": profile,
+        "work_schedule": schedule,
+        "shifts": [_serialize_sync_shift(s).model_dump() for s in shifts if s.uuid],
+        "off_days": [_serialize_sync_off_day(o).model_dump() for o in off_days if o.uuid],
+        "projects": [_serialize_sync_project(p).model_dump() for p in projects if p.uuid],
+        "sessions": [
+            {
+                "label": s.label,
+                "ip_address": s.ip_address,
+                "user_agent": s.user_agent,
+                "created_at": s.created_at,
+                "last_used_at": s.last_used_at,
+                "expires_at": s.expires_at,
+                "revoked_at": s.revoked_at,
+            }
+            for s in sessions
+        ],
+        "api_keys": [
+            {"name": k.name, "created_at": k.created_at, "last_used_at": k.last_used_at}
+            for k in api_keys
+        ],
+    }
+
+
+@app.post("/account/delete", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    body: DeleteAccountRequest,
+    request: Request,
+    context: BearerSessionContext = Depends(get_current_bearer_context),
+    db: Session = Depends(get_db),
+):
+    """Irreversibly delete the account and all its data (Art. 17). Requires
+    password + OTP re-verification."""
+    if not verify_password(body.password, context.user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password or authenticator code",
+        )
+    if not verify_totp(body.otp, context.user.totp_secret):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password or authenticator code",
+        )
+    user_id = context.user.id
+    email = context.user.email  # capture before deletion for the confirmation email
+    hard_delete_user(db, user_id)
+    # Reclaim freed pages so the erased plaintext doesn't linger in the file.
+    # The deletion is already committed; a VACUUM failure must not fail the call.
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("VACUUM")
+    except Exception:
+        pass
+    audit("account_deleted", user_id=user_id, ip=get_client_ip(request))
+    mailer.send_account_deleted_email(email)
+    return None
+
+
+def _tos_status(user: User) -> TosStatusResponse:
+    accepted = user.tos_version or None
+    return TosStatusResponse(
+        current_version=CURRENT_TOS_VERSION,
+        accepted_version=accepted,
+        accepted_at=user.tos_accepted_at,
+        acceptance_required=accepted != CURRENT_TOS_VERSION,
+    )
+
+
+@app.get("/auth/tos", response_model=TosStatusResponse)
+def get_tos_status(
+    context: BearerSessionContext = Depends(get_current_bearer_context),
+):
+    """Which terms this account accepted, and whether that is still current.
+
+    The Terms promise registered users notice before a material change takes
+    effect; this is how the app knows to show it. Deliberately read-only and
+    non-blocking — the prompt is notice, not a gate, so an account that hasn't
+    re-accepted keeps working (and keeps being able to export or delete).
+    """
+    return _tos_status(context.user)
+
+
+@app.post("/auth/tos/accept", response_model=TosStatusResponse)
+def accept_tos(
+    body: AcceptTosRequest,
+    request: Request,
+    context: BearerSessionContext = Depends(get_current_bearer_context),
+    db: Session = Depends(get_db),
+):
+    # The version travels in the body so a tab left open since before an update
+    # can't blind-accept terms it never displayed — it gets told to reload.
+    if body.version != CURRENT_TOS_VERSION:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="These terms are out of date. Reload the page to read the current version.",
+        )
+    context.user.tos_accepted_at = to_iso(utcnow())
+    context.user.tos_version = CURRENT_TOS_VERSION
+    db.commit()
+    audit(
+        "tos_accepted",
+        user_id=context.user.id,
+        ip=get_client_ip(request),
+        version=CURRENT_TOS_VERSION,
+    )
+    return _tos_status(context.user)
 
 
 @app.get("/auth/recovery-codes/status", response_model=RecoveryCodesStatusResponse)
@@ -1265,10 +2281,20 @@ def confirm_mfa_reset(
     context.user.totp_secret = context.user.pending_totp_secret
     context.user.pending_totp_secret = None
     context.user.mfa_enrolled_at = to_iso(utcnow())
+    context.user.last_totp_step = None
+    email = context.user.email
     db.commit()
 
     revoke_all_user_sessions(db, context.user.id, except_session_id=context.session.id)
     recovery_codes = replace_recovery_codes(db, context.user.id)
+    audit("mfa_reset", user_id=context.user.id)
+    mailer.send_security_alert_email(
+        email,
+        "Your TrackSuite.work authenticator was reset",
+        "<p>Your two-factor authenticator was just reset and other sessions were "
+        "signed out. If this wasn't you, use a recovery code to regain access and "
+        "change your password immediately.</p>",
+    )
     return RecoveryCodesResponse(
         recovery_codes=recovery_codes,
         remaining_count=len(recovery_codes),
@@ -1295,6 +2321,7 @@ def create_api_key(
     db.add(key_row)
     db.commit()
     db.refresh(key_row)
+    audit("api_key_created", user_id=context.user.id, key_id=key_row.id)
     return ApiKeyCreateResponse(
         id=key_row.id,
         name=key_row.name,
@@ -1411,6 +2438,9 @@ def delete_shift(
     db_shift.deleted = True
     db_shift.deleted_at = sync_now()
     db_shift.updated_at = db_shift.deleted_at
+    # Scrub free-text PII from the tombstone: a deleted row only needs identity
+    # + deletion metadata to sync, so the note must not linger in the DB.
+    db_shift.note = None
     db.commit()
     return None
 
@@ -1428,7 +2458,10 @@ def update_shift(
     if not db_shift:
         raise HTTPException(status_code=404, detail="Shift not found")
     db_shift.start_time = shift_update.start_time
-    db_shift.end_time = shift_update.end_time
+    # Treat an omitted end_time as "unchanged" rather than reopening the shift
+    # (M7); only an explicitly-sent value updates it.
+    if "end_time" in shift_update.model_fields_set:
+        db_shift.end_time = shift_update.end_time
     if "project_uuid" in shift_update.model_fields_set:
         db_shift.project_uuid = shift_update.project_uuid
     if "note" in shift_update.model_fields_set:
@@ -1436,6 +2469,10 @@ def update_shift(
     # Editing an auto-closed shift means the user has reviewed it: clear the flag.
     db_shift.auto_closed_at = None
     db_shift.updated_at = sync_now()
+    db.flush()
+    # A REST edit can leave two shifts open (e.g. clearing an end_time); collapse
+    # back to a single open shift like create/sync do (M7).
+    reconcile_open_shifts(db, user_id)
     db.commit()
     db.refresh(db_shift)
     return db_shift
@@ -1682,6 +2719,10 @@ def delete_project(
     db_project.deleted = True
     db_project.deleted_at = now
     db_project.updated_at = now
+    # Scrub identifying/billing PII from the tombstone (name → "" keeps the
+    # column non-null for old desktop deserializers; rate cleared).
+    db_project.name = ""
+    db_project.rate = None
     # Detach the project from any shifts so they revert to "Unassigned"
     # instead of referencing a deleted project.
     if db_project.uuid:
@@ -1701,14 +2742,17 @@ def delete_project(
 
 
 def _serialize_sync_shift(shift: Shift) -> SyncShift:
+    # Tombstones carry no content: a deleted row only needs its identity +
+    # deletion metadata to propagate, so the note (free-text PII) is withheld.
+    deleted = bool(shift.deleted)
     return SyncShift(
         uuid=shift.uuid,
         start_time=shift.start_time,
         end_time=shift.end_time,
         project_uuid=shift.project_uuid,
-        note=shift.note,
+        note=None if deleted else shift.note,
         updated_at=shift.updated_at or "",
-        deleted=bool(shift.deleted),
+        deleted=deleted,
         deleted_at=shift.deleted_at,
         auto_closed_at=shift.auto_closed_at,
         started_from=shift.started_from,
@@ -1726,15 +2770,19 @@ def _serialize_sync_off_day(off_day: OffDay) -> SyncOffDay:
 
 
 def _serialize_sync_project(project: Project) -> SyncProject:
+    # Tombstones carry no content. name stays a string ("" not null) so older
+    # desktop clients — whose deserializer requires a non-optional name — keep
+    # working; rate (billing PII) is withheld entirely.
+    deleted = bool(project.deleted)
     return SyncProject(
         uuid=project.uuid,
-        name=project.name,
+        name="" if deleted else project.name,
         color=project.color,
         archived=bool(project.archived),
-        rate=project.rate,
+        rate=None if deleted else project.rate,
         currency=project.currency,
         updated_at=project.updated_at or "",
-        deleted=bool(project.deleted),
+        deleted=deleted,
         deleted_at=project.deleted_at,
     )
 
@@ -1808,12 +2856,14 @@ def get_sync_state(
 @app.post("/sync/", response_model=SyncStateResponse)
 def push_sync_state(
     body: SyncPushRequest,
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(limit_sync_push),
     db: Session = Depends(get_db),
 ):
     """Merge the client's full local state (last-write-wins) and return the
     server's authoritative merged state, including tombstones."""
     for incoming in body.shifts:
+        # Clamp the client timestamp so it can't poison last-write-wins (H4).
+        inc_ts = sanitized_sync_ts(incoming.updated_at)
         row = db.query(Shift).filter(
             Shift.user_id == user_id, Shift.uuid == incoming.uuid
         ).first()
@@ -1831,6 +2881,10 @@ def push_sync_state(
                 legacy.uuid = incoming.uuid
                 row = legacy
         if row is None:
+            # Don't materialize a tombstone for a row we never had (nothing for
+            # other devices to learn; avoids deleted-row amplification).
+            if incoming.deleted:
+                continue
             db.add(Shift(
                 user_id=user_id,
                 uuid=incoming.uuid,
@@ -1838,18 +2892,19 @@ def push_sync_state(
                 end_time=incoming.end_time,
                 project_uuid=incoming.project_uuid,
                 note=incoming.note,
-                updated_at=incoming.updated_at,
+                updated_at=inc_ts,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
                 auto_closed_at=incoming.auto_closed_at,
                 started_from=incoming.started_from,
             ))
-        elif sync_ts_greater(incoming.updated_at, row.updated_at):
+        elif sync_ts_greater(inc_ts, row.updated_at):
             row.start_time = incoming.start_time
             row.end_time = incoming.end_time
             row.project_uuid = incoming.project_uuid
-            row.note = incoming.note
-            row.updated_at = incoming.updated_at
+            # Scrub the note when the winning write is a deletion.
+            row.note = None if incoming.deleted else incoming.note
+            row.updated_at = inc_ts
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
             # A newer client write owns the flag: clients that don't know the
@@ -1861,10 +2916,13 @@ def push_sync_state(
                 row.started_from = incoming.started_from
 
     for incoming in body.projects:
+        inc_ts = sanitized_sync_ts(incoming.updated_at)
         row = db.query(Project).filter(
             Project.user_id == user_id, Project.uuid == incoming.uuid
         ).first()
         if row is None:
+            if incoming.deleted:
+                continue
             db.add(Project(
                 user_id=user_id,
                 uuid=incoming.uuid,
@@ -1873,36 +2931,40 @@ def push_sync_state(
                 archived=incoming.archived,
                 rate=incoming.rate,
                 currency=incoming.currency,
-                updated_at=incoming.updated_at,
+                updated_at=inc_ts,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
             ))
-        elif sync_ts_greater(incoming.updated_at, row.updated_at):
-            row.name = incoming.name
+        elif sync_ts_greater(inc_ts, row.updated_at):
+            # Scrub identifying/billing PII when the winning write is a deletion.
+            row.name = "" if incoming.deleted else incoming.name
             row.color = incoming.color
             row.archived = incoming.archived
-            row.rate = incoming.rate
+            row.rate = None if incoming.deleted else incoming.rate
             row.currency = incoming.currency
-            row.updated_at = incoming.updated_at
+            row.updated_at = inc_ts
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
 
     for incoming in body.off_days:
+        inc_ts = sanitized_sync_ts(incoming.updated_at)
         # Off-days merge on (user_id, date), resurrecting tombstones.
         row = db.query(OffDay).filter(
             OffDay.user_id == user_id, OffDay.date == incoming.date
         ).first()
         if row is None:
+            if incoming.deleted:
+                continue
             db.add(OffDay(
                 user_id=user_id,
                 uuid=incoming.uuid,
                 date=incoming.date,
-                updated_at=incoming.updated_at,
+                updated_at=inc_ts,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
             ))
-        elif sync_ts_greater(incoming.updated_at, row.updated_at):
-            row.updated_at = incoming.updated_at
+        elif sync_ts_greater(inc_ts, row.updated_at):
+            row.updated_at = inc_ts
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at
 
@@ -1941,3 +3003,7 @@ def get_daily_hours(
         date_str = start.strftime("%Y-%m-%d")
         daily_totals[date_str] = daily_totals.get(date_str, 0) + duration_hours
     return {key: round(value, 2) for key, value in daily_totals.items()}
+
+# Kick off the background retention sweep (disabled in tests via
+# WORK_TIME_DISABLE_MAINTENANCE=1).
+start_maintenance_thread()

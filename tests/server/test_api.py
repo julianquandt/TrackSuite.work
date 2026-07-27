@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 from app_server import limiter
+from app_server.auth import hash_email
 from app_server.main import app, get_db, report_timezone
 from app_server.models import Base, RecoveryCode, Shift, User, UserSession
 
@@ -44,6 +45,8 @@ TEST_PASSWORD = "securepassword123"
 @pytest.fixture(autouse=True)
 def setup_db():
     limiter.enabled = False
+    import backend.app_server.main as _m
+    _m._rate_buckets.clear()  # reset per-user in-memory throttle between tests
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
@@ -107,6 +110,17 @@ def _login_with_recovery_code(
     )
 
 
+def _verify_email_directly(email: str = TEST_EMAIL) -> None:
+    """Simulate the user clicking the verification link (mail is disabled in
+    tests, so the raw token is never emitted). Marks the account verified."""
+    with TestingSessionLocal() as db:
+        user = db.query(User).filter(User.email_hash == hash_email(email)).first()
+        if user is not None:
+            user.email_verified_at = "2026-01-01T00:00:00+00:00"
+            user.email_verification_hash = None
+            db.commit()
+
+
 def _register_and_enroll(
     email: str = TEST_EMAIL,
     password: str = TEST_PASSWORD,
@@ -114,6 +128,7 @@ def _register_and_enroll(
 ):
     register_response = _register(email, password)
     secret = register_response.json()["totp_secret"]
+    _verify_email_directly(email)
     enroll_response = _confirm_enrollment(
         email,
         password,
@@ -141,7 +156,7 @@ def test_register_success_creates_pending_enrollment():
     assert data["totp_uri"].startswith("otpauth://totp/")
 
     with TestingSessionLocal() as db:
-        user = db.query(User).filter(User.email == TEST_EMAIL).one()
+        user = db.query(User).filter(User.email_hash == hash_email(TEST_EMAIL)).one()
         assert user.totp_secret == ""
         assert user.pending_totp_secret is not None
         assert user.pending_totp_secret.startswith("fernet$")
@@ -149,8 +164,18 @@ def test_register_success_creates_pending_enrollment():
         assert user.mfa_enrolled_at is None
 
 
-def test_register_duplicate_email():
-    _register()
+def test_register_duplicate_unenrolled_resets_account():
+    # An abandoned (never-enrolled) registration doesn't trap the email — a
+    # repeat registration resets it in place instead of 409ing.
+    first = _register()
+    assert first.status_code == 201
+    again = _register(password="a-different-password-1")
+    assert again.status_code == 201
+
+
+def test_register_duplicate_enrolled_email_conflicts():
+    # A fully set-up account DOES block re-registration.
+    _register_and_enroll()
     response = _register()
     assert response.status_code == 409
 
@@ -182,7 +207,7 @@ def test_confirm_enrollment_activates_account_and_returns_recovery_codes():
     assert data["session"]["current"] is True
 
     with TestingSessionLocal() as db:
-        user = db.query(User).filter(User.email == TEST_EMAIL).one()
+        user = db.query(User).filter(User.email_hash == hash_email(TEST_EMAIL)).one()
         assert user.totp_secret.startswith("fernet$")
         assert user.totp_secret != raw_secret
         assert user.pending_totp_secret is None

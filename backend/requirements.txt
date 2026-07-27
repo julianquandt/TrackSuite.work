@@ -6,9 +6,13 @@ pydantic-core==2.41.5
 starlette==0.52.1
 anyio==4.12.1
 greenlet==3.3.2
-argon2-cffi>=23.1.0
-pyjwt>=2.8.0
-slowapi>=0.1.9
-pydantic[email]
-pyotp>=2.9.0
-cryptography>=45.0.0
+# Pinned exactly (were open-ended) so every deploy installs the audited set and
+# a vulnerable bump can't slip in silently. Bump deliberately + re-run tests;
+# consider `pip-audit` on a schedule.
+argon2-cffi==25.1.0
+pyjwt==2.13.0
+slowapi==0.1.10
+pyotp==2.10.0
+cryptography==49.0.0
+pydantic[email]==2.12.5
+email-validator==2.3.0

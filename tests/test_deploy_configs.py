@@ -78,7 +78,7 @@ def test_root_deployment_doc_points_to_backend_copy():
         assert "backend/DEPLOYMENT.md" in content
 
 
-def test_backend_deployment_doc_mentions_private_repo_bootstrap():
+def test_backend_deployment_doc_mentions_repo_bootstrap():
     with open("backend/DEPLOYMENT.md", "r") as f:
         content = f.read()
         assert "Start Over From Scratch" in content
@@ -87,7 +87,11 @@ def test_backend_deployment_doc_mentions_private_repo_bootstrap():
         assert "Full TrackSuite.work site" in content
         assert "Backend API only" in content
         assert "should live on its own site root or subdomain" in content
-        assert "For a private repository, run these commands on the server" in content
+        # The public clone URL leads; a fork or private repo is the variation,
+        # reached with WORK_TIME_REPO_URL rather than by editing the commands.
+        assert "https://github.com/julianquandt/TrackSuite.work.git" in content
+        assert "WORK_TIME_REPO_URL" in content
+        assert "YOUR_USERNAME/work-time-app" not in content
         assert "git clone --filter=blob:none --sparse" in content
         assert "git sparse-checkout set backend app_server website" in content
         assert "sudo SKIP_WEBSITE_BUILD=1 ./backend/deploy.sh main" in content
@@ -187,3 +191,76 @@ def test_systemd_template_content():
         assert "backend.app_server.main:app" in content
         assert "WORK_TIME_JWT_SECRET" in content
         assert "WORK_TIME_ENCRYPTION_KEY" in content
+
+
+def test_systemd_template_is_sandboxed():
+    for path in ("backend/work-time-backend.service", "app_server/work-time-backend.service"):
+        with open(path, "r") as f:
+            content = f.read()
+        assert "NoNewPrivileges=yes" in content
+        assert "ProtectSystem=strict" in content
+        assert "ReadWritePaths=/opt/work-time-app/data" in content
+        assert "UMask=0077" in content
+        assert "SystemCallFilter=@system-service" in content
+
+
+def test_deployment_doc_enables_tls_and_security_headers():
+    with open("backend/DEPLOYMENT.md", "r") as f:
+        content = f.read()
+    assert "SSLEngine on" in content
+    assert "Strict-Transport-Security" in content
+    assert "X-Content-Type-Options" in content
+    assert 'RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"' in content
+    assert "LimitRequestBody" in content
+    # Secrets-file guidance and data-subject-rights endpoints are documented.
+    assert "EnvironmentFile=/etc/work-time-backend.env" in content
+    assert "/account/delete" in content
+    assert "/account/export" in content
+    assert "WORK_TIME_OLD_ENCRYPTION_KEYS" in content
+
+
+def test_deployment_doc_documents_email_and_audit():
+    with open("backend/DEPLOYMENT.md", "r") as f:
+        content = f.read()
+    assert "RESEND_API_KEY" in content
+    assert "WORK_TIME_PUBLIC_BASE_URL" in content
+    assert "verify their email" in content
+    assert "tracksuite.audit" in content
+    assert "backend/backup.sh" in content
+
+
+def test_backup_script_exists_and_is_executable():
+    assert os.path.exists("backend/backup.sh")
+    assert os.stat("backend/backup.sh").st_mode & 0o111
+    with open("backend/backup.sh", "r") as f:
+        content = f.read()
+    # Never writes an unencrypted backup.
+    assert "Refusing to write an unencrypted backup" in content
+    assert ".backup" in content
+
+
+def test_website_selfhosting_page_agrees_with_the_canonical_guide():
+    """The website's self-hosting page is a summary of backend/DEPLOYMENT.md.
+
+    The two drifted apart once: the page omitted WORK_TIME_ENCRYPTION_KEY, which
+    the backend refuses to start without, so anyone following it built a server
+    that raised on boot. Pin the load-bearing facts and the link back.
+    """
+    page = (ROOT / "website/src/pages/docs.ts").read_text()
+
+    assert "WORK_TIME_ENCRYPTION_KEY" in page
+    # Secrets belong in the root-only file, not in a world-readable unit.
+    assert "EnvironmentFile=/etc/work-time-backend.env" in page
+    assert "WORK_TIME_SIGNUP_MODE" in page
+    # Must defer to the canonical guide rather than pretend to be complete.
+    assert "backend/DEPLOYMENT.md" in page
+    assert "YOUR_USERNAME" not in page
+
+
+def test_docs_do_not_reference_the_retired_domain():
+    """tracksuite.work replaced tracksuite-work.julianquandt.com; a stale link
+    in the README sends people to a host that no longer serves the app."""
+    for relative in ("README.md", "backend/DEPLOYMENT.md", "packaging/apt/README.md",
+                     "website/src/pages/docs.ts"):
+        content = (ROOT / relative).read_text()
+        assert "julianquandt.com" not in content, f"{relative} references the retired domain"

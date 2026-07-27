@@ -1,4 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Inter is self-hosted (see the @fontsource imports in main.ts), NOT loaded from
+   fonts.googleapis.com. Embedding Google Fonts remotely transmits every
+   visitor's IP address to Google in the US without a legal basis — LG München I
+   ruled that an infringement of the visitor's personal rights (3 O 17493/20,
+   20.01.2022) and it became a standard Abmahnung target. Do not reintroduce a
+   remote @import here, for this or any other third-party asset. */
 
 /* ── Ultra-Modern Utility Tokens ────────────────────────────────── */
 :root {
@@ -192,6 +197,16 @@ p {
     padding: 0;
     border-radius: 0;
     font-size: 0.85rem;
+}
+
+/* Pointer to the canonical guide, and to the issue tracker. */
+.docs-content .docs-callout {
+    border-left: 3px solid var(--accent);
+    background: var(--bg-panel);
+    padding: 1rem 1.25rem;
+    border-radius: 0 6px 6px 0;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
 }
 
 /* ── Layout ──────────────────────────────────────────────────────── */
@@ -456,6 +471,26 @@ p {
 .download-empty { font-size: 0.85rem; color: var(--text-tertiary); }
 .download-note { color: var(--text-tertiary); font-size: 0.85rem; }
 
+/* ── Contribute / issue tracker ──────────────────────────────────── */
+.contribute { text-align: center; }
+
+.contribute-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.contribute-note {
+    margin-top: 1.25rem;
+    color: var(--text-tertiary);
+    font-size: 0.85rem;
+    max-width: 46ch;
+    margin-left: auto;
+    margin-right: auto;
+    line-height: 1.6;
+}
+
 /* ── Info blocks ─────────────────────────────────────────────────── */
 .split-grid {
     display: grid;
@@ -637,6 +672,16 @@ button[type="submit"] {
     background: var(--bg-panel);
     padding: 1.75rem;
     margin-bottom: 1.5rem;
+}
+
+/* Irreversible actions get a red accent so they read as dangerous. */
+.dash-section.danger-zone {
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border-subtle));
+    background: color-mix(in srgb, var(--danger) 6%, var(--bg-panel));
+}
+
+.dash-section.danger-zone h3 {
+    color: var(--danger);
 }
 
 .section-row {
@@ -925,6 +970,132 @@ button[type="submit"] {
     padding: 4rem 2rem;
     text-align: center;
     font-size: 0.85rem;
+    color: var(--text-tertiary);
+}
+
+.footer-links {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 1.25rem;
+    margin-bottom: 1rem;
+}
+
+.footer-links a {
+    color: var(--text-tertiary);
+    text-decoration: none;
+}
+
+.footer-links a:hover {
+    color: var(--text-primary);
+    text-decoration: underline;
+}
+
+/* Inline links in the footer body (source, licence, issue tracker). Underlined
+   rather than coloured, so they read as links against the tertiary text. */
+.site-footer p a {
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 0.2em;
+}
+
+.site-footer p a:hover {
+    color: var(--text-primary);
+}
+
+.site-footer .footer-note {
+    margin-top: 0.6rem;
+}
+
+/* ── Legal pages ─────────────────────────────────────────────────── */
+.legal-content .legal-lede {
+    font-size: 1.05rem;
+    color: var(--text-secondary);
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+/* English gloss beside the German text an Impressum has to be written in. */
+.legal-content .legal-en {
+    display: block;
+    margin-top: 0.4rem;
+    font-size: 0.9em;
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
+.legal-content .legal-address {
+    line-height: 1.8;
+    color: var(--text-primary);
+}
+
+.legal-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 1.5rem;
+}
+
+.legal-table th,
+.legal-table td {
+    text-align: left;
+    vertical-align: top;
+    padding: 0.6rem 1rem 0.6rem 0;
+    border-bottom: 1px solid var(--border-subtle);
+    font-weight: 400;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.legal-table th {
+    width: 30%;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.legal-table-wide th {
+    width: 38%;
+}
+
+/* Deliberately hard to miss: a legally mandatory field was left unconfigured. */
+.legal-warning {
+    background: var(--bg-surface);
+    border-left: 3px solid var(--danger);
+    padding: 1rem 1.25rem;
+    border-radius: 4px;
+    margin-bottom: 2rem;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+.legal-warning ul {
+    margin: 0.75rem 0 0;
+    color: var(--text-secondary);
+}
+
+.legal-updated {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 0.85rem;
+    color: var(--text-tertiary);
+}
+
+.legal-nav {
+    font-size: 0.85rem;
+    color: var(--text-tertiary);
+}
+
+/* ── Form helpers ────────────────────────────────────────────────── */
+.form-hint {
+    margin-top: 0.4rem;
+    font-size: 0.8rem;
+    color: var(--text-tertiary);
+}
+
+.form-consent {
+    margin-bottom: 1.25rem;
+    font-size: 0.8rem;
+    line-height: 1.6;
     color: var(--text-tertiary);
 }
 

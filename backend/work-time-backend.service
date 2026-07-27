@@ -8,6 +8,13 @@ User=www-data
 Group=www-data
 WorkingDirectory=/opt/work-time-app
 Environment="PATH=/opt/work-time-app/venv_server/bin"
+# RECOMMENDED: instead of the two Environment= secret lines below, put the
+# secrets in a root-owned 0600 file and reference it here, so they aren't
+# world-readable via `systemctl cat` / `systemctl show`:
+#   EnvironmentFile=/etc/work-time-backend.env
+# (that file holds WORK_TIME_JWT_SECRET=... and WORK_TIME_ENCRYPTION_KEY=...).
+# The placeholders below are intentionally invalid — the backend refuses to
+# start until you replace them (or move them to the EnvironmentFile above).
 Environment="WORK_TIME_JWT_SECRET=CHANGE-ME-use-python3-c-import-secrets;print(secrets.token_hex(32))"
 Environment="WORK_TIME_ENCRYPTION_KEY=CHANGE-ME-use-python3-c-from-cryptography.fernet-import-Fernet;print(Fernet.generate_key().decode())"
 Environment="WORK_TIME_DB_FILE=/opt/work-time-app/data/work_time_server.db"
@@ -16,6 +23,29 @@ ExecStart=/opt/work-time-app/venv_server/bin/uvicorn backend.app_server.main:app
 
 Restart=always
 RestartSec=5
+
+# ── Sandboxing (defence in depth for a network-facing service) ───────
+# Data dir is the only writable path; everything else is read-only/hidden.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/work-time-app/data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_NETLINK is required for glibc DNS resolution (outbound email to Resend);
+# without it the sandboxed service can't resolve hostnames.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# New files (the SQLite DB, -wal, -shm) are created 0600, not world-readable.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

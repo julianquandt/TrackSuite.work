@@ -29,13 +29,15 @@ def test_create_user():
 
 
 def test_user_email_uniqueness():
+    # Email itself is encrypted (non-deterministic) so uniqueness is enforced on
+    # the keyed email_hash, not the email column.
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
 
-    session.add(User(email="a@b.com", password_hash="h", totp_secret="AAAA", created_at="t"))
+    session.add(User(email="a@b.com", email_hash="hash-a", password_hash="h", totp_secret="AAAA", created_at="t"))
     session.commit()
-    session.add(User(email="a@b.com", password_hash="h2", totp_secret="BBBB", created_at="t"))
+    session.add(User(email="a@b.com", email_hash="hash-a", password_hash="h2", totp_secret="BBBB", created_at="t"))
     with pytest.raises(Exception):
         session.commit()
 

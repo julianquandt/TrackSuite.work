@@ -26,6 +26,8 @@ confirm_uninstall() {
     fi
 
     echo "This will stop and disable ${SERVICE_NAME}, remove ${SYSTEMD_UNIT_PATH}, and delete ${DEPLOY_DIR}."
+    echo "WARNING: this DELETES THE USER DATABASE at ${DEPLOY_DIR}/data/ (all accounts, shifts, projects)."
+    echo "         Back it up first if you might need it — see backend/DEPLOYMENT.md §9 (encrypted backups)."
     echo "Apache configuration will not be changed."
     read -r -p "Continue? [y/N] " reply
     case "$reply" in

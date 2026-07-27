@@ -14,7 +14,9 @@ export function navigate(hash: string): void {
 
 export function startRouter(): void {
     const handle = () => {
-        const hash = window.location.hash || "#/";
+        const raw = window.location.hash || "#/";
+        // Match on the path only, ignoring any ?query (e.g. #/verify-email?token=…).
+        const hash = raw.split("?")[0];
         const handler = routes[hash];
         if (handler) {
             handler();

@@ -43,8 +43,15 @@ export interface AuthTokensResponse {
     session: SessionInfo;
 }
 
-export interface EnrollmentCompleteResponse extends AuthTokensResponse {
+export interface EnrollmentCompleteResponse {
     recovery_codes: string[];
+    // When email verification is pending, no tokens are issued yet.
+    verification_pending: boolean;
+    access_token?: string | null;
+    refresh_token?: string | null;
+    token_type?: string;
+    expires_in?: number | null;
+    session?: SessionInfo | null;
 }
 
 export interface RecoveryCodesResponse {
@@ -242,8 +249,11 @@ async function request<T>(
 }
 
 
-export function register(email: string, password: string) {
-    return request<RegisterResponse>("POST", "/auth/register", { email, password }, { auth: false, allowRefresh: false });
+export function register(email: string, password: string, inviteCode?: string) {
+    // invite_code is only consulted by instances running restricted signup.
+    const body: Record<string, string> = { email, password };
+    if (inviteCode) body.invite_code = inviteCode;
+    return request<RegisterResponse>("POST", "/auth/register", body, { auth: false, allowRefresh: false });
 }
 
 
@@ -254,6 +264,33 @@ export function confirmEnrollment(email: string, password: string, otp: string, 
         { email, password, otp, device_name: deviceName },
         { auth: false, allowRefresh: false },
     );
+}
+
+
+export interface VerifyEmailResult {
+    email: string;
+    enrolled: boolean;
+}
+
+export function verifyEmail(token: string) {
+    return request<VerifyEmailResult>("POST", "/auth/verify-email", { token }, { auth: false, allowRefresh: false });
+}
+
+
+export function resendVerification(email: string) {
+    return request<{ detail: string }>("POST", "/auth/resend-verification", { email }, { auth: false, allowRefresh: false });
+}
+
+
+export function requestPasswordReset(email: string) {
+    return request<{ detail: string }>("POST", "/auth/password-reset/request", { email }, { auth: false, allowRefresh: false });
+}
+
+
+export function confirmPasswordReset(token: string, newPassword: string, opts: { otp?: string; recoveryCode?: string }) {
+    return request<null>("POST", "/auth/password-reset/confirm", {
+        token, new_password: newPassword, otp: opts.otp, recovery_code: opts.recoveryCode,
+    }, { auth: false, allowRefresh: false });
 }
 
 
@@ -298,6 +335,24 @@ export function listSessions() {
 
 export function revokeSession(sessionId: string) {
     return request<null>("DELETE", `/auth/sessions/${sessionId}`);
+}
+
+
+export interface TosStatus {
+    current_version: string;
+    accepted_version: string | null;
+    accepted_at: string | null;
+    acceptance_required: boolean;
+}
+
+
+export function getTosStatus() {
+    return request<TosStatus>("GET", "/auth/tos");
+}
+
+
+export function acceptTos(version: string) {
+    return request<TosStatus>("POST", "/auth/tos/accept", { version });
 }
 
 
@@ -489,4 +544,26 @@ export function getRemoteSchedule() {
 
 export function saveRemoteSchedule(schedule: Record<string, number>) {
     return request<WorkScheduleResponse>("PUT", "/work-schedule/", { schedule });
+}
+
+// ── Account & data-subject rights ─────────────────────────────────────
+
+/** Full machine-readable export of everything the server holds (Art. 15/20). */
+export function exportAccountData() {
+    return request<Record<string, unknown>>("GET", "/account/export");
+}
+
+/** Change the account password (requires current password + OTP). Revokes
+ *  every other session server-side. */
+export function changePassword(currentPassword: string, newPassword: string, otp: string) {
+    return request<null>("POST", "/auth/password", {
+        current_password: currentPassword,
+        new_password: newPassword,
+        otp,
+    });
+}
+
+/** Irreversibly delete the account and all its data (requires password + OTP). */
+export function deleteAccount(password: string, otp: string) {
+    return request<null>("POST", "/account/delete", { password, otp });
 }

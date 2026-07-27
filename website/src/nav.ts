@@ -1,18 +1,37 @@
 import { getToken, logout } from "./api";
+import { APP_ONLY, instanceConfig } from "./config";
 import { isFullMode } from "./mode";
+
+/** "TrackSuite.work" keeps its two-tone logo; a custom instance name renders plainly. */
+function logoMarkup(name: string): string {
+    if (name === "TrackSuite.work") return `TrackSuite<span>.work</span>`;
+    const el = document.createElement("span");
+    el.textContent = name;
+    return el.innerHTML;
+}
 
 export function renderNav(app: HTMLElement): void {
     const token = getToken();
+    const config = instanceConfig();
     const reportsLink = isFullMode() ? `<a href="#/reports">Reports</a>` : "";
-    const downloadBtn = `<a href="#/" id="nav-download" class="btn btn-outline btn-small">Download</a>`;
+    // Desktop downloads and the self-hosting guide document the public project;
+    // an app-only instance ships neither.
+    const downloadBtn = APP_ONLY
+        ? ""
+        : `<a href="#/" id="nav-download" class="btn btn-outline btn-small">Download</a>`;
+    const docsLink = APP_ONLY ? "" : `<a href="#/docs">Docs</a>`;
+    // Don't advertise signup the server would refuse (closed instance, or full).
+    const signUpLink = config.signup_open
+        ? `<a href="#/register" class="btn btn-primary btn-small">Sign Up</a>`
+        : "";
     const navRight = token
-        ? `<a href="#/tracker">Tracker</a>${reportsLink}<a href="#/docs">Docs</a><a href="#/dashboard">Dashboard</a>${downloadBtn}<a href="#/" id="nav-logout">Logout</a>`
-        : `<a href="#/docs">Docs</a>${downloadBtn}<a href="#/login">Login</a><a href="#/register" class="btn btn-primary btn-small">Sign Up</a>`;
+        ? `<a href="#/tracker">Tracker</a>${reportsLink}${docsLink}<a href="#/dashboard">Dashboard</a>${downloadBtn}<a href="#/" id="nav-logout">Logout</a>`
+        : `${docsLink}${downloadBtn}<a href="#/login">Login</a>${signUpLink}`;
 
     const nav = document.createElement("nav");
     nav.className = "site-nav";
     nav.innerHTML = `
-        <a href="#/" class="logo">TrackSuite<span>.work</span></a>
+        <a href="${APP_ONLY ? (token ? "#/tracker" : "#/login") : "#/"}" class="logo">${logoMarkup(config.instance_name)}</a>
         <div class="nav-links">
             ${navRight}
             <button id="theme-toggle" class="btn btn-outline btn-small" style="padding: 0.4rem; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--border-subtle);">

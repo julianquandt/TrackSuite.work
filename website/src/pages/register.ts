@@ -1,80 +1,77 @@
-import QRCode from "qrcode";
-
-import {
-    confirmEnrollment,
-    register,
-    setSessionFromAuthResponse,
-    type RegisterResponse,
-} from "../api";
-import { navigate } from "../router";
+import { register } from "../api";
+import { instanceConfig } from "../config";
+import { LEGAL_ENABLED } from "../legal-config";
+import { mount2faSetup } from "./enroll";
 
 export function renderRegister(app: HTMLElement): void {
+    const config = instanceConfig();
+
+    // A closed instance (typically a single-user self-hosted deployment) has no
+    // signup flow at all — the account is created from the server's terminal.
+    if (!config.signup_open) {
+        app.innerHTML = `
+            <div class="auth-page">
+                <div class="auth-header">
+                    <h2>Registration is closed.</h2>
+                    <p>This instance doesn't accept new sign-ups. Ask the administrator to create an account for you.</p>
+                </div>
+                <div class="auth-form-wrapper">
+                    <div class="form-footer">Already have an account? <a href="#/login">Sign in</a></div>
+                </div>
+            </div>`;
+        return;
+    }
+
+    const domainHint = config.allowed_email_domains.length
+        ? `<p class="form-hint">This instance accepts addresses at
+           ${config.allowed_email_domains.map((d) => `<strong>@${escapeHtml(d)}</strong>`).join(", ")}.</p>`
+        : "";
+
+    const inviteField = config.invite_required
+        ? `<div class="form-group">
+               <label for="reg-invite">Invite Code</label>
+               <input type="text" id="reg-invite" required placeholder="Provided by your administrator" autocomplete="off" />
+           </div>`
+        : "";
+
+    const consent = LEGAL_ENABLED
+        ? `<p class="form-consent">
+               By creating an account you agree to our
+               <a href="#/legal/terms">Terms of Service</a> and confirm you have read the
+               <a href="#/legal/privacy">Privacy Policy</a>.
+           </p>`
+        : "";
+
+    const nextStep = config.email_enabled
+        ? "Next you'll set up two-factor authentication, then verify your email to activate the account."
+        : "Next you'll set up two-factor authentication.";
+
     app.innerHTML = `
         <div class="auth-page auth-page-wide">
             <div class="auth-header">
                 <h2>Create Account.</h2>
-                <p>Create your account, scan the authenticator QR code, then verify the first code before the account becomes active.</p>
+                <p id="reg-subtitle">Enter your email and a password. ${nextStep}</p>
             </div>
             <div class="auth-form-wrapper">
                 <div class="form-error" id="reg-error"></div>
-                <div class="form-success" id="reg-success"></div>
                 <form id="register-form">
                     <div class="form-group">
                         <label for="reg-email">Email Address</label>
                         <input type="email" id="reg-email" required placeholder="name@domain.com" autocomplete="email" />
+                        ${domainHint}
                     </div>
                     <div class="form-group">
                         <label for="reg-password">Password</label>
                         <input type="password" id="reg-password" required minlength="8" placeholder="At least 8 characters" autocomplete="new-password" />
                     </div>
-                    <button type="submit" class="btn btn-primary">Provision Account</button>
+                    ${inviteField}
+                    ${consent}
+                    <button type="submit" class="btn btn-primary">Create Account</button>
                 </form>
 
-                <div class="key-reveal" id="reg-totp-setup">
-                    <div class="warning-text">
-                        Scan this QR code with your authenticator app now. The account cannot be used until you verify the first 6-digit code.
-                    </div>
-                    <div class="totp-setup-grid">
-                        <div class="totp-qr-panel">
-                            <img id="reg-totp-qr" class="totp-qr-image" alt="Authenticator QR code for TrackSuite.work" />
-                            <p class="totp-qr-caption" id="reg-totp-qr-caption">
-                                Scan with Google Authenticator, 1Password, Aegis, Authy, or another TOTP app.
-                            </p>
-                        </div>
-                        <div class="totp-secret-panel">
-                            <div class="form-group">
-                                <label>Manual TOTP Secret</label>
-                                <div class="secret-container">
-                                    <code id="reg-totp-secret" class="mono"></code>
-                                    <button class="btn btn-outline" id="reg-copy-secret" type="button">Copy Secret</button>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label for="reg-confirm-otp">Verify First Authenticator Code</label>
-                                <input type="text" id="reg-confirm-otp" placeholder="123456" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" />
-                            </div>
-                            <p class="totp-setup-copy">
-                                If your authenticator app cannot scan a QR code, create a new time-based one-time password entry manually using your email address and the copied secret.
-                            </p>
-                            <div class="btn-row auth-action-row">
-                                <button class="btn btn-primary" id="reg-confirm-setup" type="button">Verify and Finish Setup</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <div id="reg-2fa"></div>
 
-                <div class="key-reveal" id="reg-recovery-setup">
-                    <div class="warning-text">
-                        Save these recovery codes offline. Each code can be used once if you lose access to your authenticator app.
-                    </div>
-                    <div class="recovery-code-grid" id="reg-recovery-codes"></div>
-                    <div class="btn-row auth-action-row">
-                        <button class="btn btn-outline" id="reg-copy-recovery" type="button">Copy Recovery Codes</button>
-                        <button class="btn btn-primary" id="reg-go-dashboard" type="button">Continue to Dashboard</button>
-                    </div>
-                </div>
-
-                <div class="form-footer">
+                <div class="form-footer" id="reg-footer">
                     Already registered? <a href="#/login">Sign in</a>
                 </div>
             </div>
@@ -83,143 +80,16 @@ export function renderRegister(app: HTMLElement): void {
 
     const form = document.getElementById("register-form") as HTMLFormElement;
     const errorEl = document.getElementById("reg-error")!;
-    const successEl = document.getElementById("reg-success")!;
-    const setupEl = document.getElementById("reg-totp-setup")!;
-    const recoveryEl = document.getElementById("reg-recovery-setup")!;
-    const qrEl = document.getElementById("reg-totp-qr") as HTMLImageElement;
-    const qrCaptionEl = document.getElementById("reg-totp-qr-caption")!;
-    const secretEl = document.getElementById("reg-totp-secret")!;
-    const confirmOtpEl = document.getElementById("reg-confirm-otp") as HTMLInputElement;
-    const copySecretBtn = document.getElementById("reg-copy-secret") as HTMLButtonElement;
-    const confirmSetupBtn = document.getElementById("reg-confirm-setup") as HTMLButtonElement;
-    const recoveryCodesEl = document.getElementById("reg-recovery-codes")!;
-    const copyRecoveryBtn = document.getElementById("reg-copy-recovery") as HTMLButtonElement;
-    const goDashboardBtn = document.getElementById("reg-go-dashboard") as HTMLButtonElement;
-
-    let pendingCredentials: { email: string; password: string } | null = null;
-    let latestRecoveryCodes: string[] = [];
-
-    copySecretBtn.addEventListener("click", async () => {
-        const secret = secretEl.textContent ?? "";
-        if (!secret) return;
-        await navigator.clipboard.writeText(secret);
-        copySecretBtn.textContent = "Copied!";
-        setTimeout(() => {
-            copySecretBtn.textContent = "Copy Secret";
-        }, 2000);
-    });
-
-    copyRecoveryBtn.addEventListener("click", async () => {
-        if (latestRecoveryCodes.length === 0) return;
-        await navigator.clipboard.writeText(latestRecoveryCodes.join("\n"));
-        copyRecoveryBtn.textContent = "Copied!";
-        setTimeout(() => {
-            copyRecoveryBtn.textContent = "Copy Recovery Codes";
-        }, 2000);
-    });
-
-    goDashboardBtn.addEventListener("click", () => {
-        navigate("#/dashboard");
-    });
-
-    function resetMessages() {
-        errorEl.classList.remove("visible");
-        successEl.classList.remove("visible");
-    }
-
-    function renderRecoveryCodes(codes: string[]) {
-        latestRecoveryCodes = codes;
-        recoveryCodesEl.innerHTML = codes
-            .map((code) => `<code class="recovery-code-item mono">${escapeHtml(code)}</code>`)
-            .join("");
-        recoveryEl.classList.add("visible");
-        setupEl.classList.remove("visible");
-        successEl.textContent = "Authenticator verified. Save your recovery codes before you continue.";
-        successEl.classList.add("visible");
-    }
-
-    async function showTotpSetup(data: RegisterResponse, email: string, password: string) {
-        pendingCredentials = { email, password };
-        secretEl.textContent = data.totp_secret;
-        confirmOtpEl.value = "";
-        recoveryEl.classList.remove("visible");
-        try {
-            qrEl.src = await QRCode.toDataURL(data.totp_uri, {
-                width: 220,
-                margin: 1,
-                errorCorrectionLevel: "M",
-                color: {
-                    dark: "#111111",
-                    light: "#ffffff",
-                },
-            });
-            qrEl.style.display = "block";
-            qrCaptionEl.textContent = "Scan with Google Authenticator, 1Password, Aegis, Authy, or another TOTP app.";
-        } catch {
-            qrEl.removeAttribute("src");
-            qrEl.style.display = "none";
-            qrCaptionEl.textContent = "QR generation failed in this browser. Use the manual TOTP secret instead.";
-        }
-
-        setupEl.classList.add("visible");
-        successEl.textContent = "Account provisioned. Scan the QR code, then enter the first authenticator code to activate the account.";
-        successEl.classList.add("visible");
-    }
-
-    confirmSetupBtn.addEventListener("click", async () => {
-        resetMessages();
-        const otp = confirmOtpEl.value.trim();
-        if (!pendingCredentials) {
-            errorEl.textContent = "Start by creating the account first.";
-            errorEl.classList.add("visible");
-            return;
-        }
-        if (!/^\d{6}$/.test(otp)) {
-            errorEl.textContent = "Enter the 6-digit code from your authenticator app.";
-            errorEl.classList.add("visible");
-            return;
-        }
-
-        confirmSetupBtn.disabled = true;
-        confirmSetupBtn.textContent = "Verifying…";
-        try {
-            const res = await confirmEnrollment(
-                pendingCredentials.email,
-                pendingCredentials.password,
-                otp,
-                "TrackSuite.work Web",
-            );
-            if (res.ok) {
-                setSessionFromAuthResponse(res.data);
-                renderRecoveryCodes(res.data.recovery_codes);
-            } else {
-                const detail = (res.data as { detail?: string })?.detail ?? "Authenticator verification failed.";
-                errorEl.textContent = detail;
-                errorEl.classList.add("visible");
-            }
-        } catch {
-            errorEl.textContent = "Network error. Please verify your connection.";
-            errorEl.classList.add("visible");
-        } finally {
-            confirmSetupBtn.disabled = false;
-            confirmSetupBtn.textContent = "Verify and Finish Setup";
-        }
-    });
+    const subtitle = document.getElementById("reg-subtitle")!;
+    const twofaSlot = document.getElementById("reg-2fa") as HTMLElement;
 
     form.addEventListener("submit", async (e) => {
         e.preventDefault();
-        resetMessages();
-        setupEl.classList.remove("visible");
-        recoveryEl.classList.remove("visible");
-        qrEl.removeAttribute("src");
-        qrEl.style.display = "none";
-        qrCaptionEl.textContent = "Scan with Google Authenticator, 1Password, Aegis, Authy, or another TOTP app.";
-        latestRecoveryCodes = [];
-        pendingCredentials = null;
+        errorEl.classList.remove("visible");
 
         const email = (document.getElementById("reg-email") as HTMLInputElement).value.trim();
         const password = (document.getElementById("reg-password") as HTMLInputElement).value;
-
+        const inviteCode = (document.getElementById("reg-invite") as HTMLInputElement | null)?.value.trim();
         if (password.length < 8) {
             errorEl.textContent = "Password must be at least 8 characters.";
             errorEl.classList.add("visible");
@@ -228,15 +98,26 @@ export function renderRegister(app: HTMLElement): void {
 
         const btn = form.querySelector("button")!;
         btn.disabled = true;
-        btn.textContent = "Provisioning…";
-
+        btn.textContent = "Creating account…";
         try {
-            const res = await register(email, password);
+            const res = await register(email, password, inviteCode);
             if (res.ok) {
-                await showTotpSetup(res.data, email, password);
+                // Step 2: set up 2FA right here (email verification comes after).
+                form.style.display = "none";
+                subtitle.textContent = "Set up two-factor authentication to continue.";
+                await mount2faSetup(twofaSlot, {
+                    email, password,
+                    secret: res.data.totp_secret,
+                    uri: res.data.totp_uri,
+                });
             } else {
-                const detail = (res.data as { detail?: string })?.detail ?? "Provisioning failed.";
-                errorEl.textContent = detail;
+                const detail = (res.data as { detail?: string })?.detail ?? "Could not create account.";
+                errorEl.innerHTML = escapeHtml(detail);
+                // If they already have an account, nudge to sign in / reset.
+                if (res.status === 409) {
+                    errorEl.innerHTML = escapeHtml(detail)
+                        + ' <a href="#/login">Sign in</a> or <a href="#/reset-password">reset your password</a>.';
+                }
                 errorEl.classList.add("visible");
             }
         } catch {
@@ -244,11 +125,10 @@ export function renderRegister(app: HTMLElement): void {
             errorEl.classList.add("visible");
         } finally {
             btn.disabled = false;
-            btn.textContent = "Provision Account";
+            btn.textContent = "Create Account";
         }
     });
 }
-
 
 function escapeHtml(value: string): string {
     const el = document.createElement("span");

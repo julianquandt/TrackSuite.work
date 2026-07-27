@@ -18,5 +18,25 @@ ExecStart=/opt/work-time-app/venv_server/bin/uvicorn backend.app_server.main:app
 Restart=always
 RestartSec=5
 
+# Sandboxing — keep in sync with backend/work-time-backend.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/work-time-app/data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# AF_NETLINK is required for glibc DNS resolution (outbound email).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
 [Install]
 WantedBy=multi-user.target

@@ -3,7 +3,9 @@ set -euo pipefail
 
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/work-time-app}"
 BRANCH="${1:-main}"
-DEFAULT_REPO_URL="https://github.com/YOUR_USERNAME/work-time-app.git"
+# Upstream. Only used for a first deploy that isn't already a checkout and
+# didn't set WORK_TIME_REPO_URL — deploying a fork means setting that variable.
+DEFAULT_REPO_URL="https://github.com/julianquandt/TrackSuite.work.git"
 APP_USER="${APP_USER:-www-data}"
 APP_GROUP="${APP_GROUP:-www-data}"
 SKIP_PYTHON_SETUP="${SKIP_PYTHON_SETUP:-0}"
@@ -81,8 +83,8 @@ REPO_URL="$(resolve_repo_url)"
 echo "Starting deployment (branch: $BRANCH)..."
 
 if [ "$REPO_URL" = "$DEFAULT_REPO_URL" ] && ! is_git_repo; then
-    echo "Error: set WORK_TIME_REPO_URL to your repository clone URL before the first deploy." >&2
-    exit 1
+    echo "Cloning upstream: $REPO_URL"
+    echo "  (deploying a fork? set WORK_TIME_REPO_URL to its clone URL instead.)"
 fi
 
 if is_git_repo; then
@@ -123,6 +125,16 @@ if [ "$SKIP_WEBSITE_BUILD" = "1" ]; then
 elif command -v node >/dev/null 2>&1 && [ -f "$DEPLOY_DIR/website/package.json" ]; then
     echo "Building website..."
     cd "$DEPLOY_DIR/website"
+
+    # Per-deployment build config (the operator details behind the imprint and
+    # privacy policy) lives in website/.env.local — untracked, so it survives the
+    # checkout above, and Vite reads it itself. Every build is the app alone;
+    # see vite.config.ts.
+    if [ ! -f .env.local ]; then
+        echo "  No website/.env.local — building without legal pages."
+        echo "  See website/.env.example to publish your own imprint."
+    fi
+
     npm ci 2>/dev/null || npm install
     npm run build
     cd "$DEPLOY_DIR"

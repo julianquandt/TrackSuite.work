@@ -1,4 +1,4 @@
-const PUBLIC_REPO = "julianquandt/TrackSuite.work";
+import { REPO_ISSUES_URL, REPO_RELEASES_URL, REPO_URL } from "../config";
 
 type GhAsset = { name: string; browser_download_url: string };
 type OS = "windows" | "macos" | "linux";
@@ -48,17 +48,20 @@ function assetLabel(name: string): string {
     return name;
 }
 
-// Populate the download grid from the latest GitHub release. Assets are versioned
-// (names change each release), so we resolve real download URLs at runtime rather
-// than hardcode them. Falls back to a single "latest release" button on any error
-// (rate limit, offline, or no published release yet).
+// Populate the download grid from the latest release, via our own backend.
+// Assets are versioned (names change each release), so real download URLs are
+// resolved at runtime rather than hardcoded. Falls back to a single "latest
+// release" button on any error (backend down, offline, or nothing published).
 async function populateDownloads(): Promise<void> {
     const grid = document.getElementById("download-grid");
     const versionEl = document.getElementById("download-version");
     if (!grid) return;
     try {
-        const res = await fetch(`https://api.github.com/repos/${PUBLIC_REPO}/releases/latest`, {
-            headers: { Accept: "application/vnd.github+json" },
+        // Same-origin on purpose: the backend asks GitHub and caches the answer,
+        // so a visitor's IP never reaches GitHub just for loading this page —
+        // and the CSP needs no `connect-src` exception. See backend/releases.py.
+        const res = await fetch("/api/meta/releases/latest", {
+            headers: { Accept: "application/json" },
         });
         if (!res.ok) throw new Error(String(res.status));
         const data = await res.json();
@@ -88,7 +91,7 @@ async function populateDownloads(): Promise<void> {
 
         if (versionEl && data.tag_name) versionEl.textContent = `Latest release: ${data.tag_name}`;
     } catch {
-        grid.innerHTML = `<a class="btn btn-primary" href="https://github.com/${PUBLIC_REPO}/releases/latest" target="_blank" rel="noopener">Download latest release</a>
+        grid.innerHTML = `<a class="btn btn-primary" href="${REPO_RELEASES_URL}/latest" target="_blank" rel="noopener">Download latest release</a>
             <p class="download-empty">Couldn't load individual files just now — the latest release has installers for every platform.</p>`;
     }
 }
@@ -168,7 +171,7 @@ export function renderLanding(app: HTMLElement): void {
     app.innerHTML = `
         <section class="hero">
             <span class="hero-eyebrow">Time tracking · menu bar &amp; browser</span>
-            <h1>Your workday, on <span>one clear timeline.</span></h1>
+            <h1>Your workday, <span>on one clear timeline.</span></h1>
             <p>
                 Clock in from your menu bar or your browser. TrackSuite.work tracks
                 your hours offline, lets you assign them to projects on a visual
@@ -361,7 +364,7 @@ export function renderLanding(app: HTMLElement): void {
                 <p class="download-loading" id="download-loading">Fetching the latest release…</p>
             </div>
             <div class="download-links">
-                <a href="https://github.com/${PUBLIC_REPO}/releases" class="btn btn-outline" target="_blank" rel="noopener">See all versions</a>
+                <a href="${REPO_RELEASES_URL}" class="btn btn-outline" target="_blank" rel="noopener">See all versions</a>
             </div>
             <p class="download-note" id="download-version"></p>
 
@@ -401,6 +404,21 @@ export function renderLanding(app: HTMLElement): void {
             </div>
         </section>
 
+        <section class="section contribute">
+            <div class="section-header">
+                <h2 style="font-size: 1.5rem; margin-bottom: 0.5rem;">Built in the open</h2>
+                <p>Every line of this — desktop app, backend, this website — is on GitHub under the MIT licence. Read it, run it, change it.</p>
+            </div>
+            <div class="contribute-actions">
+                <a href="${REPO_ISSUES_URL}" class="btn btn-primary" target="_blank" rel="noopener">Report a bug or request a feature</a>
+                <a href="${REPO_URL}" class="btn btn-outline" target="_blank" rel="noopener">Browse the source</a>
+            </div>
+            <p class="contribute-note">
+                Bugs, rough edges and "it should really do X" all belong in the issue tracker — it's
+                the one place they won't get lost.
+            </p>
+        </section>
+
         <dialog id="deb-apt-dialog" class="deb-dialog">
             <h3>Get automatic updates with apt</h3>
             <p>The <code>.deb</code> installs fine, but it won't update itself — you'd download a fresh one each release. On Debian/Ubuntu we recommend adding our apt repository instead, so updates arrive with a normal <code>apt upgrade</code>.</p>
@@ -411,9 +429,6 @@ export function renderLanding(app: HTMLElement): void {
             </div>
         </dialog>
 
-        <footer class="site-footer">
-            <p>&copy; ${new Date().getFullYear()} TrackSuite.work OSS. Under MIT License.</p>
-        </footer>
     `;
 
     // Smooth-scroll any in-page "Download for Desktop" links to the section.

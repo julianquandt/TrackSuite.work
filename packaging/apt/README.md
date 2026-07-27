@@ -22,7 +22,7 @@ Do this once, then every tagged release updates the repo automatically.
 gpg --full-generate-key
 #   Kind: RSA and RSA   ·   Size: 4096   ·   Expiry: your call (0 = none)
 #   Name: TrackSuite.work Repository Signing Key
-#   Email: apt@tracksuite-work.julianquandt.com   ·   set a passphrase
+#   Email: apt@tracksuite.work   ·   set a passphrase
 ```
 
 Find the fingerprint and export the (private) key:

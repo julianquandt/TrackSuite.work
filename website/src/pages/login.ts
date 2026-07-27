@@ -1,9 +1,24 @@
-import { login, loginWithRecoveryCode, setSessionFromAuthResponse } from "../api";
+import { login, loginWithRecoveryCode, resendVerification, setSessionFromAuthResponse } from "../api";
+import { instanceConfig } from "../config";
 import { navigate } from "../router";
+import { checkTermsAcceptance } from "../tos";
 
 type LoginMode = "otp" | "recovery";
 
 export function renderLogin(app: HTMLElement): void {
+    const config = instanceConfig();
+    // Only offer what this instance can actually deliver: no signup link on a
+    // closed instance, and no password-reset link where no mailer is configured
+    // to send the link (the administrator resets it from the terminal instead).
+    const signUpLink = config.signup_open
+        ? `No account? <a href="#/register">Create one</a>`
+        : "";
+    const resetLink = config.email_enabled
+        ? `<a href="#/reset-password">Forgot password?</a>`
+        : "";
+    const footerLinks = [signUpLink, resetLink].filter(Boolean).join("&nbsp;·&nbsp;")
+        || "Contact your administrator if you can't sign in.";
+
     app.innerHTML = `
         <div class="auth-page auth-page-wide">
             <div class="auth-header">
@@ -35,9 +50,7 @@ export function renderLogin(app: HTMLElement): void {
                     </div>
                     <button type="submit" class="btn btn-primary">Initialize Session</button>
                 </form>
-                <div class="form-footer">
-                    No account? <a href="#/register">Create one</a>
-                </div>
+                <div class="form-footer">${footerLinks}</div>
             </div>
         </div>
     `;
@@ -86,6 +99,18 @@ export function renderLogin(app: HTMLElement): void {
             if (res.ok) {
                 setSessionFromAuthResponse(res.data);
                 navigate("#/dashboard");
+                // Startup ran this before there was a session to check.
+                void checkTermsAcceptance();
+            } else if (res.status === 403 && /verify your email/i.test((res.data as { detail?: string })?.detail ?? "")) {
+                errorEl.innerHTML = 'Verify your email address first — check your inbox. '
+                    + '<a href="#" id="login-resend">Resend the link</a>.';
+                errorEl.classList.add("visible");
+                document.getElementById("login-resend")?.addEventListener("click", async (ev) => {
+                    ev.preventDefault();
+                    await resendVerification(email);
+                    errorEl.textContent = "Verification email sent — check your inbox, then sign in.";
+                    errorEl.classList.add("visible");
+                });
             } else {
                 const detail = (res.data as { detail?: string })?.detail ?? "Authentication failed.";
                 errorEl.textContent = detail;
