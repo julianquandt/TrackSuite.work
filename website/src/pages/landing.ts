@@ -108,10 +108,24 @@ function observeReveals(): void {
     }
     const io = new IntersectionObserver((entries) => {
         for (const e of entries) {
-            if (e.isIntersecting) { e.target.classList.add("in-view"); io.unobserve(e.target); }
+            if (e.isIntersecting) { 
+                e.target.classList.add("in-view"); 
+                io.unobserve(e.target); 
+            }
         }
-    }, { threshold: 0.25 });
+    }, { threshold: 0.05, rootMargin: "60px 0px" });
     reveals.forEach((el) => io.observe(el));
+
+    // Safety fallback: reveal any element already in view or on fast jump
+    setTimeout(() => {
+        reveals.forEach((el) => {
+            const rect = el.getBoundingClientRect();
+            if (rect.top < window.innerHeight + 80) {
+                el.classList.add("in-view");
+                io.unobserve(el);
+            }
+        });
+    }, 120);
 }
 
 // The hero timeline's running block counts up from page load — a live, honest
@@ -152,19 +166,90 @@ function miniTimeline(opts: { live?: boolean; note?: string } = {}): string {
     </div>`;
 }
 
-// The apt setup as three separate, copy-paste steps. Reused on the download
-// section and in the .deb confirmation dialog.
+// The apt setup as three separate, copy-paste steps with 1-click copy buttons.
 function aptStepsHtml(): string {
     const key = "https://julianquandt.github.io/TrackSuite.work/apt/tracksuite-work.asc";
     const url = "https://julianquandt.github.io/TrackSuite.work/apt";
+    const s1 = `curl -fsSL ${key} | sudo gpg --dearmor -o /usr/share/keyrings/tracksuite-work.gpg`;
+    const s2 = `echo "deb [signed-by=/usr/share/keyrings/tracksuite-work.gpg] ${url} stable main" | sudo tee /etc/apt/sources.list.d/tracksuite-work.list`;
+    const s3 = `sudo apt update && sudo apt install track-suite-work`;
+
+    const copyIcon = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+
     return `<ol class="apt-steps">
-        <li><span class="apt-step-label">1 · Add the signing key</span>
-            <pre><code>curl -fsSL ${key} | sudo gpg --dearmor -o /usr/share/keyrings/tracksuite-work.gpg</code></pre></li>
-        <li><span class="apt-step-label">2 · Add the repository</span>
-            <pre><code>echo "deb [signed-by=/usr/share/keyrings/tracksuite-work.gpg] ${url} stable main" | sudo tee /etc/apt/sources.list.d/tracksuite-work.list</code></pre></li>
-        <li><span class="apt-step-label">3 · Install</span>
-            <pre><code>sudo apt update &amp;&amp; sudo apt install track-suite-work</code></pre></li>
+        <li>
+            <div class="apt-step-head">
+                <span class="apt-step-label">1 · Add the signing key</span>
+                <button type="button" class="btn-copy-code" data-code="${s1}" title="Copy command" aria-label="Copy step 1 command">
+                    ${copyIcon}<span>Copy</span>
+                </button>
+            </div>
+            <pre><code>${s1}</code></pre>
+        </li>
+        <li>
+            <div class="apt-step-head">
+                <span class="apt-step-label">2 · Add the repository</span>
+                <button type="button" class="btn-copy-code" data-code="${s2}" title="Copy command" aria-label="Copy step 2 command">
+                    ${copyIcon}<span>Copy</span>
+                </button>
+            </div>
+            <pre><code>${s2}</code></pre>
+        </li>
+        <li>
+            <div class="apt-step-head">
+                <span class="apt-step-label">3 · Install</span>
+                <button type="button" class="btn-copy-code" data-code="${s3}" title="Copy command" aria-label="Copy step 3 command">
+                    ${copyIcon}<span>Copy</span>
+                </button>
+            </div>
+            <pre><code>${s3}</code></pre>
+        </li>
     </ol>`;
+}
+
+function initCopyButtons(root: HTMLElement): void {
+    const checkIcon = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+    const copyIcon = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+
+    const copyText = async (text: string): Promise<boolean> => {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch {
+            // fallback
+        }
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            return ok;
+        } catch {
+            return false;
+        }
+    };
+
+    root.addEventListener("click", async (e) => {
+        const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".btn-copy-code");
+        if (!btn) return;
+        const code = btn.dataset.code;
+        if (!code) return;
+        const ok = await copyText(code);
+        if (ok) {
+            btn.innerHTML = `${checkIcon}<span>Copied!</span>`;
+            btn.classList.add("copied");
+            setTimeout(() => {
+                btn.innerHTML = `${copyIcon}<span>Copy</span>`;
+                btn.classList.remove("copied");
+            }, 2000);
+        }
+    });
 }
 
 export function renderLanding(app: HTMLElement): void {
@@ -456,4 +541,5 @@ export function renderLanding(app: HTMLElement): void {
     void populateDownloads();
     observeReveals();
     startHeroTimer();
+    initCopyButtons(app);
 }

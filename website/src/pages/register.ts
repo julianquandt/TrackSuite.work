@@ -1,4 +1,5 @@
 import { register } from "../api";
+import { escapeHtml } from "../../../shared/text.ts";
 import { instanceConfig } from "../config";
 import { LEGAL_ENABLED } from "../legal-config";
 import { mount2faSetup } from "./enroll";
@@ -128,10 +129,4 @@ export function renderRegister(app: HTMLElement): void {
             btn.textContent = "Create Account";
         }
     });
-}
-
-function escapeHtml(value: string): string {
-    const el = document.createElement("span");
-    el.textContent = value;
-    return el.innerHTML;
 }

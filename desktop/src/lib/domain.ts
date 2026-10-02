@@ -1,10 +1,25 @@
 export type ShiftRecord = {
     id: number;
+    uuid: string;
     startTime: string;
     endTime: string | null;
     projectUuid?: string | null;
     note?: string | null;
+    /** Set when the app closed this shift after a missed clock-out (review it). */
+    autoClosedAt?: string | null;
 };
+
+/** A full copy of a shift, written back by restore_shifts (undo). */
+export type ShiftSnapshot = {
+    uuid: string;
+    startTime: string;
+    endTime: string | null;
+    projectUuid: string | null;
+    note: string | null;
+    autoClosedAt: string | null;
+};
+
+export type ShiftTimeChange = { id: number; startTime: string; endTime: string | null };
 
 /** A shift the app retro-closed to its last active time after a missed clock-out. */
 export type StaleClose = {
@@ -24,6 +39,8 @@ export type ProjectRecord = {
 export type OffDayRecord = {
     id?: number;
     date: string;
+    /** null = a plain off day; else "vacation" | "sick" | "holiday" | "other". */
+    reason?: string | null;
 };
 
 export type SyncConfig = {

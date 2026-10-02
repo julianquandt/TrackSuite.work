@@ -5,6 +5,8 @@ import {
     type OffDayRecord,
     type ProjectRecord,
     type ShiftRecord,
+    type ShiftSnapshot,
+    type ShiftTimeChange,
     type StaleClose,
     type SyncConfig,
     type AppearanceConfig,
@@ -15,19 +17,33 @@ import { DEFAULT_WORK_SCHEDULE, normalizeWorkSchedule } from "./workSchedule";
 export interface ShiftRepository {
     getActiveShift(): Promise<ShiftRecord | null>;
     getAllShifts(): Promise<ShiftRecord[]>;
-    startShift(): Promise<void>;
-    endShift(): Promise<void>;
+    /** False when nothing changed (a shift was already open / none was open). */
+    startShift(): Promise<boolean>;
+    endShift(): Promise<boolean>;
     heartbeat(): Promise<void>;
     reconcileStaleShift(staleMinutes: number): Promise<StaleClose | null>;
     addManualShift(startTime: string, endTime: string, note?: string | null): Promise<void>;
     setShiftNote(shiftId: number, note: string | null): Promise<void>;
     deleteShift(shiftId: number): Promise<void>;
+    /** Suspend clock-out: ends the open shift only if this machine is tracking it. */
+    endLocalShift(): Promise<boolean>;
+    /** New start/end times, validated as a whole (errors: not_found, invalid_range, overlap). */
+    updateShiftTimes(changes: ShiftTimeChange[]): Promise<void>;
+    /** Create closed shifts in the empty parts of a range; returns their uuids. */
+    fillRange(rangeStart: string, rangeEnd: string, projectUuid: string | null, note?: string | null): Promise<string[]>;
+    /** Undo: write the snapshot rows back and delete rows the action created. */
+    restoreShifts(snapshot: ShiftSnapshot[], removeUuids: string[]): Promise<void>;
+    clearAutoClosed(shiftId: number): Promise<void>;
+    /** The shift the background loop auto-closed, once (null when none). */
+    takeAutoClosedShift(): Promise<StaleClose | null>;
 }
 
 export interface OffDayRepository {
     getOffDays(): Promise<OffDayRecord[]>;
     addOffDay(date: string): Promise<void>;
     removeOffDay(date: string): Promise<void>;
+    /** Mark the date off (if it isn't) with a reason, or change the reason. */
+    setOffDayReason(date: string, reason: string | null): Promise<void>;
 }
 
 export interface ProjectRepository {
@@ -41,6 +57,8 @@ export interface ProjectRepository {
         billing?: { rate?: string | null; currency?: string | null },
     ): Promise<void>;
     deleteProject(uuid: string): Promise<void>;
+    /** Undo a delete (its shifts are restored separately with restoreShifts). */
+    restoreProject(uuid: string): Promise<void>;
     getCurrentProject(): Promise<string | null>;
     /** Returns true if switching split an active shift. */
     setCurrentProject(projectUuid: string | null): Promise<boolean>;
@@ -68,7 +86,10 @@ export interface SettingsRepository {
 
 // ── Tauri-backed implementations ────────────────────────────────────
 
-type RustShift = { id: number; start_time: string; end_time: string | null; project_uuid: string | null; note?: string | null };
+type RustShift = {
+    id: number; uuid: string; start_time: string; end_time: string | null;
+    project_uuid: string | null; note?: string | null; auto_closed_at?: string | null;
+};
 type RustProject = { uuid: string; name: string; color: string | null; archived: boolean; rate?: string | null; currency?: string | null };
 
 async function getConfigValue(key: string) {
@@ -80,7 +101,10 @@ async function setConfigValue(key: string, value: string) {
 }
 
 function toShiftRecord(r: RustShift): ShiftRecord {
-    return { id: r.id, startTime: r.start_time, endTime: r.end_time, projectUuid: r.project_uuid, note: r.note ?? null };
+    return {
+        id: r.id, uuid: r.uuid, startTime: r.start_time, endTime: r.end_time,
+        projectUuid: r.project_uuid, note: r.note ?? null, autoClosedAt: r.auto_closed_at ?? null,
+    };
 }
 
 function timeTextToMinutes(value: string): number {
@@ -116,10 +140,10 @@ export const shifts: ShiftRepository = {
         return rows.map(toShiftRecord);
     },
     async startShift() {
-        await invoke("start_shift");
+        return await invoke<boolean>("start_shift");
     },
     async endShift() {
-        await invoke("end_shift");
+        return await invoke<boolean>("end_shift");
     },
     async heartbeat() {
         await invoke("heartbeat_active_shift");
@@ -137,6 +161,25 @@ export const shifts: ShiftRepository = {
     async setShiftNote(shiftId, note) {
         await invoke("set_shift_note", { shiftId, note });
     },
+    async endLocalShift() {
+        return await invoke<boolean>("end_local_shift");
+    },
+    async updateShiftTimes(changes) {
+        await invoke("update_shift_times", { changes });
+    },
+    async fillRange(rangeStart, rangeEnd, projectUuid, note) {
+        return await invoke<string[]>("fill_range", { rangeStart, rangeEnd, projectUuid, note: note ?? null });
+    },
+    async restoreShifts(snapshot, removeUuids) {
+        await invoke("restore_shifts", { snapshot, removeUuids });
+    },
+    async clearAutoClosed(shiftId) {
+        await invoke("clear_auto_closed", { shiftId });
+    },
+    async takeAutoClosedShift() {
+        const row = await invoke<{ start_time: string; end_time: string } | null>("take_auto_closed_shift");
+        return row ? { startTime: row.start_time, endTime: row.end_time } : null;
+    },
     async deleteShift(shiftId) {
         await invoke("delete_shift", { shiftId });
     },
@@ -144,8 +187,10 @@ export const shifts: ShiftRepository = {
 
 export const offDays: OffDayRepository = {
     async getOffDays() {
-        const dates = await invoke<string[]>("get_off_days");
-        return dates.map((d) => ({ date: d }));
+        return await invoke<{ date: string; reason: string | null }[]>("get_off_days");
+    },
+    async setOffDayReason(date, reason) {
+        await invoke("set_off_day_reason", { date, reason });
     },
     async addOffDay(date) {
         await invoke("add_off_day", { date });
@@ -173,6 +218,9 @@ export const projects: ProjectRepository = {
     },
     async deleteProject(uuid) {
         await invoke("delete_project", { uuid });
+    },
+    async restoreProject(uuid) {
+        await invoke("restore_project", { uuid });
     },
     async getCurrentProject() {
         return (await invoke<string | null>("get_current_project")) ?? null;

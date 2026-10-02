@@ -264,3 +264,36 @@ def test_docs_do_not_reference_the_retired_domain():
                      "website/src/pages/docs.ts"):
         content = (ROOT / relative).read_text()
         assert "julianquandt.com" not in content, f"{relative} references the retired domain"
+
+
+def test_backup_script_can_hand_backups_to_a_pull_user():
+    """Root's cron writes backups root-owned and 0600, so pulling them off the
+    box over SSH as an ordinary user fails. WORK_TIME_BACKUP_OWNER exists so the
+    answer isn't passwordless `sudo rsync`, which would hand root read access to
+    the whole filesystem to whoever holds that user's SSH key."""
+    script = (ROOT / "backend/backup.sh").read_text()
+
+    assert "WORK_TIME_BACKUP_OWNER" in script
+    # Both the directory and the files, or the pull still fails on one of them.
+    assert 'chown "$BACKUP_OWNER" "$BACKUP_DIR"' in script
+    assert 'chown "$BACKUP_OWNER" "$out"' in script
+    # A chown that silently fails would leave backups unreachable and unnoticed.
+    assert "could not chown" in script
+    # Still never loosens the permissions themselves.
+    assert 'chmod 700 "$BACKUP_DIR"' in script
+    assert 'chmod 600 "$out"' in script
+
+
+def test_deploy_sparse_checkout_includes_shared():
+    """The web app imports ../shared, so the server's sparse checkout must fetch it."""
+    script = (Path(__file__).resolve().parents[1] / "backend" / "deploy.sh").read_text()
+    assert "sparse-checkout set backend app_server website shared" in script
+    assert "shared/*" in script
+
+
+def test_dev_login_route_only_exists_in_dev_builds():
+    """The sandbox sign-in link (tokens in the URL) must never reach production."""
+    src = (ROOT / "website" / "src" / "main.ts").read_text()
+    route_at = src.index('route("#/dev-login"')
+    guard_at = src.rindex("if (import.meta.env.DEV)", 0, route_at)
+    assert src[guard_at:route_at].count("}") == 0, "dev-login must sit inside the DEV-only block"

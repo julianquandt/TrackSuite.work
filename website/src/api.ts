@@ -410,6 +410,9 @@ export interface OffDayItem {
     user_id: number;
     uuid?: string | null;
     date: string;
+    /** Why the day is off: null = plain off day, else a code such as
+     *  "vacation", "sick", "holiday", "other" (server: ^[a-z_]{1,32}$). */
+    reason?: string | null;
 }
 
 export interface ProjectItem {
@@ -447,11 +450,14 @@ export function updateShift(
     endTime: string | null,
     projectUuid?: string | null,
     note?: string | null,
+    opts: { clearAutoClosed?: boolean } = {},
 ) {
     const body: Record<string, unknown> = { start_time: startTime, end_time: endTime };
     // Only send project_uuid / note when explicitly provided, so plain edits preserve them.
     if (projectUuid !== undefined) body.project_uuid = projectUuid;
     if (note !== undefined) body.note = note;
+    // "Looks right" on an automatically closed shift; a time change clears it anyway.
+    if (opts.clearAutoClosed) body.clear_auto_closed = true;
     return request<ShiftItem>("PUT", `/shifts/${id}`, body);
 }
 
@@ -492,8 +498,20 @@ export function listOffDays() {
     return request<OffDayItem[]>("GET", "/off-days/");
 }
 
-export function createOffDay(date: string) {
-    return request<OffDayItem>("POST", "/off-days/", { date });
+/** Mark `date` as off. Without `reason`, a new or re-added day is a plain off
+ *  day and a day that is already off keeps its reason; a given `reason`
+ *  (null included) is always set. */
+export function createOffDay(date: string, reason?: string | null) {
+    return request<OffDayItem>(
+        "POST",
+        "/off-days/",
+        reason === undefined ? { date } : { date, reason },
+    );
+}
+
+/** Set (or clear with null) the reason of an existing off day. */
+export function updateOffDay(id: number, reason: string | null) {
+    return request<OffDayItem>("PUT", `/off-days/${id}`, { reason });
 }
 
 export function deleteOffDay(id: number) {

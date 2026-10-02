@@ -77,7 +77,7 @@ sudo mkdir -p /opt/work-time-app
 sudo chown "$USER":"$USER" /opt/work-time-app
 git clone --filter=blob:none --sparse https://github.com/julianquandt/TrackSuite.work.git /opt/work-time-app
 cd /opt/work-time-app
-git sparse-checkout set backend app_server website
+git sparse-checkout set backend app_server website shared
 sudo ./backend/deploy.sh main
 ```
 
@@ -540,12 +540,39 @@ Rotating `WORK_TIME_JWT_SECRET` simply invalidates existing access tokens; clien
 
 Use the bundled **`backend/backup.sh`** — it takes a WAL-safe snapshot, encrypts it (age or GPG), and prunes old backups. It refuses to run without a recipient, so it never leaves an unencrypted copy on disk.
 
+Generate the key **on your own machine, not the server** — a private key sitting next to the database it decrypts protects nobody:
+
+```bash
+age-keygen -o ~/tracksuite-backup.key   # prints the age1... recipient; keep the file safe
+```
+
 ```bash
 # One-off (age recommended):
 WORK_TIME_BACKUP_AGE_RECIPIENT=age1yourpublickey... ./backend/backup.sh
 
-# Nightly via cron (crontab -e), keeping 30 days:
-0 3 * * * WORK_TIME_BACKUP_AGE_RECIPIENT=age1... WORK_TIME_BACKUP_KEEP_DAYS=30 /opt/work-time-app/backend/backup.sh >> /var/log/wtt-backup.log 2>&1
+# Nightly via cron (crontab -e as root), keeping 30 days:
+0 3 * * * WORK_TIME_BACKUP_AGE_RECIPIENT=age1... WORK_TIME_BACKUP_KEEP_DAYS=30 WORK_TIME_BACKUP_OWNER=youruser /opt/work-time-app/backend/backup.sh >> /var/log/wtt-backup.log 2>&1
+```
+
+`WORK_TIME_BACKUP_OWNER` is what lets you pull the files off the box. Root's cron writes them `root:root 0600` in a `0700` directory, so `rsync` over SSH as an ordinary user fails with `Permission denied`. Setting it hands the directory and each encrypted file to that user. Prefer it over granting passwordless `sudo rsync`, which would give root read access to the entire filesystem to anyone holding that user's SSH key — what this grants instead is blobs they can't decrypt without the age key. If you have existing root-owned backups, take them over once:
+
+```bash
+sudo chown -R youruser /opt/work-time-app/backups
+```
+
+Then pull them from your machine:
+
+```bash
+rsync -avz --delete server:/opt/work-time-app/backups/ ~/backups/tracksuite/
+```
+
+**Back up `WORK_TIME_ENCRYPTION_KEY` separately too** (see Part 8). Email addresses, TOTP secrets, notes, project names and rates are encrypted at rest, so a restored database without that key is ciphertext — a perfect backup of unreadable data. Keep it wherever you keep the age key, not inside the backups it decrypts.
+
+Verify a restore occasionally, which is also how you confirm you still have both keys:
+
+```bash
+age -d -i ~/tracksuite-backup.key -o /tmp/restored.db ~/backups/tracksuite/work_time_server-<stamp>.db.age
+sqlite3 /tmp/restored.db "select count(*) from users;"
 ```
 
 Store the encrypted backups **off-box** and keep the age/GPG private key somewhere separate from the server (a backup you can't decrypt after the server is lost is useless; a key on the same disk defeats the encryption). Test a restore periodically: decrypt, then point `WORK_TIME_DB_FILE` at the restored copy. **Note:** a deleted account persists in existing backups until they rotate out of the retention window — state this in your privacy policy, and don't selectively restore individual deleted accounts.

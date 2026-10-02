@@ -292,6 +292,13 @@ def ensure_schema() -> None:
         if "note" not in shift_columns:
             conn.execute(text("ALTER TABLE shifts ADD COLUMN note VARCHAR NULL"))
 
+        # Off-day reason (vacation, sick leave, ...): NULL = plain off day.
+        off_day_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(off_days)"))
+        }
+        if "reason" not in off_day_columns:
+            conn.execute(text("ALTER TABLE off_days ADD COLUMN reason VARCHAR NULL"))
+
         # Report metadata (0.9.0): per-project billing rate + currency.
         project_columns = {
             row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))
@@ -1201,6 +1208,12 @@ class ShiftCreate(BaseModel):
     note: Optional[str] = Field(default=None, max_length=MAX_NOTE_LENGTH)
 
 
+class ShiftUpdate(ShiftCreate):
+    # Explicit "Looks right" on an auto-closed shift: drop the review flag even
+    # though the times did not change. Editing the times also drops it.
+    clear_auto_closed: Optional[bool] = None
+
+
 class ShiftResponse(BaseModel):
     id: int
     user_id: int
@@ -1246,9 +1259,30 @@ class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# Off-day reason: None (plain off day) or a short lowercase code such as
+# "vacation", "sick", "holiday", "other". The clients own the labels; the server
+# only checks the shape. The desktop app validates the same way.
+OFF_DAY_REASON_MAX_LENGTH = 32
+OFF_DAY_REASON_PATTERN = r"^[a-z_]+$"
+
+
+def _off_day_reason_field() -> Any:
+    return Field(
+        default=None,
+        min_length=1,
+        max_length=OFF_DAY_REASON_MAX_LENGTH,
+        pattern=OFF_DAY_REASON_PATTERN,
+    )
+
+
 class OffDayCreate(BaseModel):
     date: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
     uuid: Optional[str] = Field(default=None, max_length=MAX_UUID_LENGTH)
+    reason: Optional[str] = _off_day_reason_field()
+
+
+class OffDayUpdate(BaseModel):
+    reason: Optional[str] = _off_day_reason_field()
 
 
 class OffDayResponse(BaseModel):
@@ -1256,6 +1290,7 @@ class OffDayResponse(BaseModel):
     user_id: int
     uuid: Optional[str] = None
     date: str
+    reason: Optional[str] = None
     updated_at: Optional[str] = None
     deleted: bool = False
     model_config = ConfigDict(from_attributes=True)
@@ -1312,6 +1347,8 @@ class SyncShift(BaseModel):
 class SyncOffDay(BaseModel):
     uuid: str = Field(max_length=MAX_UUID_LENGTH)
     date: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
+    # Optional so older clients that don't send it keep syncing.
+    reason: Optional[str] = _off_day_reason_field()
     updated_at: str = Field(max_length=MAX_TIMESTAMP_LENGTH)
     deleted: bool = False
     deleted_at: Optional[str] = Field(default=None, max_length=MAX_TIMESTAMP_LENGTH)
@@ -2448,7 +2485,7 @@ def delete_shift(
 @app.put("/shifts/{shift_id}", response_model=ShiftResponse)
 def update_shift(
     shift_id: int,
-    shift_update: ShiftCreate,
+    shift_update: ShiftUpdate,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
@@ -2457,6 +2494,7 @@ def update_shift(
     ).first()
     if not db_shift:
         raise HTTPException(status_code=404, detail="Shift not found")
+    old_start, old_end = db_shift.start_time, db_shift.end_time
     db_shift.start_time = shift_update.start_time
     # Treat an omitted end_time as "unchanged" rather than reopening the shift
     # (M7); only an explicitly-sent value updates it.
@@ -2466,8 +2504,14 @@ def update_shift(
         db_shift.project_uuid = shift_update.project_uuid
     if "note" in shift_update.model_fields_set:
         db_shift.note = shift_update.note
-    # Editing an auto-closed shift means the user has reviewed it: clear the flag.
-    db_shift.auto_closed_at = None
+    # The auto-close flag asks the user to check the END TIME. Only a change to
+    # the shift's times (or an explicit "looks right") answers that; stamping a
+    # note or project must keep the warning visible.
+    times_changed = (
+        db_shift.start_time != old_start or db_shift.end_time != old_end
+    )
+    if times_changed or shift_update.clear_auto_closed:
+        db_shift.auto_closed_at = None
     db_shift.updated_at = sync_now()
     db.flush()
     # A REST edit can leave two shifts open (e.g. clearing an end_time); collapse
@@ -2492,6 +2536,12 @@ def create_off_day(
         OffDay.user_id == user_id, OffDay.date == off_day.date
     ).first()
     if existing:
+        # A sent reason always wins. Without one, re-adding a tombstone starts
+        # as a plain off day, and re-adding a live day keeps its reason.
+        if "reason" in off_day.model_fields_set:
+            existing.reason = off_day.reason
+        elif existing.deleted:
+            existing.reason = None
         existing.deleted = False
         existing.deleted_at = None
         existing.updated_at = sync_now()
@@ -2505,6 +2555,7 @@ def create_off_day(
         user_id=user_id,
         uuid=off_day.uuid or new_uuid(),
         date=off_day.date,
+        reason=off_day.reason,
         updated_at=sync_now(),
         deleted=False,
     )
@@ -2522,6 +2573,27 @@ def get_off_days(
     return db.query(OffDay).filter(
         OffDay.user_id == user_id, OffDay.deleted.is_(False)
     ).all()
+
+
+@app.put("/off-days/{off_day_id}", response_model=OffDayResponse)
+def update_off_day(
+    off_day_id: int,
+    off_day_update: OffDayUpdate,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    db_off_day = db.query(OffDay).filter(
+        OffDay.id == off_day_id,
+        OffDay.user_id == user_id,
+        OffDay.deleted.is_(False),
+    ).first()
+    if not db_off_day:
+        raise HTTPException(status_code=404, detail="Off day not found")
+    db_off_day.reason = off_day_update.reason
+    db_off_day.updated_at = sync_now()
+    db.commit()
+    db.refresh(db_off_day)
+    return db_off_day
 
 
 @app.delete("/off-days/{off_day_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2763,6 +2835,7 @@ def _serialize_sync_off_day(off_day: OffDay) -> SyncOffDay:
     return SyncOffDay(
         uuid=off_day.uuid,
         date=off_day.date,
+        reason=off_day.reason,
         updated_at=off_day.updated_at or "",
         deleted=bool(off_day.deleted),
         deleted_at=off_day.deleted_at,
@@ -2959,11 +3032,19 @@ def push_sync_state(
                 user_id=user_id,
                 uuid=incoming.uuid,
                 date=incoming.date,
+                reason=incoming.reason,
                 updated_at=inc_ts,
                 deleted=incoming.deleted,
                 deleted_at=incoming.deleted_at,
             ))
         elif sync_ts_greater(inc_ts, row.updated_at):
+            # The newer write carries the reason. An older client does not
+            # send the field: keep the stored reason, except when it re-adds a
+            # deleted day, which starts again as a plain off day.
+            if "reason" in incoming.model_fields_set:
+                row.reason = incoming.reason
+            elif row.deleted and not incoming.deleted:
+                row.reason = None
             row.updated_at = inc_ts
             row.deleted = incoming.deleted
             row.deleted_at = incoming.deleted_at

@@ -1,0 +1,9 @@
+{
+    "name": "tracksuite-shared",
+    "private": true,
+    "type": "module",
+    "description": "Code shared by the desktop app (desktop/) and the web app (website/).",
+    "scripts": {
+        "test": "node --test \"*.test.ts\""
+    }
+}

@@ -6,6 +6,19 @@
    remote @import here, for this or any other third-party asset. */
 
 /* ── Ultra-Modern Utility Tokens ────────────────────────────────── */
+/* Shared UI pieces (shared/ui/ui.css) read these; they follow every theme
+   because they point at this theme's own variables. */
+:root {
+    --ui-bg: var(--bg-surface);
+    --ui-border: var(--border-subtle);
+    --ui-text: var(--text-primary);
+    --ui-muted: var(--text-secondary);
+    --ui-accent: var(--accent);
+    --ui-accent-fg: var(--accent-fg);
+    --ui-danger: var(--danger);
+    --ui-warn: #f59e0b;
+}
+
 :root {
     --bg-main: #ffffff;
     --bg-panel: #fcfcfc;
@@ -218,13 +231,25 @@ p {
 
 /* ── Navigation ──────────────────────────────────────────────────── */
 .site-nav {
+    position: sticky;
+    top: 0;
+    z-index: 90;
+    background: color-mix(in srgb, var(--bg-main) 88%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 0.85rem 1.5rem;
+    transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.site-nav .nav-container {
+    max-width: 1100px;
+    margin: 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 1.5rem 2rem;
-    max-width: 1100px;
-    margin: 0 auto;
-    border-bottom: 1px solid transparent;
+    width: 100%;
+    position: relative;
 }
 
 .site-nav .logo {
@@ -232,26 +257,160 @@ p {
     font-weight: 600;
     letter-spacing: -0.05em;
     color: var(--text-primary);
+    display: inline-flex;
+    align-items: center;
 }
 
 .site-nav .logo span {
     color: var(--text-secondary);
 }
 
+.site-nav .nav-right {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+}
+
+.theme-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+}
+
+.theme-toggle-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--bg-hover);
+}
+
+.mobile-menu-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+}
+
+.mobile-menu-btn:hover {
+    background: var(--bg-hover);
+    border-color: var(--border-strong);
+}
+
+.site-nav .icon-close { display: none !important; }
+.site-nav .icon-menu { display: block !important; }
+.site-nav.nav-open .icon-menu { display: none !important; }
+.site-nav.nav-open .icon-close { display: block !important; }
+
 .site-nav .nav-links {
     display: flex;
-    gap: 2rem;
+    gap: 1.5rem;
     align-items: center;
 }
 
-.site-nav .nav-links a {
-    font-size: 0.875rem;
-    color: var(--text-secondary);
-    font-weight: 400;
+.site-nav .nav-group-links {
+    display: flex;
+    gap: 1.5rem;
+    align-items: center;
 }
 
-.site-nav .nav-links a:hover {
+.site-nav .nav-group-links a.nav-link {
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    font-weight: 450;
+    transition: color 0.15s ease;
+    text-decoration: none;
+}
+
+.site-nav .nav-group-links a.nav-link:hover {
     color: var(--text-primary);
+}
+
+.site-nav .nav-group-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+@media (max-width: 768px) {
+    .site-nav .nav-right {
+        gap: 0.5rem;
+    }
+    .mobile-menu-btn {
+        display: flex;
+    }
+    .site-nav .nav-links {
+        display: none;
+        position: absolute;
+        top: calc(100% + 0.85rem);
+        left: 0;
+        right: 0;
+        background: var(--bg-panel);
+        border: 1px solid var(--border-subtle);
+        border-radius: 12px;
+        padding: 1.25rem;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 1rem;
+        box-shadow: 0 16px 36px -12px rgba(0, 0, 0, 0.35);
+        z-index: 100;
+        animation: nav-drop 0.2s cubic-bezier(0.16, 1, 0.3, 1) both;
+    }
+    .site-nav.nav-open .nav-links {
+        display: flex;
+    }
+    .site-nav .nav-group-links {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 0.35rem;
+    }
+    .site-nav .nav-group-links a.nav-link {
+        font-size: 0.95rem;
+        padding: 0.65rem 0.75rem;
+        border-radius: 8px;
+        color: var(--text-primary);
+        font-weight: 500;
+        transition: background 0.15s ease;
+    }
+    .site-nav .nav-group-links a.nav-link:hover {
+        background: var(--bg-hover);
+    }
+    .site-nav .nav-group-actions {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        border-top: 1px solid var(--border-subtle);
+        padding-top: 0.85rem;
+        margin-top: 0.2rem;
+    }
+    .site-nav .nav-group-actions a.btn {
+        width: 100%;
+        text-align: center;
+        justify-content: center;
+        padding: 0.65rem 1rem;
+        font-size: 0.92rem;
+    }
+}
+
+@keyframes nav-drop {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 /* ── Buttons ─────────────────────────────────────────────────────── */
@@ -709,7 +868,8 @@ button[type="submit"] {
     border: 1px solid var(--border-subtle);
     border-radius: 6px;
     background: var(--bg-surface);
-    overflow: hidden;
+    /* Wide tables (Recent Shifts) scroll sideways on phones instead of being cut off. */
+    overflow-x: auto;
     margin-bottom: 2.5rem;
 }
 
@@ -1171,39 +1331,6 @@ button[type="submit"] {
     color: var(--text-primary);
 }
 
-.clock-panel {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 32px;
-    background: var(--bg-panel);
-    border: 1px solid var(--border-subtle);
-    border-radius: 16px;
-    margin-bottom: 24px;
-}
-
-.clock-timer {
-    font-size: 2.8rem;
-    font-family: var(--font-mono);
-    font-weight: 600;
-    margin: 12px 0 24px;
-    letter-spacing: -0.02em;
-}
-
-.progress-container {
-    width: 100%;
-    margin-top: 16px;
-}
-
-.progress-header {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.88rem;
-    color: var(--text-secondary);
-    margin-bottom: 6px;
-}
-
 .progress-wrap {
     height: 8px;
     background: var(--bg-surface);
@@ -1626,7 +1753,8 @@ button[type="submit"] {
 .project-menu-manage:hover { background: var(--bg-hover); color: var(--text-primary); }
 
 .projects-manage-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; max-height: 320px; overflow-y: auto; }
-.project-manage-row { display: flex; align-items: center; gap: 10px; }
+.project-manage-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.project-manage-row .pm-name { min-width: 140px; }
 .project-manage-row .pm-color, .new-project-row input[type="color"] {
     width: 34px; height: 34px; padding: 2px; border: 1px solid var(--border-subtle);
     border-radius: 8px; background: var(--bg-surface); cursor: pointer; flex-shrink: 0;
@@ -1650,46 +1778,6 @@ button[type="submit"] {
     border-radius: 6px; background: var(--bg-surface); color: var(--text-primary); font-size: 0.85rem;
 }
 .pm-billing-hint { font-size: 0.8rem; color: var(--text-secondary); margin: 0 0 10px; }
-
-/* ── Timeline note brush ──────────────────────────────────────────── */
-.timeline-brush { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-.timeline-brush-input {
-    flex: 1; min-width: 180px; padding: 7px 10px; border: 1px solid var(--border-subtle);
-    border-radius: 8px; background: var(--bg-surface); color: var(--text-primary); font-size: 0.9rem;
-}
-.timeline-brush-input:disabled { opacity: 0.5; }
-/* --accent is white in dark mode, so the label must use the contrasting
-   --accent-fg (not a hardcoded #fff, which was white-on-white in dark). */
-#btn-brush-toggle.active { background: var(--accent, #3b82f6); color: var(--accent-fg, #fff); border-color: transparent; }
-.timeline-brush-hint { font-size: 0.8rem; flex-basis: 100%; }
-.timeline-shift { position: absolute; overflow: hidden; }
-.timeline-shift .tl-shift-label { pointer-events: none; }
-.timeline-shift.has-note .tl-note-dot {
-    position: absolute; top: 1px; right: 3px; font-size: 1.1rem; line-height: 1;
-    color: currentColor; opacity: 0.85; pointer-events: none;
-}
-.timeline-editor-wrapper.brush-mode .timeline-shift.brushable {
-    /* Blocks are pointer-events:none by default (the track handles range-drag);
-       in brush mode they must catch clicks so the note can be stamped. */
-    pointer-events: auto; cursor: crosshair;
-    outline: 1px dashed rgba(255,255,255,0.6); outline-offset: -3px;
-}
-.timeline-shift.just-stamped { box-shadow: 0 0 0 2px #fff inset; }
-
-/* The running shift: a live block whose right edge tracks "now". A soft pulse
-   plus a striped trailing edge signals it is still growing. */
-.timeline-shift.timeline-live {
-    animation: tl-live-pulse 2s ease-in-out infinite;
-}
-.timeline-shift.timeline-live::after {
-    content: ""; position: absolute; top: 0; right: 0; bottom: 0; width: 10px;
-    background: repeating-linear-gradient(-45deg, rgba(255,255,255,0.45) 0 3px, transparent 3px 6px);
-    pointer-events: none;
-}
-@keyframes tl-live-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
-    50% { box-shadow: 0 0 0 2px rgba(255,255,255,0.5) inset; }
-}
 
 /* ── Trend-chart drill-down (backfill any day's sessions) ─────────── */
 .trend-hint { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-tertiary); }
@@ -1775,7 +1863,10 @@ button[type="submit"] {
        except the report itself from the flow — hiding via display:none (not
        visibility) so no dark app chrome paints onto extra pages. */
     html, body, #app { background: #fff !important; }
-    .site-nav { display: none !important; }
+    .site-nav, .site-footer, .tracker-bar, .offline-banner, .ui-toast { display: none !important; }
+    /* Reports live in a tracker tab: print only that tab's report. */
+    .dashboard > *:not(#tab-reports) { display: none !important; }
+    .dashboard { margin: 0 !important; padding: 0 !important; }
     .reports-page > *:not(.report-output) { display: none !important; }
     .report-output {
         position: static !important; margin: 0 !important; padding: 0 !important;
@@ -1798,46 +1889,17 @@ button[type="submit"] {
 .ps-item .ps-name { color: var(--text-primary); }
 .ps-item .ps-hours { font-weight: 600; color: var(--text-primary); }
 
-/* Timeline editor */
-.timeline-editor-wrapper { margin: 16px 0 4px; position: relative; user-select: none; -webkit-user-select: none; }
-.timeline-ticks { display: flex; justify-content: space-between; padding: 0 4px; margin-bottom: 6px; font-size: 0.72rem; font-weight: 600; color: var(--text-secondary); }
-.timeline-container {
-    background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 12px;
-    height: 48px; position: relative; overflow: visible; cursor: crosshair;
+/* Shown while the server can't be reached; the clock waits for fresh data. */
+.offline-banner {
+    margin: 0 0 1rem;
+    padding: 0.6rem 1rem;
+    border: 1px dashed var(--border-strong);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
 }
-.timeline-track { width: 100%; height: 100%; position: relative; border-radius: 11px; overflow: hidden; }
-.timeline-shift {
-    position: absolute; height: 100%; top: 0; box-sizing: border-box;
-    border-right: 1px solid rgba(255,255,255,0.2); border-left: 1px solid rgba(255,255,255,0.2);
-    display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700;
-    overflow: hidden; white-space: nowrap; text-overflow: ellipsis; pointer-events: none;
-}
-.timeline-selection {
-    position: absolute; height: 100%; top: 0; background: rgba(59,130,246,0.25);
-    border: 2px dashed #3b82f6; box-sizing: border-box; z-index: 10; cursor: grab;
-}
-.timeline-selection:active { cursor: grabbing; }
-.timeline-handle {
-    position: absolute; top: 50%; width: 12px; height: 24px; background: #3b82f6; border: 2px solid #ffffff;
-    border-radius: 4px; transform: translateY(-50%); box-shadow: 0 2px 4px rgba(0,0,0,0.25); cursor: ew-resize; z-index: 12;
-}
-.handle-left { left: -7px; }
-.handle-right { right: -7px; }
-.timeline-empty { padding: 16px; text-align: center; color: var(--text-secondary); font-size: 0.85rem; background: var(--bg-surface); border: 1px dashed var(--border-subtle); border-radius: 12px; }
-.timeline-controls { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-top: 14px; }
-.timeline-selection-label { font-size: 0.84rem; font-weight: 600; color: var(--text-primary); }
-.timeline-actions { display: flex; gap: 10px; align-items: center; }
-.timeline-project-select {
-    -webkit-appearance: none; -moz-appearance: none; appearance: none;
-    padding: 6px 30px 6px 12px; border-radius: 8px; border: 1px solid var(--border-subtle);
-    background-color: var(--bg-surface); color: var(--text-primary); font-size: 0.88rem; font-weight: 500; max-width: 200px;
-    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M1 1l4 4 4-4" fill="none" stroke="%2394a3b8" stroke-width="1.5"/></svg>');
-    background-repeat: no-repeat; background-position: right 10px center;
-}
-.timeline-project-select:disabled { opacity: 0.55; cursor: not-allowed; }
-.timeline-project-select option { background: var(--bg-surface); color: var(--text-primary); }
+.offline-banner[hidden] { display: none; }
 
-/* Auto-closed shift notice (server closed a shift left running). */
 .auto-closed-banner {
     margin: 0 0 1rem;
     border: 1px solid var(--danger);
@@ -1951,6 +2013,7 @@ button[type="submit"] {
     border: 1px solid var(--border-subtle); border-radius: 14px; background: var(--bg-panel);
     min-height: 190px; padding: 1.5rem; display: flex; flex-direction: column; justify-content: center; gap: 0.9rem;
     position: relative;
+    box-shadow: 0 8px 24px -16px rgba(0, 0, 0, 0.25);
 }
 .feat-visual-tl { padding-top: 2.6rem; }
 
@@ -2016,8 +2079,34 @@ button[type="submit"] {
 /* Three separated, copy-paste steps (page + .deb dialog). */
 .apt-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.85rem; }
 .apt-steps li { display: flex; flex-direction: column; gap: 0.35rem; }
+.apt-step-head { display: flex; justify-content: space-between; align-items: center; }
 .apt-step-label { font-size: 0.76rem; font-weight: 600; color: var(--text-secondary); }
-.apt-steps pre { background: #11151c; color: #e6edf3; border-radius: 8px; padding: 0.7rem 0.9rem; overflow-x: auto; font-size: 0.72rem; line-height: 1.5; margin: 0; }
+.btn-copy-code {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 5px;
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.btn-copy-code:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+    background: var(--bg-hover);
+}
+.btn-copy-code.copied {
+    color: var(--success);
+    border-color: var(--success);
+    background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+.apt-steps pre { background: #0f172a; color: #f1f5f9; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 0.75rem 0.95rem; overflow-x: auto; font-size: 0.72rem; line-height: 1.5; margin: 0; }
 .apt-steps code { font-family: var(--font-mono); white-space: pre; }
 
 /* .deb download → apt-nudge dialog */
@@ -2051,3 +2140,94 @@ button[type="submit"] {
     .fv-bar { transform: scaleY(1); transition: none; }
     .fv-sync-pulse { opacity: 1; left: calc(50% - 4px); }
 }
+
+/* A button that reads as an inline link (e.g. "Set your schedule →"). */
+.link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 0.95rem;
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+
+@media (max-width: 640px) {
+    .reports-profile-grid, .reports-filter-grid { grid-template-columns: 1fr; }
+}
+
+/* .btn sets display, which would override the hidden attribute. */
+.btn[hidden] { display: none; }
+
+/* ── Live clock extras: today target, running note, focus ring slot ── */
+.stat-sub { margin: 4px 0 0; font-size: 0.8rem; color: var(--text-secondary); min-height: 1.1em; }
+.focus-wrap { display: inline-flex; align-items: center; }
+.focus-wrap:empty { display: none; }
+.running-note {
+    display: block;
+    width: min(420px, 100%);
+    margin: 10px auto 14px;
+    box-sizing: border-box;
+    padding: 7px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 0.9rem;
+    text-align: center;
+}
+.running-note[hidden] { display: none; }
+
+/* Recent shifts grouped by day */
+.sessions-table tr.day-row td { padding-top: 14px; font-size: 0.78rem; font-weight: 700; color: var(--text-secondary); }
+.sessions-table tr.day-row .day-total { float: right; }
+.sessions-table tr.shift-row { cursor: pointer; }
+.sessions-table tr.shift-row:hover { background: var(--bg-hover); }
+
+/* Off-day reason icon in the calendar cell */
+.calendar-grid [data-date] { position: relative; }
+.cal-reason { position: absolute; top: 3px; right: 5px; font-size: 0.8rem; line-height: 1; opacity: 0.9; }
+
+/* ── Tracker bar (same layout as the desktop header) ──────────────────
+   Tabs on the left; project, focus timer and clock on the right. Stays
+   right under the site nav while the page scrolls (--site-nav-h is
+   measured in tracker.ts). */
+.tracker-bar {
+    position: sticky;
+    top: var(--site-nav-h, 0px);
+    z-index: 80;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    margin: 0 0 24px;
+    padding: 10px 0;
+    background: var(--bg-main);
+    box-shadow: 0 0 0 100vmax var(--bg-main);
+    clip-path: inset(0 -100vmax);
+    border-bottom: 1px solid var(--border-subtle);
+}
+.tracker-bar .tabs-nav { margin: 0; padding: 0; border: none; }
+.tracker-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.tracker-actions .project-chip-wrap { margin: 0; }
+.dashboard { margin-top: 1.5rem; }
+
+.week-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+.week-head h3 { margin: 0; }
+.clock-elapsed { font-variant-numeric: tabular-nums; opacity: 0.85; }
+#card-status.tracking { border-color: var(--success); }
+#card-status.tracking .stat-value { color: var(--success); }
+#card-status .running-note { margin: 8px 0 0; width: 100%; }
+
+@media (max-width: 768px) {
+    .tracker-bar { padding: 8px 0; }
+    .tracker-actions { width: 100%; justify-content: flex-end; }
+}
+
+.reports-intro { margin: 0 0 16px; }
+/* Inside the tracker's Reports tab the page needs no outer spacing of its own. */
+#tab-reports .reports-page { max-width: none; margin: 0; padding: 0; }

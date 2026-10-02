@@ -33,7 +33,7 @@ export function renderDocs(app: HTMLElement): void {
 sudo chown "$USER":"$USER" /opt/work-time-app
 git clone --filter=blob:none --sparse ${REPO_URL}.git /opt/work-time-app
 cd /opt/work-time-app
-git sparse-checkout set backend app_server website
+git sparse-checkout set backend app_server website shared
 sudo ./backend/deploy.sh main</code></pre>
             <p>Running the backend behind an existing website instead, with no web app? Use <code>sudo SKIP_WEBSITE_BUILD=1 ./backend/deploy.sh main</code> and proxy a single path to the backend.</p>
             <p>To remove it later without touching your web server: <code>cd /opt/work-time-app &amp;&amp; sudo ./backend/uninstall.sh</code></p>

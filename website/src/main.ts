@@ -7,7 +7,8 @@ import "@fontsource/inter/latin-600.css";
 import "@fontsource/inter/latin-700.css";
 
 import "./styles.css";
-import { getToken } from "./api";
+import { getToken, setSession } from "./api";
+import { setMode } from "./mode";
 import { APP_ONLY, loadInstanceConfig } from "./config";
 import { LEGAL_ENABLED } from "./legal-config";
 import { route, startRouter } from "./router";
@@ -22,14 +23,20 @@ import { renderResetPassword } from "./pages/resetPassword";
 import { renderDashboard } from "./pages/dashboard";
 import { renderDocs } from "./pages/docs";
 import { renderTracker } from "./pages/tracker";
-import { renderReports } from "./pages/reports";
 import { renderImpressum, renderPrivacy, renderTerms } from "./pages/legal";
 
 const app = document.getElementById("app")!;
 
-function render(page: (el: HTMLElement) => void): void {
+// A page may return a clean-up function; it runs before the next page renders,
+// so a page's global listeners and timers never act on another page.
+type Page = (el: HTMLElement) => void | (() => void);
+let pageCleanup: (() => void) | null = null;
+
+function render(page: Page): void {
+    pageCleanup?.();
+    pageCleanup = null;
     app.innerHTML = "";
-    page(app);
+    pageCleanup = page(app) || null;
     renderNav(app);
     renderFooter(app);
 }
@@ -47,6 +54,18 @@ function renderHome(): void {
     render(renderLanding);
 }
 
+// Dev server only (scripts/sandbox-web.sh): sign in with tokens from the URL.
+// import.meta.env.DEV is false in production builds, so Vite drops this code.
+if (import.meta.env.DEV) {
+    route("#/dev-login", () => {
+        const params = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
+        const access = params.get("access"), refresh = params.get("refresh");
+        if (access && refresh) setSession({ accessToken: access, refreshToken: refresh });
+        if (params.get("mode") === "full") setMode("full");
+        window.location.replace("#/tracker");
+    });
+}
+
 route("#/", renderHome);
 route("#/register", () => render(renderRegister));
 route("#/login", () => render(renderLogin));
@@ -54,7 +73,8 @@ route("#/verify-email", () => render(renderVerifyEmail));
 route("#/reset-password", () => render(renderResetPassword));
 route("#/dashboard", () => render(renderDashboard));
 route("#/tracker", () => render(renderTracker));
-route("#/reports", () => render(renderReports));
+// Reports are a tab of the tracker now (as in the desktop app); old links land there.
+route("#/reports", () => window.location.replace("#/tracker?tab=reports"));
 
 if (!APP_ONLY) {
     route("#/docs", () => render(renderDocs));

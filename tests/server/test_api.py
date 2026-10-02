@@ -668,6 +668,139 @@ def test_delete_off_day_scoped():
     assert client.delete(f"/off-days/{off_day_id}", headers=first_headers).status_code == 204
 
 
+def test_off_day_reason_create_and_resurrect():
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+    created = client.post(
+        "/off-days/", json={"date": "2026-03-19", "reason": "vacation"}, headers=headers,
+    )
+    assert created.status_code == 201
+    assert created.json()["reason"] == "vacation"
+    assert client.get("/off-days/", headers=headers).json()[0]["reason"] == "vacation"
+
+    # Plain off day: reason is null.
+    plain = client.post("/off-days/", json={"date": "2026-03-20"}, headers=headers)
+    assert plain.json()["reason"] is None
+
+    # Re-adding a live day without a reason keeps the reason.
+    again = client.post("/off-days/", json={"date": "2026-03-19"}, headers=headers)
+    assert again.json()["id"] == created.json()["id"]
+    assert again.json()["reason"] == "vacation"
+
+    # Re-adding a tombstone without a reason starts as a plain off day ...
+    off_day_id = created.json()["id"]
+    assert client.delete(f"/off-days/{off_day_id}", headers=headers).status_code == 204
+    revived = client.post("/off-days/", json={"date": "2026-03-19"}, headers=headers)
+    assert revived.json()["id"] == off_day_id
+    assert revived.json()["reason"] is None
+    # ... and a sent reason sets it, bumping updated_at.
+    before = revived.json()["updated_at"]
+    sick = client.post(
+        "/off-days/", json={"date": "2026-03-19", "reason": "sick"}, headers=headers,
+    )
+    assert sick.json()["reason"] == "sick"
+    assert sick.json()["updated_at"] > before
+
+
+def test_update_off_day_reason():
+    _, first_response, _ = _register_and_enroll("u1@example.com")
+    _, second_response, _ = _register_and_enroll("u2@example.com")
+    first_headers = _auth_headers(first_response.json()["access_token"])
+    second_headers = _auth_headers(second_response.json()["access_token"])
+    created = client.post("/off-days/", json={"date": "2026-03-19"}, headers=first_headers).json()
+    off_day_id = created["id"]
+
+    res = client.put(f"/off-days/{off_day_id}", json={"reason": "holiday"}, headers=first_headers)
+    assert res.status_code == 200
+    assert res.json()["reason"] == "holiday"
+    assert res.json()["updated_at"] > created["updated_at"]
+
+    cleared = client.put(f"/off-days/{off_day_id}", json={"reason": None}, headers=first_headers)
+    assert cleared.status_code == 200
+    assert cleared.json()["reason"] is None
+
+    # Other users and deleted rows: 404.
+    assert client.put(
+        f"/off-days/{off_day_id}", json={"reason": "sick"}, headers=second_headers,
+    ).status_code == 404
+    client.delete(f"/off-days/{off_day_id}", headers=first_headers)
+    assert client.put(
+        f"/off-days/{off_day_id}", json={"reason": "sick"}, headers=first_headers,
+    ).status_code == 404
+    assert client.put("/off-days/999999", json={"reason": "sick"}, headers=first_headers).status_code == 404
+
+
+@pytest.mark.parametrize("bad", ["", "Vacation", "sick-leave", "a" * 33, "vacation ", 5])
+def test_off_day_reason_validation(bad):
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+    assert client.post(
+        "/off-days/", json={"date": "2026-03-19", "reason": bad}, headers=headers,
+    ).status_code == 422
+    off_day_id = client.post("/off-days/", json={"date": "2026-03-20"}, headers=headers).json()["id"]
+    assert client.put(
+        f"/off-days/{off_day_id}", json={"reason": bad}, headers=headers,
+    ).status_code == 422
+    payload = {
+        "shifts": [], "projects": [],
+        "off_days": [{
+            "uuid": "od-bad", "date": "2026-03-21", "reason": bad,
+            "updated_at": "2026-03-21T08:00:00.000000+00:00",
+        }],
+    }
+    assert client.post("/sync/", json=payload, headers=headers).status_code == 422
+    # 32 lowercase letters / underscores are fine.
+    assert client.post(
+        "/off-days/", json={"date": "2026-03-22", "reason": "a_" * 16}, headers=headers,
+    ).status_code == 201
+
+
+def test_sync_off_day_reason_round_trip():
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+
+    def push(off_days):
+        res = client.post(
+            "/sync/", json={"shifts": [], "projects": [], "off_days": off_days}, headers=headers,
+        )
+        assert res.status_code == 200
+        return {o["date"]: o for o in res.json()["off_days"]}
+
+    state = push([
+        {"uuid": "od-1", "date": "2026-03-19", "reason": "vacation",
+         "updated_at": "2026-03-19T08:00:00.000000+00:00"},
+        {"uuid": "od-2", "date": "2026-03-20",
+         "updated_at": "2026-03-19T08:00:00.000000+00:00"},
+    ])
+    assert state["2026-03-19"]["reason"] == "vacation"
+    assert state["2026-03-20"]["reason"] is None
+    assert {o["date"]: o["reason"] for o in client.get("/sync/", headers=headers).json()["off_days"]} == {
+        "2026-03-19": "vacation", "2026-03-20": None,
+    }
+
+    # Newer write changes the reason; an older one does not.
+    state = push([{"uuid": "od-1", "date": "2026-03-19", "reason": "sick",
+                   "updated_at": "2026-03-19T09:00:00.000000+00:00"}])
+    assert state["2026-03-19"]["reason"] == "sick"
+    state = push([{"uuid": "od-1", "date": "2026-03-19", "reason": "other",
+                   "updated_at": "2026-03-19T08:30:00.000000+00:00"}])
+    assert state["2026-03-19"]["reason"] == "sick"
+
+    # An older client without the field: a newer write keeps the reason.
+    state = push([{"uuid": "od-1", "date": "2026-03-19",
+                   "updated_at": "2026-03-19T10:00:00.000000+00:00"}])
+    assert state["2026-03-19"]["reason"] == "sick"
+    assert state["2026-03-19"]["updated_at"].startswith("2026-03-19T10:00:00")
+
+    # A REST reason change shows up in the sync state.
+    rest_id = client.get("/off-days/", headers=headers).json()
+    rest_id = next(o["id"] for o in rest_id if o["date"] == "2026-03-20")
+    client.put(f"/off-days/{rest_id}", json={"reason": "holiday"}, headers=headers)
+    assert {o["date"]: o["reason"] for o in client.get("/sync/", headers=headers).json()["off_days"]}[
+        "2026-03-20"
+    ] == "holiday"
+
+
 def test_daily_hours_aggregation():
     _, enroll_response, _ = _register_and_enroll()
     headers = _auth_headers(enroll_response.json()["access_token"])
@@ -1070,3 +1203,66 @@ def test_work_schedule_is_per_user():
 
     assert client.get("/work-schedule/", headers=second_headers).json()["schedule"] is None
     assert client.get("/work-schedule/", headers=first_headers).json()["schedule"]["mon"] == 8
+
+
+def _auto_closed_shift(headers):
+    """Create two open shifts so the server auto-closes the older one."""
+    client.post(
+        "/shifts/", json={"uuid": "ac1", "start_time": "2026-04-07T08:00:00"}, headers=headers
+    )
+    client.post(
+        "/shifts/", json={"uuid": "ac2", "start_time": "2026-07-10T09:00:00"}, headers=headers
+    )
+    shifts = {s["uuid"]: s for s in client.get("/shifts/", headers=headers).json()}
+    assert shifts["ac1"]["auto_closed_at"]
+    return shifts["ac1"]
+
+
+def test_update_shift_note_keeps_auto_closed_flag():
+    """Stamping a note or project must not dismiss the 'check this end time'
+    warning; only a time change or an explicit clear_auto_closed does."""
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+    shift = _auto_closed_shift(headers)
+
+    res = client.put(
+        f"/shifts/{shift['id']}",
+        json={"start_time": shift["start_time"], "note": "client call"},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    assert res.json()["note"] == "client call"
+    assert res.json()["auto_closed_at"] == shift["auto_closed_at"]
+
+    # Re-sending the same end_time is not a change either.
+    res = client.put(
+        f"/shifts/{shift['id']}",
+        json={"start_time": shift["start_time"], "end_time": shift["end_time"]},
+        headers=headers,
+    )
+    assert res.json()["auto_closed_at"] == shift["auto_closed_at"]
+
+    # Explicit "looks right".
+    res = client.put(
+        f"/shifts/{shift['id']}",
+        json={"start_time": shift["start_time"], "clear_auto_closed": True},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    assert res.json()["auto_closed_at"] is None
+    assert res.json()["end_time"] == shift["end_time"]
+
+
+def test_update_shift_time_change_clears_auto_closed_flag():
+    _, enroll_response, _ = _register_and_enroll()
+    headers = _auth_headers(enroll_response.json()["access_token"])
+    shift = _auto_closed_shift(headers)
+
+    res = client.put(
+        f"/shifts/{shift['id']}",
+        json={"start_time": shift["start_time"], "end_time": "2026-04-07T17:00:00"},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    assert res.json()["end_time"] == "2026-04-07T17:00:00"
+    assert res.json()["auto_closed_at"] is None

@@ -1,3 +1,16 @@
+/* Shared UI pieces (shared/ui/ui.css) read these; they follow every theme
+   and palette because they point at this theme's own variables. */
+:root {
+    --ui-bg: var(--bg-input);
+    --ui-border: var(--border-color);
+    --ui-text: var(--text-main);
+    --ui-muted: var(--text-muted);
+    --ui-accent: var(--accent);
+    --ui-accent-fg: var(--accent-fg);
+    --ui-danger: var(--danger);
+    --ui-warn: #f59e0b;
+}
+
 :root {
     --bg-main: #f4f7fb;
     --bg-panel: rgba(255, 255, 255, 0.85);
@@ -283,13 +296,23 @@ select {
 
 /* ── Header ──────────────────────────────────────────────────────── */
 
+/* The header (tabs, project, focus timer, clock) stays at the top while the
+   page scrolls. The box-shadow + clip-path pair stretches its background to
+   the full window width without changing its layout. */
 .dash-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 28px;
+    margin: -32px 0 28px;
+    padding: 16px 0 14px;
     flex-wrap: wrap;
     gap: 12px;
+    position: sticky;
+    top: 0;
+    z-index: 60;
+    background: var(--bg-main);
+    box-shadow: 0 0 0 100vmax var(--bg-main);
+    clip-path: inset(0 -100vmax);
 }
 
 .dash-header h1 {
@@ -682,6 +705,15 @@ td {
     line-height: 1.5;
 }
 
+/* "= Fri, 3 Apr 2026" under a typed date: how the input was read. */
+.date-preview {
+    display: block;
+    min-height: 1.2em;
+    margin-top: 4px;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
 .modal label {
     display: block;
     margin-bottom: 14px;
@@ -1013,164 +1045,6 @@ select option {
     color: var(--text-main);
 }
 
-/* ── Day Timeline Editor ────────────────────────────────────────── */
-
-.timeline-editor-wrapper {
-    margin: 20px 0;
-    position: relative;
-    user-select: none;
-    -webkit-user-select: none;
-}
-
-.timeline-ticks {
-    display: flex;
-    justify-content: space-between;
-    padding: 0 4px;
-    margin-bottom: 6px;
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: var(--text-muted);
-}
-
-.timeline-empty {
-    padding: 16px;
-    text-align: center;
-    color: var(--text-muted);
-    font-size: 0.85rem;
-    background: var(--bg-input);
-    border: 1px dashed var(--border-color);
-    border-radius: 12px;
-}
-
-.timeline-container {
-    background: var(--bg-input);
-    border: 1px solid var(--border-color);
-    border-radius: 12px;
-    height: 48px;
-    position: relative;
-    overflow: visible;
-    box-shadow: inset 0 2px 4px var(--shadow);
-    cursor: crosshair;
-}
-
-.timeline-track {
-    width: 100%;
-    height: 100%;
-    position: relative;
-    border-radius: 11px;
-    overflow: hidden;
-}
-
-.timeline-shift {
-    position: absolute;
-    height: 100%;
-    top: 0;
-    box-sizing: border-box;
-    border-right: 1px solid rgba(255, 255, 255, 0.25);
-    border-left: 1px solid rgba(255, 255, 255, 0.25);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 0.7rem;
-    font-weight: bold;
-    color: #fff;
-    text-shadow: 0 1px 2px rgba(0,0,0,0.4);
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    pointer-events: none; /* Let drag events pass through to track */
-}
-
-.timeline-selection {
-    position: absolute;
-    height: 100%;
-    top: 0;
-    background: rgba(43, 127, 255, 0.25);
-    border: 2px dashed var(--accent);
-    box-sizing: border-box;
-    z-index: 10;
-    cursor: grab;
-}
-
-.timeline-selection:active {
-    cursor: grabbing;
-}
-
-.timeline-handle {
-    position: absolute;
-    top: 50%;
-    width: 12px;
-    height: 24px;
-    background: var(--accent);
-    border: 2px solid #ffffff;
-    border-radius: 4px;
-    transform: translateY(-50%);
-    box-shadow: 0 2px 4px rgba(0,0,0,0.25);
-    cursor: ew-resize;
-    z-index: 12;
-}
-
-.handle-left {
-    left: -7px;
-}
-
-.handle-right {
-    right: -7px;
-}
-
-.timeline-controls {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-top: 14px;
-    padding: 10px 14px;
-    background: var(--bg-input);
-    border: 1px solid var(--border-color);
-    border-radius: 12px;
-}
-
-.timeline-selection-label {
-    font-size: 0.84rem;
-    font-weight: 600;
-    color: var(--text-main);
-}
-
-.timeline-actions {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-}
-
-.timeline-project-select {
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    appearance: none;
-    padding: 6px 30px 6px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border-color);
-    background-color: var(--bg-input);
-    color: var(--text-main);
-    font-size: 0.88rem;
-    font-weight: 500;
-    max-width: 180px;
-    /* Custom caret (native one is hidden by appearance:none) */
-    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M1 1l4 4 4-4" fill="none" stroke="%2394a3b8" stroke-width="1.5"/></svg>');
-    background-repeat: no-repeat;
-    background-position: right 10px center;
-}
-
-.timeline-project-select:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
-}
-
-.timeline-project-select option {
-    background: var(--bg-select-fallback);
-    color: var(--text-main);
-}
-
 /* Read-only project tag in the Recent shifts table */
 .shift-project-tag {
     display: inline-flex;
@@ -1204,45 +1078,6 @@ select option {
 .project-manage-row .pm-rate { width: 72px; flex-shrink: 0; text-align: right; }
 .project-manage-row .pm-currency { width: 56px; flex-shrink: 0; text-transform: uppercase; }
 .pm-billing-hint { font-size: 0.8rem; color: var(--text-muted); margin: 0 0 10px; }
-
-/* ── Timeline note brush ──────────────────────────────────────────── */
-.timeline-brush { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-.timeline-brush-input {
-    flex: 1; min-width: 180px; padding: 7px 10px; border: 1px solid var(--border);
-    border-radius: 8px; background: var(--bg-input, var(--bg-elevated)); color: var(--text-primary); font: inherit; font-size: 0.9rem;
-}
-.timeline-brush-input:disabled { opacity: 0.5; }
-/* --accent-fg is the per-theme contrasting colour; some themes have a white
-   --accent, where a hardcoded #fff would be white-on-white. */
-#btn-brush-toggle.active { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
-.timeline-brush-hint { font-size: 0.8rem; flex-basis: 100%; }
-.timeline-shift .tl-shift-label { pointer-events: none; }
-.timeline-shift.has-note .tl-note-dot {
-    position: absolute; top: 1px; right: 3px; font-size: 1.1rem; line-height: 1;
-    color: currentColor; opacity: 0.85; pointer-events: none;
-}
-.timeline-editor-wrapper.brush-mode .timeline-shift.brushable {
-    /* Blocks are pointer-events:none by default (the track handles range-drag);
-       in brush mode they must catch clicks so the note can be stamped. */
-    pointer-events: auto; cursor: crosshair;
-    outline: 1px dashed rgba(255,255,255,0.6); outline-offset: -3px;
-}
-.timeline-shift.just-stamped { box-shadow: 0 0 0 2px #fff inset; }
-
-/* The running shift: a live block whose right edge tracks "now". A soft pulse
-   plus a striped trailing edge signals it is still growing. */
-.timeline-shift.timeline-live {
-    animation: tl-live-pulse 2s ease-in-out infinite;
-}
-.timeline-shift.timeline-live::after {
-    content: ""; position: absolute; top: 0; right: 0; bottom: 0; width: 10px;
-    background: repeating-linear-gradient(-45deg, rgba(255,255,255,0.45) 0 3px, transparent 3px 6px);
-    pointer-events: none;
-}
-@keyframes tl-live-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
-    50% { box-shadow: 0 0 0 2px rgba(255,255,255,0.5) inset; }
-}
 
 /* ── Trend-chart drill-down (backfill any day's sessions) ─────────── */
 .trend-hint { margin: 6px 0 0; font-size: 0.72rem; color: var(--text-muted); }
@@ -1378,17 +1213,6 @@ select option {
 .help-hint:hover {
     color: var(--text-main);
     border-color: var(--text-muted);
-}
-
-.timeline-date-picker {
-    padding: 6px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border-color);
-    background: var(--bg-main);
-    color: var(--text-main);
-    font-size: 0.88rem;
-    font-weight: 500;
-    cursor: pointer;
 }
 
 /* ── Project chip & menu ─────────────────────────────────────────── */
@@ -1633,3 +1457,70 @@ select option {
 .whats-new-version { font-weight: 600; color: var(--text-main); margin-bottom: 10px; }
 .whats-new-body ul { margin: 0; padding-left: 18px; }
 .whats-new-body li { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 9px; line-height: 1.45; }
+
+/* ── Sync status dot (header) ───────────────────────────────────── */
+.sync-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    background: var(--success);
+    cursor: help;
+}
+.sync-dot[hidden] { display: none; }
+.sync-dot[data-state="offline"] { background: var(--text-muted); }
+.sync-dot[data-state="error"] { background: var(--danger); }
+
+/* A button that reads as an inline link (e.g. "Set your schedule →"). */
+.link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    font-size: 0.95rem;
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+
+/* .btn sets display, which would override the hidden attribute. */
+.btn[hidden] { display: none; }
+
+/* ── Live clock, today target, running note ────────────────────── */
+.focus-wrap { display: inline-flex; }
+.focus-wrap:empty { display: none; }
+.clock-elapsed { font-variant-numeric: tabular-nums; opacity: 0.85; margin-left: 4px; }
+.stat-sub { margin: 4px 0 0; font-size: 0.8rem; color: var(--text-muted); min-height: 1.1em; }
+.running-note {
+    margin-top: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-input);
+    color: var(--text-main);
+    font: inherit;
+    font-size: 0.85rem;
+    text-align: center;
+}
+.running-note[hidden] { display: none; }
+/* Chip, sync dot, focus ring and clock stay together on the right. */
+.header-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+
+/* Recent shifts grouped by day */
+tr.day-row td {
+    padding-top: 14px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    border-bottom: none;
+}
+tr.day-row td span.day-total { float: right; }
+tr.shift-row { cursor: pointer; }
+tr.shift-row:hover { background: var(--bg-hover); }
+
+/* Off-day reason icon in the calendar cell */
+.calendar-grid [data-date] { position: relative; }
+.cal-reason { position: absolute; top: 3px; right: 5px; font-size: 0.8rem; line-height: 1; opacity: 0.9; }

@@ -40,6 +40,9 @@ struct RemoteSyncShift {
 struct RemoteSyncOffDay {
     uuid: String,
     date: String,
+    // Absent on servers older than the off-day reason; None = plain off day.
+    #[serde(default)]
+    reason: Option<String>,
     #[serde(default)]
     updated_at: String,
     #[serde(default)]
@@ -182,6 +185,7 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
             json!({
                 "uuid": o.uuid,
                 "date": o.date,
+                "reason": o.reason,
                 "updated_at": o.updated_at,
                 "deleted": o.deleted,
                 "deleted_at": o.deleted_at,
@@ -241,7 +245,11 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
             deleted_at: project.deleted_at.clone(),
         })?;
     }
-    for shift in &state.shifts {
+    // Closed and deleted rows before open ones: the local DB allows only one
+    // open shift, so "close A" must land before "open B".
+    let mut shifts: Vec<&RemoteSyncShift> = state.shifts.iter().collect();
+    shifts.sort_by_key(|s| s.end_time.is_none() && !s.deleted);
+    for shift in shifts {
         db::apply_synced_shift(&db::SyncShift {
             uuid: shift.uuid.clone(),
             start_time: shift.start_time.clone(),
@@ -259,6 +267,7 @@ pub async fn perform_push_sync() -> Result<SyncStatus, String> {
         db::apply_synced_off_day(&db::SyncOffDay {
             uuid: off_day.uuid.clone(),
             date: off_day.date.clone(),
+            reason: off_day.reason.clone(),
             updated_at: off_day.updated_at.clone(),
             deleted: off_day.deleted,
             deleted_at: off_day.deleted_at.clone(),

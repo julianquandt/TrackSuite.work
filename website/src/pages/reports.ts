@@ -1,6 +1,6 @@
 import {
     getProfile,
-    getToken,
+    getRemoteSchedule,
     listOffDays,
     listProjects,
     listShifts,
@@ -11,24 +11,13 @@ import {
     type ReportProfile,
     type ShiftItem,
 } from "../api";
-import { navigate } from "../router";
-import { isFullMode } from "../mode";
-
-function escapeHtml(value: string): string {
-    return value
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-}
-
-function csvCell(v: string): string {
-    // Guard against CSV/formula injection and quote fields containing separators.
-    let s = v ?? "";
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-    return s;
-}
+import { escapeHtml, csvCell } from "../../../shared/text.ts";
+import { showToast } from "../../../shared/ui/toast.ts";
+import { wireReportChoices } from "../../../shared/ui/reportChoices.ts";
+import { reasonInfo } from "../../../shared/offdays.ts";
+import { enhanceSelects } from "../../../shared/ui/select.ts";
+import "../../../shared/ui/ui.css";
+import { dayStart, localDateKey } from "../../../shared/time.ts";
 
 function shiftHours(s: ShiftItem): number {
     if (!s.end_time) return 0;
@@ -47,13 +36,6 @@ function signedHours(h: number): string {
 
 function fmtMoney(amount: number): string {
     return amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function localDateKey(d: Date): string {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
 }
 
 const WEEKDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -78,6 +60,11 @@ function loadWorkSchedule(): WorkSchedule {
     } catch {
         return fallback;
     }
+}
+
+/** A "YYYY-MM-DD" day in the system's date format (the CSV keeps ISO dates). */
+function fmtDate(key: string): string {
+    return /^\d{4}-\d{2}-\d{2}$/.test(key) ? dayStart(key).toLocaleDateString() : key;
 }
 
 function targetHoursForDate(d: Date, s: WorkSchedule): number {
@@ -112,32 +99,28 @@ function fmtTime(iso: string): string {
     return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export function renderReports(app: HTMLElement): void {
-    if (!getToken()) {
-        navigate("#/login");
-        return;
-    }
-    // Reports are a Full-mode feature; bounce to the tracker in Simple mode.
-    if (!isFullMode()) {
-        navigate("#/tracker");
-        return;
-    }
+/**
+ * The Reports tab of the tracker (Full mode), like the desktop app's. Renders
+ * into `container` and loads fresh data each time the tab is opened.
+ */
+export function mountReports(container: HTMLElement): void {
+    const app = container;
 
     let profile: ReportProfile = {};
     let projects: ProjectItem[] = [];
     let shifts: ShiftItem[] = [];
     let offDaySet = new Set<string>();
-    const schedule = loadWorkSchedule();
+    let offDayReasons = new Map<string, string | null>();
+    // The schedule on this device first; replaced by the server's copy (the
+    // cross-device source of truth) as soon as it has loaded.
+    let schedule = loadWorkSchedule();
 
     const today = new Date();
     const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
 
     app.innerHTML = `
         <div class="reports-page">
-            <div class="dashboard-header">
-                <h2>Reports</h2>
-                <p>Generate a billable summary of your tracked time. Set your letterhead and per-project rates, pick a date range, then export as CSV or print to PDF.</p>
-            </div>
+            <p class="muted reports-intro">A billable summary or a timesheet from your tracked time. Set your letterhead and per-project rates, pick a range, then export CSV or print to PDF.</p>
 
             <details class="dash-section" id="profile-section">
                 <summary class="reports-summary-toggle"><h3 style="display:inline;">Letterhead &amp; Profile</h3><span class="muted"> — appears at the top of printed reports</span></summary>
@@ -164,7 +147,8 @@ export function renderReports(app: HTMLElement): void {
 
             <section class="dash-section no-print">
                 <h3>Generate report</h3>
-                <p class="muted" style="margin-top:-4px;">Hourly rates are set per project — open the project menu on the Tracker and choose <strong>Manage projects</strong>.</p>
+                <p class="muted" style="margin-top:-4px;">Hourly rates are set per project — open the project menu at the top and choose <strong>Manage projects</strong>.</p>
+                <div id="rp-range-presets"></div>
                 <div class="reports-filter-grid">
                     <label>Style<select id="rp-style">
                         <option value="client">Client report (hours × rate)</option>
@@ -177,7 +161,6 @@ export function renderReports(app: HTMLElement): void {
                     <label class="reports-check" id="rp-times-wrap"><input type="checkbox" id="rp-times" /> Show work times (don't pool same day)</label>
                 </div>
                 <div class="btn-row" style="margin-top:12px;">
-                    <button class="btn btn-primary" type="button" id="rp-generate">Generate</button>
                     <button class="btn btn-outline" type="button" id="rp-csv">Export CSV</button>
                     <button class="btn btn-outline" type="button" id="rp-print">Print / Save as PDF</button>
                 </div>
@@ -353,7 +336,6 @@ export function renderReports(app: HTMLElement): void {
         } else {
             renderClientReport();
         }
-        $("report-output").scrollIntoView({ behavior: "smooth", block: "start" });
     }
 
     function renderClientReport() {
@@ -414,7 +396,7 @@ export function renderReports(app: HTMLElement): void {
                 <tbody>
                     ${detailRows.map(r => `
                         <tr>
-                            <td>${escapeHtml(r.date)}</td>
+                            <td>${escapeHtml(fmtDate(r.date))}</td>
                             ${withTimes ? `<td>${escapeHtml(r.times)}</td>` : ""}
                             <td>${escapeHtml(r.projectName)}</td>
                             <td>${escapeHtml(r.note)}</td>
@@ -467,9 +449,13 @@ export function renderReports(app: HTMLElement): void {
         while (cursor.getTime() <= end.getTime()) {
             const key = localDateKey(cursor);
             const worked = workedByDay.get(key) ?? 0;
-            const target = offDaySet.has(key) ? 0 : targetHoursForDate(cursor, schedule);
-            if (worked > 0 || target > 0) {
-                rows.push({ date: key, weekday: WEEKDAY_NAMES[cursor.getDay()], worked, target, diff: worked - target });
+            const off = offDaySet.has(key);
+            const target = off ? 0 : targetHoursForDate(cursor, schedule);
+            // Off days on a scheduled workday are listed too, with their reason.
+            const listOff = off && targetHoursForDate(cursor, schedule) > 0;
+            if (worked > 0 || target > 0 || listOff) {
+                const weekday = WEEKDAY_NAMES[cursor.getDay()] + (off ? ` · ${reasonInfo(offDayReasons.get(key)).label}` : "");
+                rows.push({ date: key, weekday, worked, target, diff: worked - target });
             }
             cursor.setDate(cursor.getDate() + 1);
         }
@@ -489,7 +475,7 @@ export function renderReports(app: HTMLElement): void {
 
         const bodyRows = rows.map(r => `
             <tr>
-                <td>${escapeHtml(r.date)}</td>
+                <td>${escapeHtml(fmtDate(r.date))}</td>
                 <td>${escapeHtml(r.weekday)}</td>
                 <td class="num">${fmtHours(r.worked)}</td>
                 <td class="num">${fmtHours(r.target)}</td>
@@ -531,8 +517,8 @@ export function renderReports(app: HTMLElement): void {
                 </div>
                 <div class="report-meta">
                     ${p.letter_header ? `<div class="report-title">${escapeHtml(p.letter_header)}</div>` : `<div class="report-title">Time report</div>`}
-                    <div class="muted">${escapeHtml(from)} — ${escapeHtml(to)}</div>
-                    <div class="muted">Generated ${escapeHtml(localDateKey(new Date()))}</div>
+                    <div class="muted">${escapeHtml(fmtDate(from))} — ${escapeHtml(fmtDate(to))}</div>
+                    <div class="muted">Generated ${escapeHtml(new Date().toLocaleDateString())}</div>
                 </div>
             </div>
         `;
@@ -553,7 +539,7 @@ export function renderReports(app: HTMLElement): void {
     function exportCsv() {
         if (currentStyle() === "timesheet") {
             const rows = buildTimesheet();
-            if (rows.length === 0) { alert("No working days in this range to export."); return; }
+            if (rows.length === 0) { showToast("No working days in this range to export."); return; }
             downloadCsv(
                 ["Date", "Day", "Worked", "Target", "Difference"],
                 rows.map(r => [r.date, r.weekday, fmtHours(r.worked), fmtHours(r.target), signedHours(r.diff)]),
@@ -562,7 +548,7 @@ export function renderReports(app: HTMLElement): void {
         }
         const withTimes = ($("rp-times") as HTMLInputElement).checked;
         const rows = buildDetailRows(withTimes);
-        if (rows.length === 0) { alert("No completed shifts in this range to export."); return; }
+        if (rows.length === 0) { showToast("No completed shifts in this range to export."); return; }
         const header = withTimes
             ? ["Date", "Time", "Project", "Note", "Hours", "Currency", "Amount"]
             : ["Date", "Project", "Note", "Hours", "Currency", "Amount"];
@@ -577,10 +563,10 @@ export function renderReports(app: HTMLElement): void {
         );
     }
 
-    $("rp-generate").addEventListener("click", renderReport);
-    $("rp-style").addEventListener("change", renderReport);
-    $("rp-detailed").addEventListener("change", renderReport);
-    $("rp-times").addEventListener("change", renderReport);
+    // Every choice re-renders at once and is remembered (shared/ui/reportChoices.ts).
+    const choices = wireReportChoices($("rp-range-presets") as HTMLElement, renderReport);
+    enhanceSelects(app);
+    const savedProject = choices.restore();
     $("rp-csv").addEventListener("click", exportCsv);
     $("rp-print").addEventListener("click", () => {
         if ($("report-output").hidden) renderReport();
@@ -589,26 +575,39 @@ export function renderReports(app: HTMLElement): void {
 
     // ── Initial data load ────────────────────────────────────────────
     (async () => {
-        const [profileRes, projectsRes, shiftsRes, offDaysRes] = await Promise.all([
+        const [profileRes, projectsRes, shiftsRes, offDaysRes, scheduleRes] = await Promise.all([
             getProfile(),
             listProjects(),
             listShifts(),
             listOffDays(),
+            getRemoteSchedule().catch(() => null),
         ]);
+        // Same rule as the tracker: the newer copy wins (a schedule edited here
+        // while offline is not overwritten by an older server copy).
+        const remote = scheduleRes?.ok ? scheduleRes.data : null;
+        const localTs = localStorage.getItem("tracksuite.schedule.updatedAt");
+        if (remote?.schedule && remote.schedule_updated_at && (!localTs || remote.schedule_updated_at >= localTs)) {
+            localStorage.setItem("tracksuite.schedule", JSON.stringify(remote.schedule));
+            localStorage.setItem("tracksuite.schedule.updatedAt", remote.schedule_updated_at);
+            schedule = loadWorkSchedule();
+        }
         if (profileRes.ok && profileRes.data.profile) profile = profileRes.data.profile;
         if (projectsRes.ok) projects = projectsRes.data;
         if (shiftsRes.ok) shifts = shiftsRes.data;
-        if (offDaysRes.ok) offDaySet = new Set((offDaysRes.data as OffDayItem[]).map(o => o.date));
+        if (offDaysRes.ok) {
+            offDaySet = new Set((offDaysRes.data as OffDayItem[]).map(o => o.date));
+            offDayReasons = new Map((offDaysRes.data as OffDayItem[]).map(o => [o.date, o.reason ?? null]));
+        }
 
         fillProfileForm();
 
+        // Archived projects stay reportable (billing old work), grouped at the end.
         const sel = $("rp-project") as HTMLSelectElement;
-        for (const p of projects.filter(p => !p.archived)) {
-            const opt = document.createElement("option");
-            opt.value = p.uuid ?? "";
-            opt.textContent = p.name;
-            sel.appendChild(opt);
-        }
+        const opts = (list: typeof projects) => list.map(p => `<option value="${escapeHtml(p.uuid ?? "")}">${escapeHtml(p.name)}</option>`).join("");
+        const archived = projects.filter(p => p.archived);
+        sel.insertAdjacentHTML("beforeend", opts(projects.filter(p => !p.archived))
+            + (archived.length ? `<optgroup label="Archived">${opts(archived)}</optgroup>` : ""));
+        if (projects.some(p => p.uuid === savedProject)) sel.value = savedProject;
 
         renderReport();
     })();

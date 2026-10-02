@@ -15,6 +15,8 @@ const FLATPAK_COMMAND: &str = "tracksuite-work-desktop";
 const LINUX_AUTOSTART_FILE: &str = "TrackSuite.work.desktop";
 #[cfg(target_os = "linux")]
 const FLATPAK_AUTOSTART_FILE: &str = "com.tracksuite.work.desktop.desktop";
+/// Argument passed by every autostart entry: start in the tray, no window.
+pub const HIDDEN_ARG: &str = "--hidden";
 #[cfg(target_os = "linux")]
 const LEGACY_FLATPAK_AUTOSTART_FILES: [&str; 2] = [
     "com.tracksuite-work.desktop.desktop",
@@ -140,7 +142,7 @@ Version=1.0\n\
 Name=TrackSuite.work\n\
 GenericName=Work Time Tracker\n\
 Comment=Cross-platform work time tracking desktop app\n\
-Exec={}\n\
+Exec={} {}\n\
 Icon=tracksuite-work-desktop\n\
 Categories=Utility;Office;\n\
 Keywords=time;tracking;productivity;\n\
@@ -149,6 +151,7 @@ StartupWMClass=tracksuite-work-desktop\n\
 Terminal=false\n\
 X-GNOME-Autostart-enabled=true\n",
         desktop_entry_exec(exec_path),
+        HIDDEN_ARG,
     )
 }
 
@@ -161,7 +164,7 @@ Version=1.0\n\
 Name=TrackSuite.work\n\
 GenericName=Work Time Tracker\n\
 Comment=Cross-platform work time tracking desktop app\n\
-Exec=flatpak run --command={} {}\n\
+Exec=flatpak run --command={} {} {}\n\
 Icon={}\n\
 Categories=Utility;Office;\n\
 Keywords=time;tracking;productivity;\n\
@@ -172,6 +175,7 @@ X-Flatpak={}\n\
 X-GNOME-Autostart-enabled=true\n",
         FLATPAK_COMMAND,
         flatpak_app_id(),
+        HIDDEN_ARG,
         flatpak_app_id(),
         FLATPAK_COMMAND,
         flatpak_app_id(),
@@ -208,7 +212,7 @@ fn disable_flatpak() -> Result<(), String> {
 fn enable_linux_autostart() -> Result<(), String> {
     cleanup_linux_autostart()?;
 
-    let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exec_path = launch_path()?;
     if looks_like_dev_binary(&exec_path) {
         return Err("Autostart is only supported from packaged Linux builds, not workspace target binaries.".to_string());
     }
@@ -240,11 +244,53 @@ fn cleanup_linux_autostart() -> Result<(), String> {
         return Ok(());
     };
 
+    // An entry written by an AppImage before 0.9.3 points at the temporary
+    // /tmp/.mount_* path, which is gone after the run. When we run from an
+    // AppImage now, point the entry at the AppImage file itself.
+    if exec.contains("/.mount_") {
+        if let Some(appimage) = appimage_path() {
+            fs::write(&file, linux_autostart_entry(&appimage)).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
     if looks_like_dev_exec(exec) || absolute_exec_target_missing(exec) {
         fs::remove_file(file).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Entries from before 0.9.3 open the window at login; add --hidden so
+    // autostart launches go straight to the tray.
+    if !exec.split_whitespace().any(|arg| arg == HIDDEN_ARG) {
+        let upgraded = entry.replacen(
+            &format!("Exec={}", exec),
+            &format!("Exec={} {}", exec, HIDDEN_ARG),
+            1,
+        );
+        fs::write(&file, upgraded).map_err(|e| e.to_string())?;
     }
 
     Ok(())
+}
+
+/// The AppImage file this process runs from, if any. For an AppImage,
+/// current_exe() is a temporary /tmp/.mount_* path that vanishes after the
+/// run; the runtime puts the real file's path in $APPIMAGE.
+#[cfg(target_os = "linux")]
+fn appimage_path() -> Option<PathBuf> {
+    std::env::var_os("APPIMAGE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The path an autostart entry should launch.
+#[cfg(target_os = "linux")]
+fn launch_path() -> Result<PathBuf, String> {
+    match appimage_path() {
+        Some(path) => Ok(path),
+        None => std::env::current_exe().map_err(|e| e.to_string()),
+    }
 }
 
 #[cfg(target_os = "linux")]

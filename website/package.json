@@ -6,6 +6,7 @@
     "scripts": {
         "dev": "vite",
         "build": "tsc && vite build",
+        "test:shared": "node --test \"../shared/*.test.ts\"",
         "preview": "vite preview"
     },
     "devDependencies": {

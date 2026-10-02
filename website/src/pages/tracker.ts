@@ -1,4 +1,5 @@
 import Chart from "chart.js/auto";
+import { escapeHtml, csvCell } from "../../../shared/text.ts";
 import {
     getToken,
     listShifts,
@@ -8,6 +9,7 @@ import {
     listOffDays,
     createOffDay,
     deleteOffDay,
+    updateOffDay,
     listProjects,
     createProject,
     updateProject,
@@ -19,7 +21,24 @@ import {
     type ProjectItem
 } from "../api";
 import { navigate } from "../router";
+import { getThemePreference, setThemePreference } from "../nav";
 import { getMode, setMode, isFullMode } from "../mode";
+import {
+    addDays, bucketKey, bucketLabel, dayKeyOf, dayStart, endOfLastCompleteWeek, formatDuration, formatSigned,
+    localDateKey, localIso, shiftHoursByDay, splitAcrossDays, startOfWeek, weekKey,
+} from "../../../shared/time.ts";
+import { buildProjectStackDatasets, stackedBarTopRadius, stackedTotalTooltip } from "../../../shared/charts.ts";
+import { findGaps, planAssignRange, planCoalesce, overlapping, suggestManualShift, validateTimeEdits, type PlanShift } from "../../../shared/shifts.ts";
+import { createTimeline, type TimelineHandle } from "../../../shared/ui/timeline.ts";
+import { showToast } from "../../../shared/ui/toast.ts";
+import { pushUndo } from "../../../shared/ui/undo.ts";
+import { showOffDayMenu } from "../../../shared/ui/menu.ts";
+import { reasonInfo, summarizeReasons } from "../../../shared/offdays.ts";
+import { createFocusRing, renderFocusSettings } from "../../../shared/ui/focus.ts";
+import { renderPresets } from "../../../shared/ui/presets.ts";
+import { mountReports } from "./reports";
+import { enhanceSelects } from "../../../shared/ui/select.ts";
+import "../../../shared/ui/ui.css";
 
 // ── Project helpers (module-level, pure) ─────────────────────────────
 const PROJECT_PALETTE = [
@@ -34,16 +53,6 @@ function unassignedColor(): string {
         .getPropertyValue("--project-unassigned").trim() || UNASSIGNED_FALLBACK;
 }
 
-function escapeHtml(value: string): string {
-    return value.replace(/[&<>"']/g, (ch) => (
-        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!
-    ));
-}
-
-function csvCell(v: string): string {
-    return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
-}
-
 /** Readable text color for a given #rrggbb background. */
 function contrastText(color: string): string {
     const m = /#?([0-9a-f]{6})/i.exec(color.trim());
@@ -53,20 +62,6 @@ function contrastText(color: string): string {
     return lum > 0.6 ? "#1f2937" : "#ffffff";
 }
 
-function formatTimeFromMinutes(minutes: number): string {
-    // Round to whole minutes: block-click selections carry fractional minutes
-    // (derived from second-precision timestamps) that would otherwise render as
-    // "09:03.7833333333".
-    const total = Math.round(minutes);
-    const h = Math.floor(total / 60);
-    const m = total % 60;
-    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-}
-
-function parseLocalDayStartMs(dateKey: string): number {
-    const [y, mo, d] = dateKey.split("-").map(Number);
-    return new Date(y, mo - 1, d, 0, 0, 0, 0).getTime();
-}
 
 // ── Types ────────────────────────────────────────────────────────────
 interface WorkSchedule {
@@ -116,74 +111,17 @@ function saveWorkSchedule(s: WorkSchedule) {
 }
 
 // ── Time & Date Helpers ──────────────────────────────────────────────
-function formatDuration(hours: number): string {
-    const h = Math.floor(Math.abs(hours));
-    const m = Math.round((Math.abs(hours) - h) * 60);
-    const sign = hours < 0 ? "-" : "";
-    return m > 0 ? `${sign}${h}h ${m}m` : `${sign}${h}h`;
-}
-
-function formatSigned(hours: number): string {
-    const prefix = hours >= 0 ? "+" : "";
-    return prefix + formatDuration(hours);
-}
-
 function shiftDurationHours(s: ShiftItem): number {
     const start = new Date(s.start_time).getTime();
     const end = s.end_time ? new Date(s.end_time).getTime() : Date.now();
     return (end - start) / 3_600_000;
 }
 
-function toDateKey(iso: string): string {
-    return iso.slice(0, 10);
-}
-
-function localDateKey(d: Date): string {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
-}
-
-// Shift timestamps are stored as naive local wall clock ("2026-07-15T09:00:00",
-// no zone) to match what the desktop app writes — never toISOString(), which
-// emits UTC "Z" and produced mixed-frame shifts that 500'd /stats/daily-hours/.
-// Reading side already parses zoneless date-times as local via new Date(...).
-function localIso(d: Date): string {
-    const h = String(d.getHours()).padStart(2, "0");
-    const min = String(d.getMinutes()).padStart(2, "0");
-    const s = String(d.getSeconds()).padStart(2, "0");
-    return `${localDateKey(d)}T${h}:${min}:${s}`;
-}
-
-function weekStartDate(): Date {
-    const now = new Date();
-    const day = now.getDay();
-    const diff = day === 0 ? 6 : day - 1; // Monday start
-    const d = new Date(now);
-    d.setHours(0, 0, 0, 0);
-    d.setDate(d.getDate() - diff);
-    return d;
-}
-
-function addDays(d: Date, n: number): Date {
-    const r = new Date(d);
-    r.setDate(r.getDate() + n);
-    return r;
-}
-
-function weekKey(d: Date): string {
-    const jan1 = new Date(d.getFullYear(), 0, 1);
-    const days = Math.floor((d.getTime() - jan1.getTime()) / 86_400_000);
-    const wn = Math.ceil((days + jan1.getDay() + 1) / 7);
-    return `${d.getFullYear()}-W${String(wn).padStart(2, "0")}`;
-}
-
-function bucketKey(d: Date, granularity: string): string {
-    if (granularity === "week") return weekKey(d);
-    if (granularity === "month") return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-    return localDateKey(d);
-}
+// Shift timestamps are written as naive local wall clock via localIso() (see
+// shared/time.ts) — never toISOString(), which emits UTC "Z" and produced
+// mixed-frame shifts that 500'd /stats/daily-hours/. Every write re-encodes the
+// start too (localIso(new Date(start))), so a legacy "Z" start never ends up
+// paired with a local end on the same row.
 
 function getTargetHoursForDate(d: Date, s: WorkSchedule): number {
     const day = d.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
@@ -242,7 +180,16 @@ let activePointerMove: ((e: MouseEvent | TouchEvent) => void) | null = null;
 let activePointerUp: (() => void) | null = null;
 let activeDocClick: ((e: MouseEvent) => void) | null = null;
 
-export function renderTracker(app: HTMLElement): void {
+/** Chart axis/grid colours from the current theme's CSS variables. */
+function chartThemeColors(): { text: string; grid: string } {
+    const css = getComputedStyle(document.documentElement);
+    return {
+        text: css.getPropertyValue("--text-secondary").trim() || "#4b5563",
+        grid: css.getPropertyValue("--border-subtle").trim() || "#e5e7eb",
+    };
+}
+
+export function renderTracker(app: HTMLElement): (() => void) | void {
     if (!getToken()) {
         navigate("#/login");
         return;
@@ -260,16 +207,22 @@ export function renderTracker(app: HTMLElement): void {
 
     app.innerHTML = `
         <div class="dashboard">
-            <div class="dashboard-header">
-                <h2>Time Tracker</h2>
-                <p>Clock in/out, view analytics, and manage settings inside the browser app.</p>
-            </div>
+            <p id="offline-banner" class="offline-banner" role="status" hidden></p>
 
-            <!-- Tabbed Navigation -->
-            <div class="tabs-nav">
-                <button class="tab-link active" data-target="dashboard">Dashboard</button>
-                <button class="tab-link" data-target="statistics">Statistics</button>
-                <button class="tab-link" data-target="settings">Settings</button>
+            <!-- Same layout as the desktop app: tabs, project, focus timer and
+                 clock in one bar that stays at the top while the page scrolls. -->
+            <div class="tracker-bar">
+                <div class="tabs-nav">
+                    <button class="tab-link active" data-target="dashboard">Dashboard</button>
+                    <button class="tab-link" data-target="statistics">Statistics</button>
+                    ${isFullMode() ? `<button class="tab-link" data-target="reports">Reports</button>` : ""}
+                    <button class="tab-link" data-target="settings">Settings</button>
+                </div>
+                <div class="tracker-actions">
+                    <div class="project-chip-wrap" id="project-chip-wrap"></div>
+                    <span id="focus-wrap" class="focus-wrap"></span>
+                    <button class="btn btn-primary" id="btn-clock-action" type="button">Clock In</button>
+                </div>
             </div>
 
             <!-- ═══ Tab: Dashboard ═══ -->
@@ -277,98 +230,60 @@ export function renderTracker(app: HTMLElement): void {
                 <!-- Stats Grid -->
                 <div class="stats-grid">
                     <div class="stat-card" id="card-today">
-                        <h4>Worked Today</h4>
+                        <h4>Today</h4>
                         <div class="stat-value" id="hours-today">0h</div>
+                        <p class="stat-sub" id="today-sub"></p>
                     </div>
                     <div class="stat-card" id="card-week">
-                        <h4>Worked This Week</h4>
+                        <h4>This week</h4>
                         <div class="stat-value" id="hours-week">0h</div>
                     </div>
-                    <div class="stat-card" id="card-shifts">
-                        <h4>Shifts Logged</h4>
-                        <div class="stat-value" id="shifts-count">0</div>
+                    <div class="stat-card" id="card-status">
+                        <h4>Status</h4>
+                        <div class="stat-value" id="clock-status">Idle</div>
+                        <input type="text" id="running-note" class="running-note" maxlength="500" placeholder="What are you working on?" autocomplete="off" hidden>
                     </div>
                 </div>
 
                 <!-- Auto-closed shift notice (shifts left running, closed by the server) -->
                 <div id="auto-closed-banner" class="auto-closed-banner" hidden></div>
 
-                <!-- Tracker Clock Console -->
-                <div class="clock-panel" id="clock-console">
-                    <span class="badge" id="clock-status">IDLE</span>
-                    <div class="clock-timer" id="clock-timer">00:00:00</div>
-                    <div class="project-chip-wrap" id="project-chip-wrap"></div>
-                    <div class="btn-row">
-                        <button class="btn btn-primary" id="btn-clock-action" type="button">Clock In</button>
-                        <button class="btn btn-danger" id="btn-clock-discard" type="button" style="display:none;">Discard Current</button>
-                        <button class="btn btn-outline" id="btn-add-manual" type="button">Log Shift Manually</button>
-                        <button class="btn btn-outline" id="btn-jump-offdays" type="button" title="Jump to the off-days calendar">Off days ↓</button>
-                    </div>
-
-                    <div class="progress-container">
-                        <div class="progress-header">
-                            <span>Weekly Progress</span>
-                            <span id="week-target-text">Target: 36h</span>
-                        </div>
-                        <div class="progress-wrap">
-                            <div class="progress-bar" id="week-bar" style="width: 0%;"></div>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- Performance Chart -->
                 <div class="chart-panel">
-                    <h3>Weekly Performance</h3>
+                    <div class="section-row week-head">
+                        <h3>This week</h3>
+                        <span class="muted" id="week-target-text">Target: 36h</span>
+                    </div>
+                    <div class="progress-wrap">
+                        <div class="progress-bar" id="week-bar" style="width: 0%;"></div>
+                    </div>
                     <div style="position: relative; height: 260px; width: 100%;">
                         <canvas id="weekly-chart"></canvas>
                     </div>
                 </div>
 
-                <!-- Day Timeline Editor -->
+                <!-- Day timeline (shared/ui/timeline.ts) -->
                 <div class="chart-panel" id="timeline-editor-panel">
                     <div class="panel-title-row">
-                        <h3>Day Timeline Editor</h3>
-                        <span class="help-hint" tabindex="0" title="Click a bar in Weekly Performance to pick a day. Drag across the track to select a range (or click a segment to select it); drag the selection to move it, or its edges to resize. Then Assign a project — or Remove / press Delete to clear an assignment.">ⓘ</span>
-                        <span class="muted" id="timeline-day-label" style="margin-left:auto;"></span>
+                        <h3>Day</h3>
+                        <button type="button" class="btn btn-outline btn-small" id="btn-back-to-stats" hidden>← Back to Statistics</button>
                     </div>
-                    <div class="timeline-editor-wrapper" id="timeline-editor-wrapper">
-                        <div class="timeline-ticks" id="timeline-ticks"></div>
-                        <div class="timeline-container" id="timeline-container">
-                            <div class="timeline-track" id="timeline-track">
-                                <div class="timeline-selection" id="timeline-selection" style="display:none;">
-                                    <div class="timeline-handle handle-left" id="handle-left"></div>
-                                    <div class="timeline-handle handle-right" id="handle-right"></div>
-                                </div>
-                            </div>
-                        </div>
-                        <p class="timeline-empty" id="timeline-empty" hidden>No shifts recorded on this day.</p>
-                    </div>
-                    <div class="timeline-controls">
-                        <span class="timeline-selection-label" id="timeline-selection-label">No range selected. Drag on the timeline above to select.</span>
-                        <div class="timeline-actions">
-                            <select id="timeline-project-select" class="timeline-project-select" disabled></select>
-                            <button class="btn btn-primary btn-small" id="btn-timeline-assign" disabled>Assign</button>
-                            <button class="btn btn-outline btn-small" id="btn-timeline-remove" disabled title="Clear the project from this range (or press Delete)">Remove</button>
-                        </div>
-                    </div>
-                    <div class="timeline-brush" id="timeline-brush">
-                        <button class="btn btn-outline btn-small" id="btn-brush-toggle" type="button" title="Paint a note onto shift blocks">🖌 Note brush</button>
-                        <input type="text" id="timeline-brush-note" class="timeline-brush-input" placeholder="Turn on the brush, type a note, then click blocks to stamp it" maxlength="500" disabled />
-                        <span class="muted timeline-brush-hint" id="timeline-brush-hint"></span>
-                    </div>
+                    <div id="timeline-root"></div>
                 </div>
 
                 <!-- Shifts History Section -->
                 <section class="dash-section">
                     <div class="section-row" style="display:flex; justify-content:space-between; align-items:center;">
-                        <h3>Recent Shifts</h3>
-                        <button class="btn btn-outline btn-small" id="btn-export-csv" type="button">Export CSV</button>
+                        <h3>Recent shifts</h3>
+                        <div class="btn-row">
+                            <button class="btn btn-outline btn-small" id="btn-add-manual" type="button">+ Add shift</button>
+                            <button class="btn btn-outline btn-small" id="btn-jump-offdays" type="button" title="Jump to the off-days calendar">Off days ↓</button>
+                        </div>
                     </div>
                     <div class="table-wrapper">
                         <table class="sessions-table">
                             <thead>
                                 <tr>
-                                    <th>Date</th>
                                     <th>Start</th>
                                     <th>End</th>
                                     <th>Duration</th>
@@ -379,7 +294,7 @@ export function renderTracker(app: HTMLElement): void {
                             </thead>
                             <tbody id="shift-table-body">
                                 <tr>
-                                    <td colspan="7" class="muted" style="text-align:center; padding: 24px;">Loading shift history…</td>
+                                    <td colspan="6" class="muted" style="text-align:center; padding: 24px;">Loading shift history…</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -400,7 +315,7 @@ export function renderTracker(app: HTMLElement): void {
                         <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
                     </div>
                     <div class="calendar-grid" id="offcal-grid" style="display:grid; grid-template-columns:repeat(7, 1fr); gap:6px;"></div>
-                    <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Click a single day to toggle it.</p>
+                    <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Right-click a day to give it a reason (vacation, sick leave, …).</p>
                 </section>
             </div>
 
@@ -417,7 +332,7 @@ export function renderTracker(app: HTMLElement): void {
                         <div class="stat-value" id="avg-weekly">0h</div>
                     </div>
                     <div class="stat-card" id="overtime-card">
-                        <h4>Overtime Balance</h4>
+                        <h4>Overtime</h4>
                         <div class="stat-value" id="overtime-val">0h</div>
                     </div>
                 </div>
@@ -425,8 +340,11 @@ export function renderTracker(app: HTMLElement): void {
                 <!-- Averages Controls -->
                 <section class="panel">
                     <div class="panel-header">
-                        <h2>Averages Calculations</h2>
+                        <h2>Averages</h2>
                     </div>
+                    <div id="avg-presets"></div>
+                    <details class="ui-custom">
+                    <summary>Custom range</summary>
                     <div class="control-row">
                         <label class="ctrl">Period
                             <select id="stats-unit">
@@ -439,8 +357,11 @@ export function renderTracker(app: HTMLElement): void {
                         <label class="ctrl" id="stats-count-wrap">Count
                             <input type="number" id="stats-count" value="4" min="1" max="365">
                         </label>
-                        <label class="ctrl toggle-label" style="margin-top:20px;">
-                            <input type="checkbox" id="stats-holidays" checked>
+                    </div>
+                    </details>
+                    <div class="control-row">
+                        <label class="ctrl toggle-label">
+                            <input type="checkbox" id="stats-holidays">
                             <span>Credit expected hours on scheduled off-days</span>
                         </label>
                     </div>
@@ -449,47 +370,49 @@ export function renderTracker(app: HTMLElement): void {
 
                 <!-- Trends Chart -->
                 <div class="chart-panel">
-                        <div class="section-row" style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
-                            <h3>Performance Trends</h3>
-                            <div class="control-row" style="margin-bottom:0; gap:8px;">
-                                <label class="ctrl" style="font-size:0.75rem;">Show last
-                                    <input type="number" id="trend-count" value="7" min="1" max="90" style="padding:4px 8px; width:70px;">
+                        <h3>Trends</h3>
+                        <div id="trend-presets"></div>
+                        <details class="ui-custom">
+                            <summary>Custom range</summary>
+                            <div class="control-row" style="gap:8px;">
+                                <label class="ctrl">Show last
+                                    <input type="number" id="trend-count" value="7" min="1" max="365" style="width:80px;">
                                 </label>
-                                <label class="ctrl" style="font-size:0.75rem;">Unit
-                                    <select id="trend-unit" style="padding:4px 8px;">
+                                <label class="ctrl">Unit
+                                    <select id="trend-unit">
                                         <option value="days" selected>Days</option>
                                         <option value="weeks">Weeks</option>
                                         <option value="months">Months</option>
                                     </select>
                                 </label>
-                                <label class="ctrl" style="font-size:0.75rem;">Group By
-                                    <select id="trend-granularity" style="padding:4px 8px;">
+                                <label class="ctrl">Group by
+                                    <select id="trend-granularity">
                                         <option value="day" selected>Day</option>
                                         <option value="week">Week</option>
                                         <option value="month">Month</option>
                                     </select>
                                 </label>
                             </div>
-                        </div>
+                        </details>
                         <div style="position: relative; height: 260px; width: 100%;">
                             <canvas id="trend-chart"></canvas>
                         </div>
-                        <p class="trend-hint muted">Click a bar to edit that day’s sessions — week/month bars zoom in first.</p>
+                        <p class="trend-hint muted">Click a day to open it — week and month bars zoom in first.</p>
                         <div class="project-summary" id="project-summary"></div>
                 </div>
 
-                <!-- Slide-down day editor: drill into any day from the trend chart -->
+                <!-- Zoomed trend view: breadcrumbs back out -->
                 <div id="trend-drill-panel" class="trend-drill-panel" hidden>
                     <div class="trend-drill-head">
                         <div class="trend-drill-crumbs" id="trend-drill-crumbs"></div>
                         <button type="button" class="btn btn-outline trend-drill-close" id="trend-drill-close">Close</button>
                     </div>
-                    <div class="trend-drill-slot" id="trend-drill-slot">
-                        <p class="muted trend-drill-empty" id="trend-drill-empty">Click a day bar above to edit that day’s sessions.</p>
-                    </div>
                 </div>
 
             </div>
+
+            <!-- ═══ Tab: Reports (Full mode; filled when opened) ═══ -->
+            <div class="tab-page tab-hidden" id="tab-reports"></div>
 
             <!-- ═══ Tab: Settings ═══ -->
             <div class="tab-page tab-hidden" id="tab-settings">
@@ -512,7 +435,7 @@ export function renderTracker(app: HTMLElement): void {
                 <!-- Work Schedule settings -->
                 <section class="panel">
                     <div class="panel-header">
-                        <h2>Work Schedule Configuration</h2>
+                        <h2>Work schedule</h2>
                         <p class="muted">Set the target hours for each workday. Set non-working days (e.g. Sat/Sun) to 0.0.</p>
                     </div>
                     <div class="schedule-hours-grid">
@@ -524,22 +447,38 @@ export function renderTracker(app: HTMLElement): void {
                         <label class="schedule-hour-row"><span>Saturday</span><input type="number" id="cfg-hours-sat" min="0" step="0.1" max="24" /></label>
                         <label class="schedule-hour-row"><span>Sunday</span><input type="number" id="cfg-hours-sun" min="0" step="0.1" max="24" /></label>
                     </div>
-                    <div class="btn-row">
-                        <button class="btn btn-primary" id="btn-save-schedule" type="button">Save Work Schedule</button>
-                        <span id="schedule-status-text" style="color: var(--success); font-size:0.9rem; align-self:center; display:none; margin-left: 12px;">Saved ✓</span>
+                    <p class="muted" id="schedule-status-text" role="status"></p>
+                </section>
+
+                <!-- Focus timer (shared/ui/focus.ts) -->
+                <section class="panel">
+                    <div class="panel-header">
+                        <h2>Focus timer</h2>
+                        <p class="muted">An optional timer for focus and breaks. It sits next to the clock button and never starts a round by itself.</p>
                     </div>
+                    <div id="focus-settings"></div>
+                </section>
+
+                <!-- Your data -->
+                <section class="panel">
+                    <div class="panel-header">
+                        <h2>Your data</h2>
+                        <p class="muted">All your shifts (with project and note) and off days as a CSV file. The full account export (JSON) is on the Account page.</p>
+                    </div>
+                    <button class="btn btn-outline btn-small" id="btn-export-csv" type="button">Export CSV</button>
                 </section>
 
                 <!-- Appearance Panel -->
                 <section class="panel">
                     <div class="panel-header">
-                        <h2>Theme and Aesthetics</h2>
+                        <h2>Appearance</h2>
                     </div>
                     <div class="control-row">
-                        <label class="ctrl">Palette Mode
+                        <label class="ctrl">Theme
                             <select id="cfg-theme-select">
-                                <option value="light">Light Mode</option>
-                                <option value="dark">Dark Mode</option>
+                                <option value="system">Same as system</option>
+                                <option value="light">Light</option>
+                                <option value="dark">Dark</option>
                             </select>
                         </label>
                     </div>
@@ -604,8 +543,9 @@ export function renderTracker(app: HTMLElement): void {
 
     // ── Wire DOM Controls ────────────────────────────────────────────
     const clockBtn = document.getElementById("btn-clock-action") as HTMLButtonElement;
-    const discardBtn = document.getElementById("btn-clock-discard") as HTMLButtonElement;
     const addManualBtn = document.getElementById("btn-add-manual") as HTMLButtonElement;
+    const runningNote = document.getElementById("running-note") as HTMLInputElement;
+    const BASE_TITLE = document.title;
 
     const dlgShift = document.getElementById("dlg-shift") as HTMLDialogElement;
     const formShift = document.getElementById("form-shift") as HTMLFormElement;
@@ -635,13 +575,19 @@ export function renderTracker(app: HTMLElement): void {
     // last-write-wins, keyed by a stored server timestamp.
     const SCHEDULE_TS_KEY = "tracksuite.schedule.updatedAt";
 
-    async function persistSchedule(schedule: WorkSchedule) {
+    /** Save locally and to the server; true when the server has it too. */
+    async function persistSchedule(schedule: WorkSchedule): Promise<boolean> {
         saveWorkSchedule(schedule);
         currentSchedule = schedule;
         localStorage.setItem(SCHEDULE_TS_KEY, new Date().toISOString()); // provisional
-        const resp = await saveRemoteSchedule(schedule as unknown as Record<string, number>);
-        if (resp.ok && resp.data?.schedule_updated_at) {
-            localStorage.setItem(SCHEDULE_TS_KEY, resp.data.schedule_updated_at);
+        try {
+            const resp = await saveRemoteSchedule(schedule as unknown as Record<string, number>);
+            if (resp.ok && resp.data?.schedule_updated_at) {
+                localStorage.setItem(SCHEDULE_TS_KEY, resp.data.schedule_updated_at);
+            }
+            return resp.ok;
+        } catch {
+            return false;
         }
     }
 
@@ -680,7 +626,21 @@ export function renderTracker(app: HTMLElement): void {
     const trendUnitEl = document.getElementById("trend-unit") as HTMLSelectElement;
     const trendGranEl = document.getElementById("trend-granularity") as HTMLSelectElement;
 
-    const statsHandler = () => refreshData();
+    // One-click ranges; the selects stay under "Custom range".
+    const highlightAvgPresets = renderPresets(document.getElementById("avg-presets")!, [
+        { label: "Last 4 weeks", values: { "stats-unit": "weeks", "stats-count": "4" } },
+        { label: "Last 12 weeks", values: { "stats-unit": "weeks", "stats-count": "12" } },
+        { label: "Last 6 months", values: { "stats-unit": "months", "stats-count": "6" } },
+        { label: "Year to date", values: { "stats-unit": "ytd" } },
+    ], () => void refreshData());
+    const highlightTrendPresets = renderPresets(document.getElementById("trend-presets")!, [
+        { label: "7 days", values: { "trend-count": "7", "trend-unit": "days", "trend-granularity": "day" } },
+        { label: "30 days", values: { "trend-count": "30", "trend-unit": "days", "trend-granularity": "day" } },
+        { label: "12 weeks", values: { "trend-count": "12", "trend-unit": "weeks", "trend-granularity": "week" } },
+        { label: "12 months", values: { "trend-count": "12", "trend-unit": "months", "trend-granularity": "month" } },
+    ], () => { trendDrillStack = []; void refreshData(); });
+
+    const statsHandler = () => { highlightAvgPresets(); void refreshData(); };
     [statsUnitEl, statsCountEl, statsHolidaysEl].forEach(el => {
         el.addEventListener("change", statsHandler);
     });
@@ -688,9 +648,8 @@ export function renderTracker(app: HTMLElement): void {
     // active drill so the fresh selection isn't overridden by a stale level.
     [trendCountEl, trendUnitEl, trendGranEl].forEach(el => {
         el.addEventListener("change", () => {
-            restoreEditorHome();
             trendDrillStack = [];
-            drillDay = null;
+            highlightTrendPresets();
             void refreshData();
         });
     });
@@ -706,25 +665,9 @@ export function renderTracker(app: HTMLElement): void {
 
     // Theme selector setup
     const themeSelect = document.getElementById("cfg-theme-select") as HTMLSelectElement;
-    const currentTheme = document.documentElement.classList.contains("dark") ? "dark" : "light";
-    themeSelect.value = currentTheme;
+    themeSelect.value = getThemePreference();
     themeSelect.addEventListener("change", () => {
-        const theme = themeSelect.value;
-        const iconBtn = document.getElementById("theme-toggle");
-        if (theme === "dark") {
-            document.documentElement.classList.add("dark");
-            document.documentElement.classList.remove("light");
-            localStorage.setItem("theme", "dark");
-        } else {
-            document.documentElement.classList.add("light");
-            document.documentElement.classList.remove("dark");
-            localStorage.setItem("theme", "light");
-        }
-        // Dispatch click to update icons in nav menu
-        if (iconBtn) {
-            // Trigger theme repaint
-            refreshData();
-        }
+        setThemePreference(themeSelect.value as "system" | "light" | "dark");
     });
 
     // Tab Switching logic
@@ -732,19 +675,14 @@ export function renderTracker(app: HTMLElement): void {
         link.addEventListener("click", () => {
             const btn = link as HTMLButtonElement;
             const target = btn.dataset.target;
-            // The trend drill borrows the timeline-editor panel into the Statistics
-            // tab; send it home before showing any other tab (esp. the dashboard,
-            // which owns it), or it gets stranded in the hidden stats slot.
-            if (target !== "statistics") {
-                restoreEditorHome();
-                trendDrillStack = [];
-                drillDay = null;
-                const empty = document.getElementById("trend-drill-empty");
-                if (empty) empty.hidden = false;
-                syncDrillUI();
+            // "Back to Statistics" only makes sense right after opening a day from there.
+            if (target !== "dashboard") {
+                const back = document.getElementById("btn-back-to-stats");
+                if (back) back.hidden = true;
             }
             tabLinks.forEach(l => l.classList.remove("active"));
             btn.classList.add("active");
+            history.replaceState(null, "", target === "dashboard" ? "#/tracker" : `#/tracker?tab=${target}`);
 
             tabPages.forEach(page => {
                 if (page.id === `tab-${target}`) {
@@ -753,6 +691,9 @@ export function renderTracker(app: HTMLElement): void {
                     page.classList.add("tab-hidden");
                 }
             });
+
+            // Reports load fresh data each time the tab is opened.
+            if (target === "reports") mountReports(document.getElementById("tab-reports")!);
 
             // Re-render charts upon target switch
             if (target === "dashboard" || target === "statistics") {
@@ -772,33 +713,9 @@ export function renderTracker(app: HTMLElement): void {
     let projectsCached: ProjectItem[] = [];
     let currentProjectUuid: string | null = localStorage.getItem(CURRENT_PROJECT_KEY) || null;
 
-    // Timeline editor state (minutes-since-midnight of the selected day).
+    // The day shown in the timeline (shared component; see buildTimeline()).
     let timelineDayKey = localDateKey(new Date());
-    let timelineSpanStart = 8 * 60;
-    let timelineSpanEnd = 18 * 60;
-    let timelineHasShifts = false;
-    let timelineSelStartMin = 0;
-    let timelineSelEndMin = 0;
-    let timelineStartMin: number | null = null;
-    let timelineEndMin: number | null = null;
-    let tlDragStartMin = 0;
-    let tlDragging = false;
-    let tlResizeL = false;
-    let tlResizeR = false;
-    let tlMoving = false;
-    let tlMoveGrab = 0;
-    let tlMoveOrigStart = 0;
-    let tlMoveOrigEnd = 0;
-    let timelineBlocks: { startMin: number; endMin: number; projectUuid: string | null }[] = [];
-    // Note-brush state: when active, timeline blocks become clickable/draggable
-    // to "stamp" the brush note onto their shift (range-drag is suppressed).
-    let brushActive = false;
-    let brushPainting = false;
-    let brushDirty = false;
-    // In-flight note writes from the current brush stroke. The brush-end
-    // refreshData() must await these, else its GET can race ahead of the PUTs
-    // and revert the freshly-stamped notes.
-    let brushPending: Promise<unknown>[] = [];
+    let timeline: TimelineHandle | null = null;
 
     function projectById(uuid: string | null | undefined): ProjectItem | null {
         if (!uuid) return null;
@@ -820,18 +737,36 @@ export function renderTracker(app: HTMLElement): void {
     }
 
     // Switch the sticky current project; auto-split the running shift (client-side).
+    // One switch at a time: a second key press while the first is still saving
+    // would split the same (stale) shift twice and leave two shifts open.
+    let switchInFlight = false;
     async function switchToProject(projectUuid: string | null) {
+        if (switchInFlight || dataStale) return;
+        switchInFlight = true;
+        try {
+            await doSwitchToProject(projectUuid);
+        } catch {
+            setDataStale(true);
+        } finally {
+            switchInFlight = false;
+        }
+    }
+    async function doSwitchToProject(projectUuid: string | null) {
         currentProjectUuid = projectUuid;
         localStorage.setItem(CURRENT_PROJECT_KEY, projectUuid ?? "");
         if (activeShiftCached && (activeShiftCached.project_uuid ?? null) !== projectUuid) {
             const startMs = new Date(activeShiftCached.start_time).getTime();
             const nowMs = Date.now();
-            if (nowMs - startMs < 1000) {
-                await updateShift(activeShiftCached.id, activeShiftCached.start_time, null, projectUuid);
+            const startIso = localIso(new Date(startMs));
+            // Within the first minute just retag, so a quick correction after
+            // clock-in doesn't leave a few-second fragment.
+            if (nowMs - startMs < 60_000) {
+                await updateShift(activeShiftCached.id, startIso, null, projectUuid);
             } else {
                 const nowIso = localIso(new Date(nowMs));
-                await updateShift(activeShiftCached.id, activeShiftCached.start_time, nowIso, activeShiftCached.project_uuid ?? null);
-                await createShift(nowIso, null, projectUuid);
+                const closed = await updateShift(activeShiftCached.id, startIso, nowIso, activeShiftCached.project_uuid ?? null);
+                // Only open the next segment if the close landed, or two shifts would be open.
+                if (closed.ok) await createShift(nowIso, null, projectUuid);
             }
         }
         await refreshData();
@@ -925,9 +860,22 @@ export function renderTracker(app: HTMLElement): void {
             currencyEl?.addEventListener("change", save);
             archEl.addEventListener("change", save);
             row.querySelector(".pm-delete")!.addEventListener("click", async () => {
-                if (!confirm("Delete this project? Its shifts keep their time but become Unassigned.")) return;
-                await deleteProject(id);
+                // Delete at once; Undo recreates the project and re-tags its shifts.
+                const proj = projectsCached.find(p => p.id === id);
+                if (!proj) return;
+                const tagged = shiftsCached.filter(s => s.project_uuid && s.project_uuid === proj.uuid).map(s => ({ ...s }));
+                const res = await deleteProject(id);
+                if (!res.ok) { showToast("Couldn't delete the project.", { tone: "error" }); return; }
                 await reloadProjects(); renderProjectsManageList(); renderProjectChip(); await refreshData();
+                pushUndo(`Deleted project ${proj.name}`, async () => {
+                    const again = await createProject(proj.name, proj.color ?? nextProjectColor());
+                    if (!again.ok || !again.data?.uuid) throw new Error("server error");
+                    if (again.data.id && (proj.archived || proj.rate || proj.currency)) {
+                        await updateProject(again.data.id, { name: proj.name, color: proj.color ?? "", archived: proj.archived, rate: proj.rate ?? null, currency: proj.currency ?? null });
+                    }
+                    for (const s of tagged) await updateShift(s.id, localIso(new Date(s.start_time)), s.end_time ? localIso(new Date(s.end_time)) : null, again.data.uuid);
+                    await reloadProjects(); renderProjectsManageList(); renderProjectChip(); await refreshData();
+                });
             });
         });
     }
@@ -937,205 +885,229 @@ export function renderTracker(app: HTMLElement): void {
     }
 
     // ── Client-side split + coalesce (server has no atomic endpoint) ──
+    // The rules live in shared/shifts.ts (same as the desktop's Rust): split
+    // pieces keep their note, and touching shifts merge only when project AND
+    // note match, scoped to the edited day(s) so old history is never rewritten.
+    const toPlanShift = (s: ShiftItem): PlanShift => ({
+        key: s.id,
+        startMs: new Date(s.start_time).getTime(),
+        endMs: s.end_time ? new Date(s.end_time).getTime() : null,
+        project: s.project_uuid ?? null,
+        note: s.note ?? null,
+    });
+
     async function assignRangeMs(rangeStartMs: number, rangeEndMs: number, projectUuid: string | null) {
         if (rangeStartMs >= rangeEndMs) return;
-        const overlapping = shiftsCached.filter(s => s.end_time && new Date(s.start_time).getTime() < rangeEndMs && new Date(s.end_time).getTime() > rangeStartMs);
-        for (const s of overlapping) {
-            const sMs = new Date(s.start_time).getTime();
-            const eMs = new Date(s.end_time!).getTime();
-            const oStart = Math.max(sMs, rangeStartMs);
-            const oEnd = Math.min(eMs, rangeEndMs);
-            if (oStart >= oEnd) continue;
-            const segs: { start: number; end: number; proj: string | null }[] = [];
-            if (sMs < oStart) segs.push({ start: sMs, end: oStart, proj: s.project_uuid ?? null });
-            segs.push({ start: oStart, end: oEnd, proj: projectUuid });
-            if (oEnd < eMs) segs.push({ start: oEnd, end: eMs, proj: s.project_uuid ?? null });
-            await updateShift(s.id, localIso(new Date(segs[0].start)), localIso(new Date(segs[0].end)), segs[0].proj);
-            for (const seg of segs.slice(1)) {
-                await createShift(localIso(new Date(seg.start)), localIso(new Date(seg.end)), seg.proj);
-            }
+        const plan = planAssignRange(shiftsCached.map(toPlanShift), rangeStartMs, rangeEndMs, projectUuid);
+        for (const u of plan.updates) {
+            await updateShift(u.key, localIso(new Date(u.startMs)), localIso(new Date(u.endMs)), u.project);
+        }
+        for (const c of plan.creates) {
+            await createShift(localIso(new Date(c.startMs)), localIso(new Date(c.endMs)), c.project, c.note);
         }
         const fresh = await listShifts();
-        if (fresh.ok) await coalesceShifts(fresh.data || []);
+        if (fresh.ok) await coalesceShifts(fresh.data || [], rangeStartMs, rangeEndMs);
         await refreshData();
     }
 
-    async function coalesceShifts(list: ShiftItem[]) {
-        const closed = list.filter(s => s.end_time).sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime());
-        let i = 0;
-        while (i < closed.length) {
-            const keep = closed[i];
-            let mergedEndMs = new Date(keep.end_time!).getTime();
-            const toDelete: ShiftItem[] = [];
-            let j = i + 1;
-            while (j < closed.length) {
-                const cur = closed[j];
-                if (new Date(cur.start_time).getTime() === mergedEndMs && (cur.project_uuid ?? null) === (keep.project_uuid ?? null)) {
-                    mergedEndMs = new Date(cur.end_time!).getTime();
-                    toDelete.push(cur); j++;
-                } else break;
-            }
-            if (toDelete.length > 0) {
-                await updateShift(keep.id, keep.start_time, localIso(new Date(mergedEndMs)), keep.project_uuid ?? null);
-                for (const d of toDelete) await deleteShift(d.id);
-            }
-            i = j;
+    async function coalesceShifts(list: ShiftItem[], fromMs: number, toMs: number) {
+        const dayFrom = dayStart(localDateKey(new Date(fromMs))).getTime();
+        const dayTo = addDays(dayStart(localDateKey(new Date(toMs))), 1).getTime();
+        const scoped = overlapping(list.map(toPlanShift), dayFrom, dayTo, Date.now());
+        const plan = planCoalesce(scoped);
+        const byId = new Map(list.map(s => [s.id, s]));
+        for (const u of plan.updates) {
+            const keep = byId.get(u.key)!;
+            await updateShift(keep.id, localIso(new Date(keep.start_time)), localIso(new Date(u.endMs)), keep.project_uuid ?? null);
         }
+        for (const id of plan.deletes) await deleteShift(id);
     }
 
-    // ── Timeline editor ──────────────────────────────────────────────
-    function renderTimelineDayLabel() {
-        const el = document.getElementById("timeline-day-label");
-        if (!el) return;
-        const ms = parseLocalDayStartMs(timelineDayKey || localDateKey(new Date()));
-        el.textContent = new Date(ms).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-    }
+    // ── Undo (shared/ui/undo.ts) ─────────────────────────────────────
+    // Before an edit, keep a copy of the shifts it can touch; Undo writes the
+    // copies back and deletes rows the edit created. Rows deleted meanwhile
+    // come back as new rows (the server has no "undelete").
+    const snapshotRange = (fromMs: number, toMs: number): ShiftItem[] =>
+        shiftsCached
+            .filter(s => new Date(s.start_time).getTime() < toMs && (s.end_time ? new Date(s.end_time).getTime() : Date.now()) > fromMs)
+            .map(s => ({ ...s }));
 
-    function renderTimelineTicks() {
-        const el = document.getElementById("timeline-ticks");
-        if (!el) return;
-        const span = timelineSpanEnd - timelineSpanStart;
-        const parts: string[] = [];
-        for (let i = 0; i < 5; i++) {
-            const min = Math.round((timelineSpanStart + (span * i) / 4) / 5) * 5;
-            parts.push(`<span>${formatTimeFromMinutes(min)}</span>`);
+    async function restoreSnapshot(before: ShiftItem[], fromMs: number, toMs: number) {
+        const fresh = await listShifts();
+        if (!fresh.ok) throw new Error("server unreachable");
+        const now = fresh.data || [];
+        const beforeIds = new Set(before.map(b => b.id));
+        const created = now.filter(s => !beforeIds.has(s.id)
+            && new Date(s.start_time).getTime() < toMs
+            && (s.end_time ? new Date(s.end_time).getTime() : Date.now()) > fromMs);
+        for (const c of created) await deleteShift(c.id);
+        const nowIds = new Set(now.map(s => s.id));
+        for (const b of before) {
+            const start = localIso(new Date(b.start_time));
+            const end = b.end_time ? localIso(new Date(b.end_time)) : null;
+            if (nowIds.has(b.id)) await updateShift(b.id, start, end, b.project_uuid ?? null, b.note ?? null);
+            else await createShift(start, end, b.project_uuid ?? null, b.note ?? null);
         }
-        el.innerHTML = parts.join("");
+        await refreshData();
     }
 
-    function renderTimelineShifts() {
-        const track = document.getElementById("timeline-track");
-        if (!track) return;
-        const selectionEl = document.getElementById("timeline-selection");
-        track.innerHTML = "";
-        if (selectionEl) track.appendChild(selectionEl);
+    /**
+     * Run an edit of shifts within [fromMs, toMs) and offer to undo it. The
+     * snapshot covers the whole local days: merging touching shifts can change
+     * a neighbour outside the edited range.
+     */
+    async function undoable(label: string, fromMs: number, toMs: number, action: () => Promise<void>) {
+        const lo = dayRangeOf(fromMs)[0];
+        const hi = dayRangeOf(Math.max(fromMs, toMs - 1))[1];
+        const before = snapshotRange(lo, hi);
+        await action();
+        // Nothing changed: no Undo entry, or the next Undo would do nothing.
+        const key = (s: ShiftItem) => [s.id, s.start_time, s.end_time, s.project_uuid ?? "", s.note ?? ""].join("|");
+        const after = snapshotRange(lo, hi);
+        if (before.length === after.length && after.every(s => before.some(b => key(b) === key(s)))) return;
+        pushUndo(label, () => restoreSnapshot(before, lo, hi));
+    }
 
-        const dayStartMs = parseLocalDayStartMs(timelineDayKey);
-        const dayEndMs = dayStartMs + 1440 * 60000;
-        const blocks = shiftsCached
-            .filter(s => s.end_time && new Date(s.start_time).getTime() < dayEndMs && new Date(s.end_time).getTime() > dayStartMs)
-            .map(s => {
-                const startMin = (Math.max(new Date(s.start_time).getTime(), dayStartMs) - dayStartMs) / 60000;
-                const endMin = (Math.min(new Date(s.end_time!).getTime(), dayEndMs) - dayStartMs) / 60000;
-                return { s, startMin, endMin, live: false };
+    const dayRangeOf = (ms: number): [number, number] => {
+        const start = dayStart(localDateKey(new Date(ms))).getTime();
+        return [start, addDays(new Date(start), 1).getTime()];
+    };
+
+    /** Delete a shift at once, with Undo (no "Are you sure?"). */
+    async function deleteShiftUndoable(id: number, label = "Shift deleted") {
+        const s = shiftsCached.find(x => x.id === id);
+        if (!s) return;
+        const [lo] = dayRangeOf(new Date(s.start_time).getTime());
+        const hi = s.end_time ? new Date(s.end_time).getTime() : Date.now();
+        try {
+            await undoable(label, lo, hi, async () => {
+                const res = await deleteShift(id);
+                if (!res.ok) throw new Error("server error");
+                await refreshData();
             });
-
-        // The running shift has no end_time, so it never lands in `blocks`. Render
-        // it as a live block whose right edge tracks "now" (capped to the day) and
-        // grows on the 1s clock tick — see updateLiveTimelineBlock().
-        const nowMs = Date.now();
-        const active = shiftsCached.find(s => s.end_time === null);
-        let liveEntry: { s: ShiftItem; startMin: number; endMin: number; live: boolean } | null = null;
-        if (active) {
-            const st = new Date(active.start_time).getTime();
-            if (st < dayEndMs && Math.min(nowMs, dayEndMs) > dayStartMs) {
-                liveEntry = {
-                    s: active,
-                    startMin: (Math.max(st, dayStartMs) - dayStartMs) / 60000,
-                    endMin: (Math.min(nowMs, dayEndMs) - dayStartMs) / 60000,
-                    live: true,
-                };
-            }
+        } catch {
+            showToast("Couldn't delete the shift — the server didn't answer.", { tone: "error" });
         }
-
-        const entries = liveEntry ? [...blocks, liveEntry] : blocks;
-        timelineHasShifts = entries.length > 0;
-        // Range-assign occupancy excludes the open shift: splitting a running shift
-        // by range is not supported. The live block stays note-brushable only.
-        timelineBlocks = blocks.map(b => ({ startMin: b.startMin, endMin: b.endMin, projectUuid: b.s.project_uuid ?? null }));
-
-        const container = document.getElementById("timeline-container");
-        const ticksEl = document.getElementById("timeline-ticks");
-        const emptyEl = document.getElementById("timeline-empty");
-        if (container) container.style.display = timelineHasShifts ? "" : "none";
-        if (ticksEl) ticksEl.style.display = timelineHasShifts ? "" : "none";
-        if (emptyEl) (emptyEl as HTMLElement).hidden = timelineHasShifts;
-        renderTimelineDayLabel();
-
-        if (!timelineHasShifts) { timelineSpanStart = 8 * 60; timelineSpanEnd = 18 * 60; return; }
-        const minStart = Math.min(...entries.map(b => b.startMin));
-        const maxEnd = Math.max(...entries.map(b => b.endMin));
-        timelineSpanStart = Math.max(0, Math.floor((minStart - 30) / 30) * 30);
-        timelineSpanEnd = Math.min(1440, Math.ceil((maxEnd + 30) / 30) * 30);
-        if (timelineSpanEnd - timelineSpanStart < 60) timelineSpanEnd = Math.min(1440, timelineSpanStart + 60);
-        const span = timelineSpanEnd - timelineSpanStart;
-
-        for (const b of entries) {
-            const start = new Date(b.s.start_time);
-            const color = projectColor(b.s.project_uuid);
-            const div = document.createElement("div");
-            div.className = "timeline-shift";
-            const note = b.s.note ?? "";
-            if (note) div.classList.add("has-note");
-            if (brushActive) div.classList.add("brushable");
-            if (b.live) { div.classList.add("timeline-live"); div.id = "timeline-live-block"; }
-            div.dataset.shiftId = String(b.s.id);
-            div.style.left = `${((b.startMin - timelineSpanStart) / span) * 100}%`;
-            div.style.width = `${((b.endMin - b.startMin) / span) * 100}%`;
-            div.style.backgroundColor = color;
-            div.style.color = contrastText(color);
-            const name = projectName(b.s.project_uuid);
-            div.innerHTML = `<span class="tl-shift-label">${escapeHtml(name)} (${((b.endMin - b.startMin) / 60).toFixed(1)}h)</span>${note ? `<span class="tl-note-dot" title="${escapeHtml(note)}">•</span>` : ""}`;
-            const from = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-            if (b.live) {
-                div.title = note ? `${name}: ${from} – now (running)\nNote: ${note}` : `${name}: ${from} – now (running)`;
-            } else {
-                const times = `${from} – ${new Date(b.s.end_time!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-                div.title = note ? `${name}: ${times}\nNote: ${note}` : `${name}: ${times}`;
-            }
-            track.appendChild(div);
-        }
-        renderTimelineTicks();
     }
 
-    // Grow the live (running-shift) block each second without a full re-render,
-    // so the timeline reflects the active session in real time. Re-pads the whole
-    // strip only when the block outgrows the padded span, and never yanks the DOM
-    // out from under an in-progress drag/brush stroke.
-    function updateLiveTimelineBlock() {
-        if (!activeShiftCached) return;
-        const el = document.getElementById("timeline-live-block") as HTMLElement | null;
-        if (!el) return;
-        if (tlDragging || tlResizeL || tlResizeR || tlMoving || brushPainting) return;
-        const dayStartMs = parseLocalDayStartMs(timelineDayKey);
-        const dayEndMs = dayStartMs + 1440 * 60000;
-        const st = new Date(activeShiftCached.start_time).getTime();
-        if (st >= dayEndMs) return;
-        const startMin = (Math.max(st, dayStartMs) - dayStartMs) / 60000;
-        const endMin = (Math.min(Date.now(), dayEndMs) - dayStartMs) / 60000;
-        if (endMin > timelineSpanEnd) { renderTimelineShifts(); return; }
-        const span = timelineSpanEnd - timelineSpanStart;
-        el.style.left = `${((startMin - timelineSpanStart) / span) * 100}%`;
-        el.style.width = `${((endMin - startMin) / span) * 100}%`;
-        const label = el.querySelector(".tl-shift-label");
-        if (label) label.textContent = `${projectName(activeShiftCached.project_uuid)} (${((endMin - startMin) / 60).toFixed(1)}h)`;
+    // ── Timeline (shared/ui/timeline.ts) ─────────────────────────────
+    function shiftById(id: number): ShiftItem {
+        const s = shiftsCached.find(x => x.id === id);
+        if (!s) throw new Error("That shift no longer exists.");
+        return s;
     }
 
+    async function fillRangeMs(fromMs: number, toMs: number, projectUuid: string | null) {
+        const now = Date.now();
+        const occupied = shiftsCached.map(s => ({ startMs: new Date(s.start_time).getTime(), endMs: s.end_time ? new Date(s.end_time).getTime() : now }));
+        for (const g of findGaps(occupied, fromMs, Math.min(toMs, now))) {
+            await createShift(localIso(new Date(g.startMs)), localIso(new Date(g.endMs)), projectUuid);
+        }
+        const fresh = await listShifts();
+        if (fresh.ok) await coalesceShifts(fresh.data || [], fromMs, toMs);
+        await refreshData();
+    }
+
+    function buildTimeline() {
+        const root = document.getElementById("timeline-root");
+        if (!root) return;
+        timeline = createTimeline(root, {
+            assignRange: (fromMs, toMs, project) => undoable(`Painted ${projectName(project)}`, fromMs, toMs, () => assignRangeMs(fromMs, toMs, project)),
+            assignRanges: (ranges, project) => undoable(`Painted ${projectName(project)}`,
+                Math.min(...ranges.map(r => r.startMs)), Math.max(...ranges.map(r => r.endMs)), async () => {
+                    for (const r of ranges) await assignRangeMs(r.startMs, r.endMs, project);
+                }),
+            fillRange: (fromMs, toMs, project) => undoable(`Added time to ${projectName(project)}`, fromMs, toMs, () => fillRangeMs(fromMs, toMs, project)),
+            setTimes: async (changes) => {
+                const err = validateTimeEdits(shiftsCached.map(toPlanShift), changes.map(c => ({ key: c.id, startMs: c.startMs, endMs: c.endMs })), Date.now());
+                if (err) throw new Error(err);
+                const lo = Math.min(...changes.map(c => Math.min(c.startMs, new Date(shiftById(c.id).start_time).getTime())));
+                const hi = Math.max(...changes.map(c => Math.max(c.endMs ?? Date.now(), shiftById(c.id).end_time ? new Date(shiftById(c.id).end_time!).getTime() : Date.now())));
+                await undoable("Changed shift times", lo, hi, async () => {
+                    for (const c of changes) {
+                        const res = await updateShift(c.id, localIso(new Date(c.startMs)), c.endMs === null ? null : localIso(new Date(c.endMs)));
+                        if (!res.ok) throw new Error("server error");
+                    }
+                    await refreshData();
+                });
+            },
+            setNotes: async (ids, note) => {
+                const spans = ids.map(id => shiftById(id));
+                const lo = Math.min(...spans.map(s => new Date(s.start_time).getTime()));
+                const hi = Math.max(...spans.map(s => s.end_time ? new Date(s.end_time).getTime() : Date.now()));
+                await undoable(note ? "Painted note" : "Erased note", lo, hi, async () => {
+                    for (const s of spans) await updateShift(s.id, s.start_time, s.end_time, undefined, note);
+                    await refreshData();
+                });
+            },
+            setProject: async (id, project) => {
+                const s = shiftById(id);
+                const [lo, hi] = [new Date(s.start_time).getTime(), s.end_time ? new Date(s.end_time).getTime() : Date.now()];
+                await undoable(project ? `Moved to ${projectName(project)}` : "Removed project", lo, hi, async () => {
+                    await updateShift(s.id, localIso(new Date(s.start_time)), s.end_time ? localIso(new Date(s.end_time)) : null, project);
+                    // Touching pieces with the same project and note merge back into one.
+                    if (s.end_time) {
+                        const fresh = await listShifts();
+                        if (fresh.ok) await coalesceShifts(fresh.data || [], lo, hi);
+                    }
+                    // Re-tagging the running shift also changes what you're tracking now.
+                    if (!s.end_time) { currentProjectUuid = project; localStorage.setItem(CURRENT_PROJECT_KEY, project ?? ""); }
+                    await refreshData();
+                });
+            },
+            deleteShift: async (id) => {
+                const s = shiftById(id);
+                const [lo, hi] = [new Date(s.start_time).getTime(), s.end_time ? new Date(s.end_time).getTime() : Date.now()];
+                await undoable("Shift deleted", lo, hi, async () => {
+                    const res = await deleteShift(id);
+                    if (!res.ok) throw new Error("server error");
+                    await refreshData();
+                });
+            },
+            clearAutoClosed: async (id) => {
+                const s = shiftById(id);
+                await updateShift(s.id, s.start_time, s.end_time, undefined, undefined, { clearAutoClosed: true });
+                await refreshData();
+            },
+            projectColor: (uuid) => projectColor(uuid),
+            projectName: (uuid) => projectName(uuid),
+            textColorOn: contrastText,
+            onDayChange: (key) => { timelineDayKey = key; },
+            describeError: (err) => err instanceof Error ? err.message : "Couldn't save that change.",
+        }, timelineDayKey);
+    }
+
+    function pushTimelineData() {
+        if (!timeline) return;
+        timeline.setData(
+            shiftsCached.map(s => ({
+                id: s.id,
+                startMs: new Date(s.start_time).getTime(),
+                endMs: s.end_time ? new Date(s.end_time).getTime() : null,
+                project: s.project_uuid ?? null,
+                note: s.note ?? null,
+                autoClosed: !!s.auto_closed_at,
+            })),
+            projectsCached.filter(p => !p.archived && p.uuid).map(p => ({ uuid: p.uuid!, name: p.name, color: p.color || unassignedColor() })),
+        );
+    }
+
+    /** Open a day in the timeline (from a chart bar) and bring it into view. */
     function setTimelineDay(dateKey: string) {
         timelineDayKey = dateKey;
-        timelineSelStartMin = 0; timelineSelEndMin = 0;
-        updateSelectionUI();
-        renderTimelineShifts();
-        renderTimelineProjectSelect();
-        document.getElementById("timeline-editor-wrapper")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        timeline?.showDay(dateKey);
+        document.getElementById("timeline-editor-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    // ── Trend-chart drill-down: reach & edit ANY day's sessions ──────
-    // The trend chart already spans arbitrary history; clicking a bar drills in.
-    // A day bar opens that day's timeline editor (moved into the slide-down slot);
-    // a week/month bar zooms the chart into its days first. A breadcrumb walks
-    // back out. This is the only path to backfill projects/notes on old days.
+    // ── Trend-chart drill-down ───────────────────────────────────────
+    // Week/month bars zoom the chart into their days (breadcrumbs walk back);
+    // a day bar opens that day in the Dashboard timeline, with a way back.
     type TrendDrillLevel = { start: Date; end: Date; granularity: string; label: string };
     let trendDrillStack: TrendDrillLevel[] = [];
     let trendBucketRange: Record<string, { start: number; end: number }> = {};
     let trendLabelsCurrent: string[] = [];
     let trendGranularityCurrent = "day";
-    let drillDay: string | null = null;
-    let drillEditorOrigParent: HTMLElement | null = null;
-    let drillEditorOrigNext: Node | null = null;
 
-    // What range/granularity the trend chart should show: the top drill level, or
-    // the user's configured selects at the root.
     function currentTrendView(): { start: Date | null; end: Date; granularity: string } {
         const top = trendDrillStack[trendDrillStack.length - 1];
         if (top) return { start: top.start, end: top.end, granularity: top.granularity };
@@ -1143,324 +1115,53 @@ export function renderTracker(app: HTMLElement): void {
         return { start: null, end: new Date(), granularity: g };
     }
 
-    // Relocate the whole timeline-editor PANEL (bar + assign controls + brush,
-    // which are siblings) into the drill slot and back, so the full editor is
-    // reused with zero duplication. Moving only the bar left the controls behind.
-    function moveEditorIntoSlot() {
-        const panel = document.getElementById("timeline-editor-panel");
-        const slot = document.getElementById("trend-drill-slot");
-        if (!panel || !slot || panel.parentElement === slot) return;
-        drillEditorOrigParent = panel.parentElement;
-        drillEditorOrigNext = panel.nextSibling;
-        slot.appendChild(panel);
-    }
-    function restoreEditorHome() {
-        const panel = document.getElementById("timeline-editor-panel");
-        if (panel && drillEditorOrigParent) {
-            if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
-                drillEditorOrigParent.insertBefore(panel, drillEditorOrigNext);
-            else drillEditorOrigParent.appendChild(panel);
-        }
-        drillEditorOrigParent = null; drillEditorOrigNext = null;
+    function showTab(target: string) {
+        (document.querySelector(`.tab-link[data-target="${target}"]`) as HTMLButtonElement | null)?.click();
     }
 
-    function openDayDrill(dateKey: string) {
-        drillDay = dateKey;
-        moveEditorIntoSlot();
-        const empty = document.getElementById("trend-drill-empty");
-        if (empty) empty.hidden = true;
+    function openDayFromStats(dateKey: string) {
+        showTab("dashboard");
+        const back = document.getElementById("btn-back-to-stats");
+        if (back) back.hidden = false;
         setTimelineDay(dateKey);
-        syncDrillUI();
-        document.getElementById("trend-drill-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
-    function closeTrendDrill() {
-        restoreEditorHome();
-        trendDrillStack = [];
-        drillDay = null;
-        syncDrillUI();
-        void refreshData();
-    }
-
-    // Pop the drill stack to a level (-1 = root) and drop any open day.
     function drillToLevel(level: number) {
-        restoreEditorHome();
         trendDrillStack = level < 0 ? [] : trendDrillStack.slice(0, level + 1);
-        drillDay = null;
-        const empty = document.getElementById("trend-drill-empty");
-        if (empty) empty.hidden = false;
         void refreshData();
     }
 
-    // Click on a trend bar: day bucket → open editor; week/month → zoom into days.
     function onTrendBarClick(index: number) {
         const bk = trendLabelsCurrent[index];
         if (bk == null) return;
-        if (trendGranularityCurrent === "day") { openDayDrill(bk); return; }
+        if (trendGranularityCurrent === "day") { openDayFromStats(bk); return; }
         const range = trendBucketRange[bk];
         if (!range) return;
         const startD = new Date(range.start);
         const label = trendGranularityCurrent === "week"
-            ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+            ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
             : startD.toLocaleDateString(undefined, { month: "long", year: "numeric" });
         trendDrillStack.push({ start: startD, end: new Date(range.end), granularity: "day", label });
-        drillDay = null;
-        const empty = document.getElementById("trend-drill-empty");
-        if (empty) empty.hidden = false;
         void refreshData();
     }
 
-    // Show/hide the slide-down panel and paint the breadcrumb trail.
     function syncDrillUI() {
         const panel = document.getElementById("trend-drill-panel");
         const crumbs = document.getElementById("trend-drill-crumbs");
         if (!panel || !crumbs) return;
-        const open = trendDrillStack.length > 0 || drillDay != null;
-        panel.hidden = !open;
-        if (!open) return;
+        panel.hidden = trendDrillStack.length === 0;
+        if (panel.hidden) return;
         const parts = [`<button type="button" class="crumb" data-level="-1">All</button>`];
         trendDrillStack.forEach((lvl, i) => {
             parts.push(`<span class="crumb-sep">▸</span><button type="button" class="crumb" data-level="${i}">${escapeHtml(lvl.label)}</button>`);
         });
-        if (drillDay) {
-            const d = new Date(drillDay + "T00:00:00");
-            parts.push(`<span class="crumb-sep">▸</span><span class="crumb crumb-current">${escapeHtml(d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }))}</span>`);
-        }
         crumbs.innerHTML = parts.join("");
         crumbs.querySelectorAll(".crumb[data-level]").forEach(b =>
             b.addEventListener("click", () => drillToLevel(parseInt((b as HTMLElement).dataset.level!))));
     }
 
-    function renderTimelineProjectSelect() {
-        const select = document.getElementById("timeline-project-select") as HTMLSelectElement | null;
-        if (!select) return;
-        const prev = select.value || currentProjectUuid || "";
-        const active = projectsCached.filter(p => !p.archived);
-        select.innerHTML = [`<option value="">Unassigned</option>`, ...active.map(p => `<option value="${p.uuid}">${escapeHtml(p.name)}</option>`)].join("");
-        select.value = active.some(p => p.uuid === prev) ? prev : "";
-    }
-
-    function updateSelectionUI() {
-        const selectionEl = document.getElementById("timeline-selection") as HTMLElement | null;
-        const labelEl = document.getElementById("timeline-selection-label");
-        const selectEl = document.getElementById("timeline-project-select") as HTMLSelectElement | null;
-        const assignBtn = document.getElementById("btn-timeline-assign") as HTMLButtonElement | null;
-        const removeBtn = document.getElementById("btn-timeline-remove") as HTMLButtonElement | null;
-        if (!selectionEl || !labelEl || !selectEl || !assignBtn) return;
-        if (timelineSelStartMin === timelineSelEndMin) {
-            selectionEl.style.display = "none";
-            labelEl.textContent = "No range selected. Drag on the timeline above to select.";
-            selectEl.disabled = true; assignBtn.disabled = true; if (removeBtn) removeBtn.disabled = true;
-            timelineStartMin = null; timelineEndMin = null;
-        } else {
-            selectionEl.style.display = "block";
-            const span = timelineSpanEnd - timelineSpanStart;
-            selectionEl.style.left = `${((timelineSelStartMin - timelineSpanStart) / span) * 100}%`;
-            selectionEl.style.width = `${((timelineSelEndMin - timelineSelStartMin) / span) * 100}%`;
-            const durMin = Math.round(timelineSelEndMin - timelineSelStartMin);
-            const h = Math.floor(durMin / 60), m = durMin % 60;
-            labelEl.textContent = `Selected: ${formatTimeFromMinutes(timelineSelStartMin)} to ${formatTimeFromMinutes(timelineSelEndMin)} (${h > 0 ? `${h}h ${m}m` : `${m}m`})`;
-            selectEl.disabled = false; assignBtn.disabled = false; if (removeBtn) removeBtn.disabled = false;
-            timelineStartMin = timelineSelStartMin; timelineEndMin = timelineSelEndMin;
-        }
-    }
-
-    function getMinutesFromEvent(e: MouseEvent | TouchEvent, trackEl: HTMLElement): number {
-        const rect = trackEl.getBoundingClientRect();
-        const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
-        const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-        const span = timelineSpanEnd - timelineSpanStart;
-        return Math.round((timelineSpanStart + pct * span) / 5) * 5;
-    }
-
-    // Stamp the brush note onto one shift block, updating the DOM optimistically
-    // and persisting. Skips a no-op so dragging across a block doesn't re-write it.
-    async function stampNoteOnBlock(el: HTMLElement): Promise<void> {
-        const id = Number(el.dataset.shiftId);
-        const s = shiftsCached.find(x => x.id === id);
-        if (!s) return;
-        const raw = (document.getElementById("timeline-brush-note") as HTMLInputElement).value.trim();
-        const newNote = raw === "" ? null : raw;
-        if ((s.note ?? null) === newNote) return;
-        s.note = newNote;
-        el.classList.toggle("has-note", !!newNote);
-        el.classList.add("just-stamped");
-        setTimeout(() => el.classList.remove("just-stamped"), 400);
-        let dot = el.querySelector(".tl-note-dot");
-        if (newNote && !dot) el.insertAdjacentHTML("beforeend", `<span class="tl-note-dot">•</span>`);
-        else if (!newNote && dot) dot.remove();
-        brushDirty = true;
-        // Persist; the optimistic DOM stays even on failure — the brush-end
-        // refreshData() reconciles against the server either way.
-        await updateShift(id, s.start_time, s.end_time, undefined, newNote);
-    }
-
-    function initBrush() {
-        const toggle = document.getElementById("btn-brush-toggle") as HTMLButtonElement | null;
-        const input = document.getElementById("timeline-brush-note") as HTMLInputElement | null;
-        const hint = document.getElementById("timeline-brush-hint");
-        const wrapper = document.getElementById("timeline-editor-wrapper");
-        if (!toggle || !input || !hint || !wrapper) return;
-        toggle.addEventListener("click", () => {
-            brushActive = !brushActive;
-            toggle.classList.toggle("active", brushActive);
-            wrapper.classList.toggle("brush-mode", brushActive);
-            input.disabled = !brushActive;
-            // Brush mode and range-assign are mutually exclusive interactions.
-            if (brushActive) {
-                timelineSelStartMin = timelineSelEndMin = 0;
-                updateSelectionUI();
-                hint.textContent = "Click a block to stamp the note; drag across to cover several. Empty note = erase.";
-                input.focus();
-            } else {
-                hint.textContent = "";
-            }
-            renderTimelineShifts();
-        });
-    }
-
-    function initTimelineDrag() {
-        const track = document.getElementById("timeline-track");
-        const handleLeft = document.getElementById("handle-left");
-        const handleRight = document.getElementById("handle-right");
-        const selectionEl = document.getElementById("timeline-selection");
-        if (!track || !handleLeft || !handleRight || !selectionEl) return;
-
-        const startDrag = (e: MouseEvent | TouchEvent) => {
-            if (brushActive) return; // brush mode owns block clicks; no range-select
-            if (selectionEl.contains(e.target as Node)) return;
-            tlDragging = true;
-            tlDragStartMin = getMinutesFromEvent(e, track);
-            timelineSelStartMin = tlDragStartMin; timelineSelEndMin = tlDragStartMin;
-            updateSelectionUI();
-            if (e.cancelable) e.preventDefault();
-        };
-        track.addEventListener("mousedown", startDrag);
-        track.addEventListener("touchstart", startDrag, { passive: false });
-
-        // Note-brush painting: stamp the brush note onto blocks in brush mode.
-        const brushBlockFromEvent = (e: Event): HTMLElement | null =>
-            (e.target as HTMLElement)?.closest(".timeline-shift") as HTMLElement | null;
-        const brushDown = (e: MouseEvent | TouchEvent) => {
-            if (!brushActive) return;
-            const blk = brushBlockFromEvent(e);
-            if (!blk) return;
-            if (e.cancelable) e.preventDefault();
-            brushPainting = true;
-            brushPending.push(stampNoteOnBlock(blk));
-        };
-        const brushOver = (e: MouseEvent) => {
-            if (!brushActive || !brushPainting) return;
-            const blk = brushBlockFromEvent(e);
-            if (blk) brushPending.push(stampNoteOnBlock(blk));
-        };
-        track.addEventListener("mousedown", brushDown);
-        track.addEventListener("touchstart", brushDown, { passive: false });
-        track.addEventListener("mouseover", brushOver);
-        track.addEventListener("touchmove", (e) => {
-            if (!brushActive || !brushPainting) return;
-            const t = e.touches[0];
-            const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
-            if (el) brushPending.push(stampNoteOnBlock(el));
-        }, { passive: true });
-
-        const startMove = (e: MouseEvent | TouchEvent) => {
-            if (e.target === handleLeft || e.target === handleRight) return;
-            e.stopPropagation();
-            tlMoving = true;
-            tlMoveGrab = getMinutesFromEvent(e, track);
-            tlMoveOrigStart = timelineSelStartMin; tlMoveOrigEnd = timelineSelEndMin;
-            if (e.cancelable) e.preventDefault();
-        };
-        selectionEl.addEventListener("mousedown", startMove);
-        selectionEl.addEventListener("touchstart", startMove, { passive: false });
-
-        handleLeft.addEventListener("mousedown", (e) => { e.stopPropagation(); tlResizeL = true; });
-        handleLeft.addEventListener("touchstart", (e) => { e.stopPropagation(); tlResizeL = true; }, { passive: true });
-        handleRight.addEventListener("mousedown", (e) => { e.stopPropagation(); tlResizeR = true; });
-        handleRight.addEventListener("touchstart", (e) => { e.stopPropagation(); tlResizeR = true; }, { passive: true });
-
-        const onMove = (e: MouseEvent | TouchEvent) => {
-            if (tlDragging) {
-                const cur = getMinutesFromEvent(e, track);
-                timelineSelStartMin = Math.min(tlDragStartMin, cur);
-                timelineSelEndMin = Math.max(tlDragStartMin, cur);
-                updateSelectionUI();
-            } else if (tlResizeL) {
-                const cur = getMinutesFromEvent(e, track);
-                if (cur < timelineSelEndMin) { timelineSelStartMin = cur; updateSelectionUI(); }
-            } else if (tlResizeR) {
-                const cur = getMinutesFromEvent(e, track);
-                if (cur > timelineSelStartMin) { timelineSelEndMin = cur; updateSelectionUI(); }
-            } else if (tlMoving) {
-                const width = tlMoveOrigEnd - tlMoveOrigStart;
-                const delta = getMinutesFromEvent(e, track) - tlMoveGrab;
-                const ns = Math.max(timelineSpanStart, Math.min(tlMoveOrigStart + delta, timelineSpanEnd - width));
-                timelineSelStartMin = ns; timelineSelEndMin = ns + width;
-                updateSelectionUI();
-            }
-        };
-        const onEnd = () => {
-            if (brushPainting) {
-                brushPainting = false;
-                if (brushDirty) {
-                    brushDirty = false;
-                    // Wait for the stroke's writes to commit before reconciling,
-                    // or the GET races the PUTs and reverts the stamped notes.
-                    const pend = brushPending; brushPending = [];
-                    void Promise.allSettled(pend).then(() => refreshData());
-                }
-            }
-            const wasClick = tlDragging && timelineSelStartMin === timelineSelEndMin;
-            tlDragging = false; tlResizeL = false; tlResizeR = false; tlMoving = false;
-            if (wasClick) {
-                const min = timelineSelStartMin;
-                const blk = timelineBlocks.find(b => min >= b.startMin && min < b.endMin);
-                if (blk) {
-                    timelineSelStartMin = blk.startMin; timelineSelEndMin = blk.endMin;
-                    const sel = document.getElementById("timeline-project-select") as HTMLSelectElement | null;
-                    if (sel) sel.value = blk.projectUuid || "";
-                    updateSelectionUI();
-                }
-            }
-        };
-        activePointerMove = onMove;
-        activePointerUp = onEnd;
-    }
-
-    async function applyTimelineRange(projectUuid: string | null) {
-        if (timelineStartMin === null || timelineEndMin === null) return;
-        const dayStartMs = parseLocalDayStartMs(timelineDayKey);
-        const rangeStartMs = dayStartMs + timelineStartMin * 60000;
-        const rangeEndMs = dayStartMs + timelineEndMin * 60000;
-        timelineSelStartMin = 0; timelineSelEndMin = 0; updateSelectionUI();
-        await assignRangeMs(rangeStartMs, rangeEndMs, projectUuid);
-    }
-
-    // ── Stacked-by-project chart datasets ────────────────────────────
-    type BarRadius = { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number };
-    function stackedBarTopRadius(r: number) {
-        return (ctx: { dataIndex: number; datasetIndex: number; chart: Chart }): BarRadius => {
-            const datasets = ctx.chart.data.datasets;
-            let topIdx = -1;
-            for (let i = 0; i < datasets.length; i++) { const v = datasets[i].data[ctx.dataIndex] as number; if (v && v > 0) topIdx = i; }
-            const isTop = ctx.datasetIndex === topIdx;
-            return { topLeft: isTop ? r : 0, topRight: isTop ? r : 0, bottomLeft: 0, bottomRight: 0 };
-        };
-    }
-    function buildProjectStackDatasets(bucketCount: number, list: ShiftItem[], hoursOf: (s: ShiftItem) => number, bucketOf: (s: ShiftItem) => number) {
-        const buckets = new Map<string, number[]>();
-        const ensure = (k: string) => { let a = buckets.get(k); if (!a) { a = new Array(bucketCount).fill(0); buckets.set(k, a); } return a; };
-        for (const s of list) { const b = bucketOf(s); if (b < 0 || b >= bucketCount) continue; ensure(s.project_uuid || "")[b] += hoursOf(s); }
-        const keys = [...buckets.keys()].sort((a, b) => a === "" ? 1 : b === "" ? -1 : projectName(a).localeCompare(projectName(b)));
-        const radius = stackedBarTopRadius(4);
-        return keys.map(k => ({
-            label: k ? projectName(k) : "Unassigned",
-            data: buckets.get(k)!.map(v => parseFloat(v.toFixed(2))),
-            backgroundColor: k ? projectColor(k) : unassignedColor(),
-            stack: "hours", borderRadius: radius, borderSkipped: false,
-        }));
-    }
+    // ── Stacked-by-project chart datasets (shared/charts.ts) ─────────
+    const projectLook = { name: (u: string) => projectName(u), color: (u: string) => projectColor(u), unassignedColor };
     function renderProjectSummary(datasets: { label: string; backgroundColor: string; data: number[] }[]) {
         const el = document.getElementById("project-summary");
         if (!el) return;
@@ -1474,23 +1175,25 @@ export function renderTracker(app: HTMLElement): void {
     }
 
     // ── One-time project/timeline wiring ─────────────────────────────
-    renderTimelineDayLabel();
-    initTimelineDrag();
-    initBrush();
-    document.getElementById("trend-drill-close")?.addEventListener("click", closeTrendDrill);
-    document.getElementById("btn-timeline-assign")?.addEventListener("click", () => {
-        const sel = document.getElementById("timeline-project-select") as HTMLSelectElement;
-        void applyTimelineRange(sel.value || null);
+    buildTimeline();
+    // App-styled dropdowns (the native selects stay underneath).
+    enhanceSelects(app);
+    document.getElementById("trend-drill-close")?.addEventListener("click", () => drillToLevel(-1));
+    document.getElementById("btn-back-to-stats")?.addEventListener("click", (e) => {
+        (e.currentTarget as HTMLElement).hidden = true;
+        showTab("statistics");
     });
-    document.getElementById("btn-timeline-remove")?.addEventListener("click", () => void applyTimelineRange(null));
 
     document.getElementById("btn-export-csv")?.addEventListener("click", () => {
         const rows: string[] = [];
         rows.push("[Shifts]");
-        rows.push(["ID", "Start Time", "End Time", "Duration (Hours)", "Project"].join(","));
+        rows.push(["ID", "Start Time", "End Time", "Duration (Hours)", "Project", "Note"].join(","));
         for (const s of shiftsCached) {
             const dur = shiftDurationHours(s).toFixed(2);
-            rows.push([String(s.id), s.start_time, s.end_time ?? "", dur, csvCell(projectName(s.project_uuid))].join(","));
+            // Times in the naive local frame, the same as desktop exports.
+            const start = localIso(new Date(s.start_time));
+            const end = s.end_time ? localIso(new Date(s.end_time)) : "";
+            rows.push([String(s.id), start, end, dur, csvCell(projectName(s.project_uuid)), csvCell(s.note ?? "")].join(","));
         }
         rows.push("");
         rows.push("[Off Days]");
@@ -1523,15 +1226,10 @@ export function renderTracker(app: HTMLElement): void {
         const wrap = document.getElementById("project-chip-wrap");
         if (wrap && !wrap.contains(e.target as Node)) menu.hidden = true;
     };
-    // Number keys: 0 = Unassigned, 1–9 = Nth project. Delete clears a timeline selection.
+    // Number keys: 0 = Unassigned, 1–9 = Nth project (over the timeline they pick a brush instead).
     activeKeydownHandler = (e) => {
         const tag = (e.target as HTMLElement | null)?.tagName;
         const typing = tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA";
-        if ((e.key === "Delete" || e.key === "Backspace") && !typing && timelineStartMin !== null && timelineEndMin !== null) {
-            e.preventDefault();
-            void applyTimelineRange(null);
-            return;
-        }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         if (e.key < "0" || e.key > "9" || typing) return;
         if (e.key === "0") { e.preventDefault(); void switchToProject(null); return; }
@@ -1544,11 +1242,17 @@ export function renderTracker(app: HTMLElement): void {
 
     // Toggle Modal Dialogs
     addManualBtn.addEventListener("click", () => {
-        const todayStr = localDateKey(new Date());
-        (document.getElementById("inp-shift-start-date") as HTMLInputElement).value = todayStr;
-        (document.getElementById("inp-shift-end-date") as HTMLInputElement).value = todayStr;
-        (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = "09:00";
-        (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = "17:00";
+        // Prefill: the day shown in the timeline, right after its last shift.
+        const day = timeline?.day() ?? localDateKey(new Date());
+        const dayStartMs = dayStart(day).getTime();
+        const offDays = new Set(offDaysCached.map(o => o.date));
+        const spans = shiftsCached.map(s => ({ startMs: new Date(s.start_time).getTime(), endMs: s.end_time ? new Date(s.end_time).getTime() : Date.now() }));
+        const [a, b] = suggestManualShift(spans, dayStartMs, Date.now(), offDays.has(day) ? 0 : getTargetHoursForDate(new Date(dayStartMs), currentSchedule));
+        const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5);
+        (document.getElementById("inp-shift-start-date") as HTMLInputElement).value = localDateKey(new Date(a));
+        (document.getElementById("inp-shift-end-date") as HTMLInputElement).value = localDateKey(new Date(b));
+        (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = hhmm(a);
+        (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = hhmm(b);
         (document.getElementById("inp-shift-note") as HTMLInputElement).value = "";
         const errEl = document.getElementById("shift-error")!;
         errEl.textContent = "";
@@ -1600,7 +1304,15 @@ export function renderTracker(app: HTMLElement): void {
             const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
             cell.dataset.date = dateKey;
             if (dateKey === todayStr) cell.classList.add("cal-today");
-            if (offDayIds.has(dateKey)) cell.classList.add("cal-offday");
+            if (offDayIds.has(dateKey)) {
+                cell.classList.add("cal-offday");
+                const info = reasonInfo(offDaysCached.find(o => o.date === dateKey)?.reason);
+                cell.title = info.label;
+                if (info.key) {
+                    cell.dataset.reason = info.key;
+                    cell.insertAdjacentHTML("beforeend", `<span class="cal-reason" aria-hidden="true">${info.icon}</span>`);
+                }
+            }
             grid.appendChild(cell);
         }
     }
@@ -1650,16 +1362,31 @@ export function renderTracker(app: HTMLElement): void {
         offDragAnchor = offDragCurrent = null;
         if (!anchor || !current) return;
         try {
-            await applyOffDays(offRange(anchor, current), offDragMode);
+            const mode = offDragMode;
+            const had = new Set(offDaysCached.map(o => o.date));
+            const changed = offRange(anchor, current).filter(d => (mode === "add") !== had.has(d));
+            await applyOffDays(changed, mode);
             await refreshData(); // re-renders the calendar, clearing preview classes
-        } catch (err) { console.error("Failed to apply off days", err); }
+            if (changed.length) {
+                const what = `${changed.length} off day${changed.length > 1 ? "s" : ""}`;
+                pushUndo(mode === "add" ? `Marked ${what}` : `Cleared ${what}`, async () => {
+                    await applyOffDays(changed, mode === "add" ? "remove" : "add");
+                    await refreshData();
+                });
+            }
+        } catch (err) {
+            console.error("Failed to apply off days", err);
+            showToast("Couldn't save the off days.", { tone: "error" });
+        }
     }
 
+    const onOffDragMouseUp = () => { void endOffDrag(); };
     const offcalGrid = document.getElementById("offcal-grid");
     if (offcalGrid) {
         const cellDate = (e: Event): string | null =>
             (e.target as HTMLElement)?.closest<HTMLElement>("[data-date]")?.dataset.date ?? null;
         offcalGrid.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return; // right-click opens the reason menu instead
             const d = cellDate(e);
             if (!d) return;
             e.preventDefault(); // don't text-select while dragging
@@ -1675,7 +1402,45 @@ export function renderTracker(app: HTMLElement): void {
             offDragCurrent = d;
             paintOffDragPreview();
         });
-        window.addEventListener("mouseup", () => { void endOffDrag(); });
+        window.addEventListener("mouseup", onOffDragMouseUp);
+
+        // Right-click a day: mark it off with a reason (vacation, sick, …),
+        // change the reason, or make it a normal day again. Undoable.
+        const setReason = async (date: string, reason: string | null) => {
+            const existing = offDaysCached.find(o => o.date === date);
+            const res = existing ? await updateOffDay(existing.id, reason) : await createOffDay(date, reason);
+            if (!res.ok) throw new Error("server error");
+        };
+        const clearDay = async (date: string) => {
+            const existing = offDaysCached.find(o => o.date === date);
+            if (existing) await deleteOffDay(existing.id);
+        };
+        offcalGrid.addEventListener("contextmenu", (e) => {
+            const d = cellDate(e);
+            if (!d) return;
+            e.preventDefault();
+            const prev = offDaysCached.find(o => o.date === d);
+            const wasOff = !!prev;
+            const prevReason = prev?.reason ?? null;
+            const label = dayStart(d).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+            const restore = async () => {
+                if (wasOff) await setReason(d, prevReason); else await clearDay(d);
+                await refreshData();
+            };
+            const apply = async (what: string, action: () => Promise<void>) => {
+                try {
+                    await action();
+                    await refreshData();
+                    pushUndo(`${label}: ${what}`, restore);
+                } catch {
+                    showToast("Couldn't save the off day.", { tone: "error" });
+                }
+            };
+            showOffDayMenu({ x: e.clientX, y: e.clientY }, { label, isOff: wasOff, reason: prevReason }, {
+                setReason: (reason) => apply(reasonInfo(reason).label, () => setReason(d, reason)),
+                clear: () => apply("not an off day", () => clearDay(d)),
+            });
+        });
     }
 
     // "Off days ↓" in the clock panel scrolls the dashboard to the calendar.
@@ -1684,7 +1449,16 @@ export function renderTracker(app: HTMLElement): void {
     });
 
     // Save Work Schedule
-    document.getElementById("btn-save-schedule")?.addEventListener("click", () => {
+    // The schedule saves itself shortly after you stop typing (no Save button).
+    let scheduleSaveTimer: number | null = null;
+    document.querySelectorAll<HTMLInputElement>('[id^="cfg-hours-"]').forEach(input => {
+        input.addEventListener("input", () => {
+            if (scheduleSaveTimer !== null) window.clearTimeout(scheduleSaveTimer);
+            scheduleSaveTimer = window.setTimeout(() => void saveScheduleFromInputs(), 700);
+        });
+    });
+    async function saveScheduleFromInputs() {
+        scheduleSaveTimer = null;
         const schedule: WorkSchedule = {
             mon: parseFloat((document.getElementById("cfg-hours-mon") as HTMLInputElement).value) || 0,
             tue: parseFloat((document.getElementById("cfg-hours-tue") as HTMLInputElement).value) || 0,
@@ -1694,14 +1468,12 @@ export function renderTracker(app: HTMLElement): void {
             sat: parseFloat((document.getElementById("cfg-hours-sat") as HTMLInputElement).value) || 0,
             sun: parseFloat((document.getElementById("cfg-hours-sun") as HTMLInputElement).value) || 0
         };
-        void persistSchedule(schedule);
-
-        const savedText = document.getElementById("schedule-status-text")!;
-        savedText.style.display = "inline";
-        setTimeout(() => { savedText.style.display = "none"; }, 2000);
-
-        refreshData();
-    });
+        const status = document.getElementById("schedule-status-text")!;
+        status.textContent = "Saving…";
+        const onServer = await persistSchedule(schedule);
+        status.textContent = onServer ? "Saved ✓" : "Saved on this device — couldn't reach the server, will retry next time.";
+        void refreshData();
+    }
 
     // PWA Custom Button Setup
     const installPwaBtn = document.getElementById("btn-install-pwa");
@@ -1720,17 +1492,18 @@ export function renderTracker(app: HTMLElement): void {
 
     // Clock In/Out Action
     clockBtn.addEventListener("click", async () => {
+        if (dataStale) return;
         clockBtn.disabled = true;
         try {
             if (activeShiftCached) {
                 // Clock Out
                 const end = localIso(new Date());
-                const res = await updateShift(activeShiftCached.id, activeShiftCached.start_time, end);
+                const res = await updateShift(activeShiftCached.id, localIso(new Date(activeShiftCached.start_time)), end);
                 if (res.ok) {
                     stopTimer();
                     await refreshData();
                 } else {
-                    alert("Failed to clock out: server error");
+                    showToast("Couldn't clock out — the server didn't accept it. Try again.", { tone: "error" });
                 }
             } else {
                 // Clock In (tagged with the current project)
@@ -1739,33 +1512,14 @@ export function renderTracker(app: HTMLElement): void {
                 if (res.ok) {
                     await refreshData();
                 } else {
-                    alert("Failed to clock in: server error");
+                    showToast("Couldn't clock in — the server didn't accept it. Try again.", { tone: "error" });
                 }
             }
         } catch (e) {
             console.error(e);
+            setDataStale(true);
         } finally {
-            clockBtn.disabled = false;
-        }
-    });
-
-    // Clock Discard Action
-    discardBtn.addEventListener("click", async () => {
-        if (activeShiftCached && confirm("Discard the current active shift? This time will not be recorded.")) {
-            discardBtn.disabled = true;
-            try {
-                const res = await deleteShift(activeShiftCached.id);
-                if (res.ok) {
-                    stopTimer();
-                    await refreshData();
-                } else {
-                    alert("Failed to delete shift: server error");
-                }
-            } catch (e) {
-                console.error(e);
-            } finally {
-                discardBtn.disabled = false;
-            }
+            clockBtn.disabled = dataStale;
         }
     });
 
@@ -1830,14 +1584,16 @@ export function renderTracker(app: HTMLElement): void {
         const updateText = () => {
             const elapsedMs = Date.now() - startMs;
             if (elapsedMs < 0) {
-                timerEl.textContent = "00:00:00";
+                timerEl.textContent = "· 0:00";
                 return;
             }
             const sec = Math.floor(elapsedMs / 1000) % 60;
             const min = Math.floor(elapsedMs / 60000) % 60;
             const hrs = Math.floor(elapsedMs / 3600000);
-            timerEl.textContent = `${String(hrs).padStart(2, "0")}:${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-            updateLiveTimelineBlock();
+            timerEl.textContent = `· ${hrs}:${String(min).padStart(2, "0")}`;
+            // The running time in the browser tab, so it's visible from any tab.
+            document.title = `${hrs}:${String(min).padStart(2, "0")} · ${BASE_TITLE}`;
+            if (sec === 0) renderToday();
         };
 
         updateText();
@@ -1849,7 +1605,27 @@ export function renderTracker(app: HTMLElement): void {
             clearInterval(activeTimerId);
             activeTimerId = null;
         }
-        document.getElementById("clock-timer")!.textContent = "00:00:00";
+        document.title = BASE_TITLE;
+    }
+
+    // "Today" grows while tracking; the line under it says how much is left
+    // of today's target and, while tracking, when you'd be done.
+    let todayBase = { hours: 0, atMs: Date.now(), targetHours: 0 };
+    function renderToday() {
+        const now = Date.now();
+        const tracking = !!activeShiftCached;
+        const today = todayBase.hours + (tracking ? (now - todayBase.atMs) / 3_600_000 : 0);
+        const todayEl = document.getElementById("hours-today");
+        if (todayEl) todayEl.textContent = formatDuration(today);
+        const sub = document.getElementById("today-sub");
+        if (!sub) return;
+        const left = todayBase.targetHours - today;
+        if (todayBase.targetHours <= 0) sub.textContent = "";
+        else if (left <= 0) sub.textContent = "Target reached ✓";
+        else if (tracking) {
+            const done = new Date(now + left * 3_600_000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            sub.textContent = `${formatDuration(left)} to go · done ≈ ${done}`;
+        } else sub.textContent = `${formatDuration(left)} to go`;
     }
 
     // ── Fetch & Draw Stats ───────────────────────────────────────────
@@ -1869,7 +1645,7 @@ export function renderTracker(app: HTMLElement): void {
             return;
         }
         const dates = flagged
-            .map(s => toDateKey(s.start_time))
+            .map(s => dayKeyOf(s.start_time))
             .filter((d, i, a) => a.indexOf(d) === i)
             .sort()
             .map(d => `<strong>${escapeHtml(d)}</strong>`)
@@ -1891,8 +1667,28 @@ export function renderTracker(app: HTMLElement): void {
         });
     }
 
+    // When a refresh fails the page still shows the last data. Clocking in or
+    // out from that stale view could open a second shift, so the clock waits
+    // until a refresh succeeds again.
+    let dataStale = false;
+    function setDataStale(stale: boolean) {
+        dataStale = stale;
+        const el = document.getElementById("offline-banner");
+        if (el) {
+            el.hidden = !stale;
+            el.textContent = stale ? "Can't reach the server — showing your last loaded data. Retrying…" : "";
+        }
+        clockBtn.disabled = stale;
+    }
+
     async function refreshData() {
-        const [shiftsResp, offdaysResp, projectsResp] = await Promise.all([listShifts(), listOffDays(), listProjects()]);
+        let shiftsResp, offdaysResp, projectsResp;
+        try {
+            [shiftsResp, offdaysResp, projectsResp] = await Promise.all([listShifts(), listOffDays(), listProjects()]);
+        } catch {
+            setDataStale(true);
+            return;
+        }
 
         if (!shiftsResp.ok || !offdaysResp.ok) {
             if (shiftsResp.status === 401 || offdaysResp.status === 401) {
@@ -1900,8 +1696,10 @@ export function renderTracker(app: HTMLElement): void {
                 navigate("#/login");
                 return;
             }
+            setDataStale(true);
             return;
         }
+        setDataStale(false);
 
         shiftsCached = shiftsResp.data || [];
         offDaysCached = offdaysResp.data || [];
@@ -1910,8 +1708,7 @@ export function renderTracker(app: HTMLElement): void {
 
         // Project chip, timeline, and per-shift picker options.
         renderProjectChip();
-        renderTimelineProjectSelect();
-        renderTimelineShifts();
+        pushTimelineData();
         renderAutoClosedBanner();
 
         const offDayDates = new Set(offDaysCached.map(o => o.date));
@@ -1920,47 +1717,49 @@ export function renderTracker(app: HTMLElement): void {
         // 1. Clock panel active state & Discard button
         const statusEl = document.getElementById("clock-status")!;
         if (activeShiftCached) {
-            statusEl.textContent = "TRACKING";
-            statusEl.className = "badge badge-success";
+            // "Tracking · 1:23" like the desktop Status card.
+            if (!document.getElementById("clock-timer")) statusEl.innerHTML = `Tracking <span class="clock-elapsed" id="clock-timer"></span>`;
+            document.getElementById("card-status")?.classList.add("tracking");
             clockBtn.textContent = "Clock Out";
             clockBtn.className = "btn btn-danger";
-            discardBtn.style.display = "inline-block";
+            runningNote.hidden = false;
+            if (document.activeElement !== runningNote) runningNote.value = activeShiftCached.note ?? "";
             startTimer(activeShiftCached.start_time);
         } else {
-            statusEl.textContent = "IDLE";
-            statusEl.className = "badge";
+            statusEl.textContent = "Idle";
+            document.getElementById("card-status")?.classList.remove("tracking");
             clockBtn.textContent = "Clock In";
             clockBtn.className = "btn btn-primary";
-            discardBtn.style.display = "none";
+            runningNote.hidden = true;
             stopTimer();
         }
 
         // 2. Today hours
         const todayKey = localDateKey(now);
-        const todayHours = shiftsCached
-            .filter(s => toDateKey(s.start_time) === todayKey)
-            .reduce((sum, s) => sum + shiftDurationHours(s), 0);
-        document.getElementById("hours-today")!.textContent = formatDuration(todayHours);
+        // Hours per local day, split at midnight (a night shift counts on both days).
+        const hoursByDay = new Map<string, number>();
+        for (const s of shiftsCached) {
+            for (const [day, h] of shiftHoursByDay(s.start_time, s.end_time)) hoursByDay.set(day, (hoursByDay.get(day) ?? 0) + h);
+        }
+        const todayHours = hoursByDay.get(todayKey) ?? 0;
+        todayBase = { hours: todayHours, atMs: Date.now(), targetHours: offDayDates.has(todayKey) ? 0 : getTargetHoursForDate(now, currentSchedule) };
+        renderToday();
 
         // 3. Week hours & chart data
-        const ws = weekStartDate();
+        const ws = startOfWeek(now);
         const dayLabels: string[] = [];
         const dayKeys: string[] = [];
         let weekTotal = 0;
-        const isDark = document.documentElement.classList.contains("dark");
 
         for (let i = 0; i < 7; i++) {
             const d = addDays(ws, i);
             const key = localDateKey(d);
             dayKeys.push(key);
             dayLabels.push(d.toLocaleDateString(undefined, { weekday: "short" }));
-            weekTotal += shiftsCached
-                .filter(s => toDateKey(s.start_time) === key)
-                .reduce((sum, s) => sum + shiftDurationHours(s), 0);
+            weekTotal += hoursByDay.get(key) ?? 0;
         }
 
         document.getElementById("hours-week")!.textContent = formatDuration(weekTotal);
-        document.getElementById("shifts-count")!.textContent = String(shiftsCached.filter(s => s.end_time !== null).length);
 
         // Weekly Target Bar
         let weekTarget = 0;
@@ -1980,9 +1779,12 @@ export function renderTracker(app: HTMLElement): void {
         // 4. Weekly Performance Chart (stacked by project; click a bar to load its day)
         const weeklyCanvas = document.getElementById("weekly-chart") as HTMLCanvasElement;
         if (weeklyCanvas) {
-            const textColor = isDark ? "#888888" : "#4b5563";
-            const gridColor = isDark ? "#222222" : "#e5e7eb";
-            const weekDatasets = buildProjectStackDatasets(7, shiftsCached, shiftDurationHours, (s) => dayKeys.indexOf(toDateKey(s.start_time)));
+            const { text: textColor, grid: gridColor } = chartThemeColors();
+            const weekDatasets = buildProjectStackDatasets(
+                7, shiftsCached, s => s.project_uuid,
+                s => [...shiftHoursByDay(s.start_time, s.end_time)].map(([day, h]): [number, number] => [dayKeys.indexOf(day), h]),
+                projectLook,
+            );
             if (weeklyChartInstance) weeklyChartInstance.destroy();
             weeklyChartInstance = new Chart(weeklyCanvas, {
                 type: "bar",
@@ -1991,7 +1793,10 @@ export function renderTracker(app: HTMLElement): void {
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
-                    plugins: { legend: { display: weekDatasets.length > 1, position: "bottom", labels: { color: textColor } } },
+                    plugins: {
+                        legend: { display: weekDatasets.length > 1, position: "bottom", labels: { color: textColor } },
+                        tooltip: stackedTotalTooltip("Day Total"),
+                    },
                     scales: {
                         x: { stacked: true, grid: { color: gridColor }, ticks: { color: textColor } },
                         y: { stacked: true, beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, stepSize: 2 } }
@@ -2001,9 +1806,6 @@ export function renderTracker(app: HTMLElement): void {
                         if (!native) return;
                         const pts = chart.getElementsAtEventForMode(native, "index", { intersect: false }, false);
                         if (!pts.length) return;
-                        // The weekly bar edits in the editor's home slot; if a trend
-                        // drill has it in the slide-down, send it back first.
-                        if (drillDay != null || trendDrillStack.length) { restoreEditorHome(); trendDrillStack = []; drillDay = null; syncDrillUI(); }
                         setTimelineDay(dayKeys[pts[0].index]);
                     },
                     onHover: (evt, els) => { const el = evt.native?.target as HTMLElement | undefined; if (el) el.style.cursor = els.length ? "pointer" : "default"; }
@@ -2020,11 +1822,8 @@ export function renderTracker(app: HTMLElement): void {
         document.getElementById("stats-count-wrap")!.style.display = statsUnit === "ytd" ? "none" : "";
 
         // Get end of last week
-        const dayOfWeek = now.getDay();
-        const daysSinceSunday = dayOfWeek === 0 ? 0 : dayOfWeek;
-        const endOfLastWeek = new Date(now);
-        endOfLastWeek.setDate(endOfLastWeek.getDate() - daysSinceSunday - 1);
-        endOfLastWeek.setHours(23, 59, 59, 999);
+        // (Monday–Sunday weeks; this used to stop on Saturday.)
+        const endOfLastWeek = endOfLastCompleteWeek(now);
 
         let statsStart: Date;
         if (statsUnit === "days") statsStart = addDays(endOfLastWeek, -(statsCount - 1));
@@ -2048,18 +1847,18 @@ export function renderTracker(app: HTMLElement): void {
         const hoursPerWeek: Record<string, number> = {};
         let totalActual = 0;
 
+        const statsFromMs = statsStart.getTime();
+        const statsToMs = endOfLastWeek.getTime() + 1;
         for (const s of shiftsCached) {
             if (!s.end_time) continue;
-            const st = new Date(s.start_time);
-            const en = new Date(s.end_time);
-            if (st < statsStart || st > endOfLastWeek) continue;
-
-            const dur = (en.getTime() - st.getTime()) / 3_600_000;
-            totalActual += dur;
-            const dayKey = toDateKey(s.start_time);
-            hoursPerDay[dayKey] = (hoursPerDay[dayKey] ?? 0) + dur;
-            const wk = weekKey(st);
-            hoursPerWeek[wk] = (hoursPerWeek[wk] ?? 0) + dur;
+            const st = Math.max(new Date(s.start_time).getTime(), statsFromMs);
+            const en = Math.min(new Date(s.end_time).getTime(), statsToMs);
+            for (const [dayKey, h] of splitAcrossDays(st, en)) {
+                totalActual += h;
+                hoursPerDay[dayKey] = (hoursPerDay[dayKey] ?? 0) + h;
+                const wk = weekKey(dayStart(dayKey));
+                hoursPerWeek[wk] = (hoursPerWeek[wk] ?? 0) + h;
+            }
         }
 
         // Expected hours and off-day crediting
@@ -2080,6 +1879,10 @@ export function renderTracker(app: HTMLElement): void {
             cursor.setDate(cursor.getDate() + 1);
         }
 
+        const periodOffDays = offDaysCached.filter(o => {
+            const t = dayStart(o.date).getTime();
+            return t >= statsStart.getTime() && t <= endOfLastWeek.getTime();
+        });
         const daysWorked = Object.keys(hoursPerDay).length;
         const weeksWorked = Object.keys(hoursPerWeek).length;
         const totalForAvg = Object.values(hoursPerDay).reduce((a, b) => a + b, 0);
@@ -2087,18 +1890,38 @@ export function renderTracker(app: HTMLElement): void {
         const avgWeekly = weeksWorked > 0 ? totalForAvg / weeksWorked : 0;
         const overtime = totalActual - expectedHours;
 
-        document.getElementById("avg-daily")!.textContent = formatDuration(avgDaily);
-        document.getElementById("avg-weekly")!.textContent = formatDuration(avgWeekly);
-        document.getElementById("overtime-val")!.textContent = formatSigned(overtime);
-
+        // Averages use complete weeks only. Before the first one ends there is
+        // nothing to average: say when there will be, instead of "0h".
+        const noFullWeek = statsStart > endOfLastWeek;
+        document.getElementById("avg-daily")!.textContent = noFullWeek ? "–" : formatDuration(avgDaily);
+        document.getElementById("avg-weekly")!.textContent = noFullWeek ? "–" : formatDuration(avgWeekly);
+        // Overtime against a schedule the user never set is a made-up number:
+        // ask for the schedule instead.
+        const otVal = document.getElementById("overtime-val")!;
         const otCard = document.getElementById("overtime-card")!;
-        otCard.classList.toggle("overtime-pos", overtime >= 0);
-        otCard.classList.toggle("overtime-neg", overtime < 0);
+        if (noFullWeek) {
+            otVal.textContent = "–";
+            otCard.classList.remove("overtime-pos", "overtime-neg");
+        } else if (localStorage.getItem("tracksuite.schedule") !== null) {
+            otVal.textContent = formatSigned(overtime);
+            otCard.classList.toggle("overtime-pos", overtime >= 0);
+            otCard.classList.toggle("overtime-neg", overtime < 0);
+        } else {
+            otVal.innerHTML = `<button type="button" class="link-btn" id="btn-set-schedule">Set your schedule →</button>`;
+            otCard.classList.remove("overtime-pos", "overtime-neg");
+            document.getElementById("btn-set-schedule")!.addEventListener("click", () => {
+                (document.querySelector('.tab-link[data-target="settings"]') as HTMLButtonElement | null)?.click();
+                document.getElementById("cfg-hours-mon")?.focus();
+            });
+        }
 
-        document.getElementById("avg-detail")!.innerHTML = `
+        document.getElementById("avg-detail")!.innerHTML = noFullWeek
+            ? `<p>Averages count complete weeks (Mon–Sun). Your first one is done on <strong>${escapeHtml(addDays(endOfLastWeek, 7).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }))}</strong>.</p>`
+            : `
             <p>Period: <strong>${statsStart.toLocaleDateString()} – ${endOfLastWeek.toLocaleDateString()}</strong></p>
             <p>Days with logged hours: <strong>${daysWorked}</strong> · Complete weeks: <strong>${weeksWorked}</strong></p>
             <p>Total logged: <strong>${formatDuration(totalActual)}</strong> · Expected: <strong>${formatDuration(expectedHours)}</strong></p>
+            ${periodOffDays.length ? `<p>Off days: <strong>${escapeHtml(summarizeReasons(periodOffDays.map(o => o.reason)))}</strong></p>` : ""}
         `;
 
         // 6. ── Trends Chart & Calculations ────────────────────────────
@@ -2154,9 +1977,11 @@ export function renderTracker(app: HTMLElement): void {
 
         const trendDatasets = buildProjectStackDatasets(
             trendLabels.length,
-            trendRelevant,
-            (s) => (new Date(s.end_time!).getTime() - new Date(s.start_time).getTime()) / 3_600_000,
-            (s) => (s.end_time ? idxOf(bucketKey(new Date(s.start_time), granularity)) : -1),
+            trendRelevant.filter(s => s.end_time),
+            s => s.project_uuid,
+            s => [...shiftHoursByDay(s.start_time, s.end_time)].map(([day, h]): [number, number] =>
+                [idxOf(bucketKey(dayStart(day), granularity)), h]),
+            projectLook,
         );
         if (Object.keys(offdayCredit).length > 0) {
             let un = trendDatasets.find(d => d.label === "Unassigned");
@@ -2170,19 +1995,27 @@ export function renderTracker(app: HTMLElement): void {
 
         const trendCanvas = document.getElementById("trend-chart") as HTMLCanvasElement;
         if (trendCanvas) {
-            const textColor = isDark ? "#888888" : "#4b5563";
-            const gridColor = isDark ? "#222222" : "#e5e7eb";
+            const { text: textColor, grid: gridColor } = chartThemeColors();
             if (trendChartInstance) trendChartInstance.destroy();
             trendChartInstance = new Chart(trendCanvas, {
                 type: "bar",
-                data: { labels: trendLabels, datasets: trendDatasets },
+                data: { labels: trendLabels.map(k => bucketLabel(k, granularity)), datasets: trendDatasets },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     animation: false,
-                    onClick: (_evt, els) => { if (els.length) onTrendBarClick(els[0].index); },
+                    // Anywhere in a column counts, so an empty day can be opened to add time.
+                    onClick: (evt, _els, chart) => {
+                        const native = evt.native as Event | null;
+                        if (!native) return;
+                        const pts = chart.getElementsAtEventForMode(native, "index", { intersect: false }, false);
+                        if (pts.length) onTrendBarClick(pts[0].index);
+                    },
                     onHover: (evt, els) => { const t = (evt.native?.target as HTMLElement | undefined); if (t) t.style.cursor = els.length ? "pointer" : "default"; },
-                    plugins: { legend: { display: trendDatasets.length > 1, position: "bottom", labels: { color: textColor } } },
+                    plugins: {
+                        legend: { display: trendDatasets.length > 1, position: "bottom", labels: { color: textColor } },
+                        tooltip: stackedTotalTooltip(granularity === "month" ? "Month Total" : granularity === "week" ? "Week Total" : "Day Total"),
+                    },
                     scales: {
                         x: { stacked: true, grid: { color: gridColor }, ticks: { color: textColor } },
                         y: { stacked: true, beginAtZero: true, grid: { color: gridColor }, ticks: { color: textColor, stepSize: 2 } }
@@ -2203,16 +2036,22 @@ export function renderTracker(app: HTMLElement): void {
             .sort((a, b) => b.start_time.localeCompare(a.start_time));
 
         if (sortedShifts.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="7" class="muted" style="text-align:center; padding: 24px;">No completed shifts logged.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="6" class="muted" style="text-align:center; padding: 24px;">No completed shifts yet.</td></tr>`;
         } else {
+            // Grouped by day, each day with its total; a click on a row opens
+            // that shift in the timeline editor (times, project, note, delete).
+            let lastDay = "";
             tableBody.innerHTML = sortedShifts.slice(0, 25).map(s => {
                 const startLocal = new Date(s.start_time);
                 const endLocal = s.end_time ? new Date(s.end_time) : new Date();
                 const dur = shiftDurationHours(s);
+                const day = localDateKey(startLocal);
+                const dayHeader = day === lastDay ? "" : `<tr class="day-row"><td colspan="6"><span>${escapeHtml(
+                    startLocal.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" }))}</span><span class="day-total">${formatDuration(hoursByDay.get(day) ?? 0)}</span></td></tr>`;
+                lastDay = day;
 
-                return `
-                    <tr>
-                        <td><strong>${startLocal.toLocaleDateString()}</strong></td>
+                return dayHeader + `
+                    <tr class="shift-row" data-id="${s.id}" title="Open in the timeline">
                         <td>${startLocal.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</td>
                         <td>${s.end_time ? endLocal.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "active"}</td>
                         <td><span class="badge badge-success">${formatDuration(dur)}</span></td>
@@ -2234,20 +2073,22 @@ export function renderTracker(app: HTMLElement): void {
                 if ((s.note ?? null) === newNote) return;
                 const res = await updateShift(id, s.start_time, s.end_time, undefined, newNote);
                 if (res.ok) s.note = res.data?.note ?? newNote;
-                else alert("Failed to save note: server error.");
+                else showToast("Couldn't save the note.", { tone: "error" });
             };
             tableBody.querySelectorAll<HTMLInputElement>(".shift-note-input").forEach(input => {
                 input.addEventListener("change", () => void saveNoteInput(input));
                 // Carry-down flow: Enter saves and drops to the next row; ↓ copies
                 // the note from the row above (fast repeats without copy-paste).
                 input.addEventListener("keydown", (e) => {
+                    // Neighbouring note fields, skipping the day header rows.
+                    const all = [...tableBody.querySelectorAll<HTMLInputElement>(".shift-note-input")];
+                    const i = all.indexOf(input);
                     if (e.key === "Enter") {
                         e.preventDefault();
                         void saveNoteInput(input);
-                        const next = input.closest("tr")?.nextElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
-                        next?.focus();
+                        all[i + 1]?.focus();
                     } else if (e.key === "ArrowDown") {
-                        const prev = input.closest("tr")?.previousElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+                        const prev = all[i - 1] ?? null;
                         if (prev) {
                             e.preventDefault();
                             input.value = prev.value;
@@ -2257,33 +2098,106 @@ export function renderTracker(app: HTMLElement): void {
                 });
             });
 
+            tableBody.querySelectorAll<HTMLTableRowElement>(".shift-row").forEach(row => {
+                row.addEventListener("click", (e) => {
+                    if ((e.target as HTMLElement).closest("input, button")) return;
+                    timeline?.select(Number(row.dataset.id));
+                    document.getElementById("timeline-editor-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                });
+            });
+
             tableBody.querySelectorAll(".delete-shift-btn").forEach(btn => {
                 btn.addEventListener("click", async (e) => {
                     const target = e.currentTarget as HTMLButtonElement;
                     const id = Number(target.dataset.id);
-                    if (id && confirm("Are you sure you want to delete this shift record?")) {
-                        target.disabled = true;
-                        try {
-                            const delRes = await deleteShift(id);
-                            if (delRes.ok) {
-                                await refreshData();
-                            } else {
-                                alert("Failed to delete shift: Server error.");
-                            }
-                        } catch (err) {
-                            console.error("Error deleting shift:", err);
-                            alert("Failed to delete shift: Network or server error.");
-                        } finally {
-                            target.disabled = false;
-                        }
-                    }
+                    if (!id) return;
+                    target.disabled = true;
+                    await deleteShiftUndoable(id);
                 });
             });
         }
     }
 
+    // A note for what you're doing right now, without opening the table.
+    runningNote.addEventListener("change", async () => {
+        const s = activeShiftCached;
+        if (!s) return;
+        await updateShift(s.id, s.start_time, s.end_time, undefined, runningNote.value.trim() || null);
+        await refreshData();
+    });
+    runningNote.addEventListener("keydown", (e) => { if (e.key === "Enter") runningNote.blur(); });
+
+    // Optional focus/break timer (Settings → Focus timer; off by default).
+    const focusRing = createFocusRing(document.getElementById("focus-wrap")!, {
+        notify: (title, body) => {
+            if ("Notification" in window && Notification.permission === "granted") new Notification(title, { body });
+            else showToast(`${title} — ${body}`, { timeoutMs: 10000 });
+        },
+        pauseTracking: async () => {
+            const s = activeShiftCached;
+            if (!s) return false;
+            const res = await updateShift(s.id, localIso(new Date(s.start_time)), localIso(new Date()));
+            await refreshData();
+            return res.ok;
+        },
+        resumeTracking: async () => {
+            if (activeShiftCached) return;
+            await createShift(localIso(new Date()), null, currentProjectUuid);
+            await refreshData();
+        },
+    });
+    renderFocusSettings(document.getElementById("focus-settings")!, {
+        // Ask once, when the user turns the timer on (a user gesture).
+        onEnable: () => { if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission(); },
+    });
+
+    // Keep the open tab in the URL (#/tracker?tab=statistics), so a reload or a
+    // link lands where you were.
+    const tabFromUrl = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("tab");
+    if (tabFromUrl && tabFromUrl !== "dashboard") showTab(tabFromUrl);
+
+    // The tracker bar sticks right under the site nav, whatever its height.
+    const navObserver = new ResizeObserver(() => {
+        const nav = document.querySelector<HTMLElement>(".site-nav");
+        document.documentElement.style.setProperty("--site-nav-h", `${nav?.offsetHeight ?? 0}px`);
+    });
+    window.setTimeout(() => {
+        const nav = document.querySelector<HTMLElement>(".site-nav");
+        if (nav) navObserver.observe(nav);
+    }, 0);
+
     // Run Initial Data Pull
     refreshData();
     // Pull the shared work schedule (may adopt a newer server copy and re-render).
-    void reconcileSchedule();
+    void reconcileSchedule().catch(() => { /* offline: keep the local schedule */ });
+
+    // Another device may have clocked in/out: pull fresh state whenever the tab
+    // comes back, and retry every 30 s while the server is unreachable.
+    const onVisible = () => { if (document.visibilityState === "visible") void refreshData(); };
+    const onFocus = () => void refreshData();
+    const onTheme = () => void refreshData();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("tracksuite:themechange", onTheme);
+    const retryTimer = window.setInterval(() => { if (dataStale) void refreshData(); }, 30_000);
+
+    // Leaving the tracker: nothing of it may keep acting on the next page.
+    return () => {
+        document.removeEventListener("visibilitychange", onVisible);
+        window.removeEventListener("focus", onFocus);
+        window.removeEventListener("tracksuite:themechange", onTheme);
+        window.clearInterval(retryTimer);
+        window.removeEventListener("mouseup", onOffDragMouseUp);
+        if (activeTimerId !== null) { clearInterval(activeTimerId); activeTimerId = null; }
+        activeKeydownHandler = null;
+        activePointerMove = null;
+        activePointerUp = null;
+        activeDocClick = null;
+        timeline?.destroy(); timeline = null;
+        focusRing.destroy();
+        navObserver.disconnect();
+        document.title = BASE_TITLE;
+        weeklyChartInstance?.destroy(); weeklyChartInstance = null;
+        trendChartInstance?.destroy(); trendChartInstance = null;
+    };
 }

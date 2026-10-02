@@ -48,7 +48,7 @@ export function renderLogin(app: HTMLElement): void {
                         <label for="login-recovery">Recovery Code</label>
                         <input type="text" id="login-recovery" placeholder="ABCDE-12345" autocomplete="off" maxlength="11" />
                     </div>
-                    <button type="submit" class="btn btn-primary">Initialize Session</button>
+                    <button type="submit" class="btn btn-primary">Sign in</button>
                 </form>
                 <div class="form-footer">${footerLinks}</div>
             </div>
@@ -98,7 +98,7 @@ export function renderLogin(app: HTMLElement): void {
 
             if (res.ok) {
                 setSessionFromAuthResponse(res.data);
-                navigate("#/dashboard");
+                navigate("#/tracker");
                 // Startup ran this before there was a session to check.
                 void checkTermsAcceptance();
             } else if (res.status === 403 && /verify your email/i.test((res.data as { detail?: string })?.detail ?? "")) {
@@ -121,7 +121,7 @@ export function renderLogin(app: HTMLElement): void {
             errorEl.classList.add("visible");
         } finally {
             btn.disabled = false;
-            btn.textContent = "Initialize Session";
+            btn.textContent = "Sign in";
         }
     });
 }

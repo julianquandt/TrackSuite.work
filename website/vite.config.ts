@@ -56,6 +56,8 @@ export default defineConfig(({ mode }) => {
         },
         server: {
             port: 3000,
+            // Allow importing ../shared (code shared with the desktop app).
+            fs: { allow: [".."] },
             proxy: {
                 "/api": {
                     target: "http://127.0.0.1:8007",

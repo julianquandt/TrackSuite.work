@@ -26,10 +26,11 @@ def test_auto_sync_on_clock_out():
     """Clock-out handler fires performSync() after endShift."""
     src = _read("desktop/src/main.ts")
     assert "performSync()" in src
-    # performSync is called in the clock button handler after wasClockedIn check
-    clock_handler_idx = src.index("wasClockedIn")
-    sync_idx = src.index("performSync()", clock_handler_idx)
-    assert sync_idx > clock_handler_idx
+    # The clock handler ends/starts the shift, then syncs.
+    handler = src.split("async function onClockClick()", 1)[1].split("\n}\n", 1)[0]
+    assert handler.index("endShift()") < handler.index("performSync()")
+    # ...and guards against a double click racing itself.
+    assert "if (clockBusy) return;" in handler
 
 
 # ── Notifications ────────────────────────────────────────────────────
@@ -52,7 +53,7 @@ def test_notification_on_clock_events():
 
 
 def test_notifications_use_linux_native_command_and_non_linux_plugin_api():
-    """Linux notifications should bypass the plugin's runtime path while other platforms keep the plugin API."""
+    """Linux talks to the notification daemon directly; macOS/Windows use the plugin from Rust (and JS as a fallback)."""
     src = _read("desktop/src/main.ts")
     main_rs = _read("desktop/src-tauri/src/main.rs")
     notification_rs = _read("desktop/src-tauri/src/notification.rs")
@@ -73,7 +74,9 @@ def test_notifications_use_linux_native_command_and_non_linux_plugin_api():
     assert 'string:desktop-entry:' not in notification_rs
     assert "org.freedesktop.Notifications" in notification_rs
     assert "zbus::Connection::session()" in notification_rs
-    assert 'Err("native-linux-notifications-unsupported".to_string())' in notification_rs
+    # Non-Linux platforms notify from Rust via the plugin (the tray needs it too).
+    assert "tauri_plugin_notification::NotificationExt" in notification_rs
+    assert 'Err("native-linux-notifications-unsupported".to_string())' not in notification_rs
     assert 'Notification.permission' not in src
     assert 'new Notification(' not in src
 
@@ -173,8 +176,10 @@ def test_tray_clock_toggle():
     assert "start_shift_row" in rs
     assert "end_shift_row" in rs
     assert "set_tray_tracking_state" in rs
-    assert 'notify_async("Clocked In"' in rs
-    assert 'notify_async("Clocked Out"' in rs
+    assert 'notify_async(app, "Clocked In"' in rs
+    assert 'notify_async(app, "Clocked Out"' in rs
+    # The tray item, --toggle and a second launch share one toggle path.
+    assert '"clock" => toggle_tracking(app)' in rs
 
 
 def test_tray_sync_item():
@@ -339,7 +344,9 @@ def test_work_schedule_settings_are_present_and_persisted():
 
     assert "cfg-hours-mon" in src
     assert "cfg-hours-fri" in src
-    assert "btn-save-schedule" in src
+    # Saves itself while typing (debounced), no Save button.
+    assert "saveScheduleFromInputs" in src
+    assert "btn-save-schedule" not in src
     assert "schedule-summary" in src
     assert "getWorkSchedule" in storage
     assert "saveWorkSchedule" in storage
@@ -375,5 +382,64 @@ def test_sync_no_longer_uses_manual_user_id():
     src = _read("desktop/src/main.ts")
     assert "cfg-uid" not in src
     assert "user_id=" not in src
-    assert 'body: { date }' in _read("desktop/src/lib/api.ts")
-    assert 'body: { start_time: shift.startTime, end_time: shift.endTime }' in _read("desktop/src/lib/api.ts")
+    api = _read("desktop/src/lib/api.ts")
+    assert "user_id" not in api
+    assert "apiKey: opts.apiKey" in api
+
+
+def test_timeline_is_the_shared_component():
+    """Both apps use the shared timeline (paint, edge drag, day arrows) with undo."""
+    for path in ("desktop/src/main.ts", "website/src/pages/tracker.ts"):
+        src = _read(path)
+        assert "createTimeline(" in src
+        assert "pushUndo(" in src
+        assert 'shared/ui/ui.css' in src
+        # The old select-range -> pick -> Assign flow is gone.
+        assert "btn-timeline-assign" not in src
+        assert "moveEditorIntoSlot" not in src
+    tl = _read("shared/ui/timeline.ts")
+    for feature in ("fillRange", "assignRange", "setTimes", "setNotes", "clearAutoClosed", "showDatePicker", "ArrowLeft"):
+        assert feature in tl
+
+
+def test_no_blocking_dialogs_for_edits():
+    """Destructive edits use undo toasts, not confirm()/alert()."""
+    for path in ("desktop/src/main.ts", "website/src/pages/tracker.ts", "website/src/pages/reports.ts"):
+        src = _read(path)
+        assert "confirm(" not in src
+        assert "alert(" not in src
+
+
+def test_chart_tooltips_include_total_time():
+    """Weekly chart and trend chart tooltips include total duration."""
+    src = _read("desktop/src/main.ts")
+    assert "function stackedTotalTooltip(" in _read("shared/charts.ts")
+    assert 'stackedTotalTooltip("Day Total")' in src
+    assert 'stackedTotalTooltip("Day Total")' in _read("website/src/pages/tracker.ts")
+    assert "Month Total" in src
+    assert "Week Total" in src
+
+
+def test_dashboard_timeline_date_isolation():
+    """Statistics drill-down does not bleed into the Dashboard timeline view."""
+    src = _read("desktop/src/main.ts")
+    # The timeline keeps its own day; Statistics opens a day on the Dashboard.
+    assert "function openDayFromStats(" in src
+    assert "btn-back-to-stats" in src
+
+
+def test_tab_switch_does_not_scroll_to_timeline():
+    """Only an explicit day pick scrolls; a tab switch never does."""
+    src = _read("desktop/src/main.ts")
+    switch_tab = src.split("function switchTab(", 1)[1].split("\n}\n", 1)[0]
+    assert "setTimelineDay(" not in switch_tab
+    assert "scrollIntoView" not in switch_tab
+
+
+def test_consistent_system_date_formatting():
+    """UI uses formatSystemDate for user-facing date displays while keeping flexible ISO parsing."""
+    src = _read("desktop/src/main.ts")
+    assert "formatSystemDate" in src
+    assert "normalizeDateInputValue" in src
+    assert "toLocaleDateString" in src
+

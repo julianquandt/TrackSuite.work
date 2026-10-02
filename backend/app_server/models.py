@@ -181,6 +181,9 @@ class OffDay(Base):
     # An off-day is identified by its date; uuid is carried for parity only.
     uuid: Mapped[str | None] = mapped_column(index=True, nullable=True)
     date: Mapped[str] = mapped_column(nullable=False)
+    # Why the day is off: NULL for a plain off day, else a short code such as
+    # "vacation", "sick", "holiday" or "other". The clients own the labels.
+    reason: Mapped[str | None] = mapped_column(nullable=True)
     # Sync metadata (canonical UTC microsecond timestamps).
     updated_at: Mapped[str | None] = mapped_column(nullable=True)
     deleted: Mapped[bool] = mapped_column(nullable=False, default=False)

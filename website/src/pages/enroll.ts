@@ -1,4 +1,5 @@
 import QRCode from "qrcode";
+import { escapeHtml } from "../../../shared/text.ts";
 
 import { confirmEnrollment, resendVerification, setSession } from "../api";
 import { navigate } from "../router";
@@ -152,8 +153,8 @@ export async function mount2faSetup(container: HTMLElement, target: EnrollTarget
                 // No-email deployment: logged in immediately.
                 setSession({ accessToken: res.data.access_token, refreshToken: res.data.refresh_token });
                 nextEl.innerHTML = `<div class="btn-row auth-action-row">
-                    <button class="btn btn-primary" id="enroll-go" type="button">Continue to Dashboard</button></div>`;
-                nextEl.querySelector("#enroll-go")?.addEventListener("click", () => navigate("#/dashboard"));
+                    <button class="btn btn-primary" id="enroll-go" type="button">Continue to the tracker</button></div>`;
+                nextEl.querySelector("#enroll-go")?.addEventListener("click", () => navigate("#/tracker"));
             }
         } catch {
             errorEl.textContent = "Network error. Please try again.";
@@ -163,10 +164,4 @@ export async function mount2faSetup(container: HTMLElement, target: EnrollTarget
             confirmBtn.textContent = "Verify & Continue";
         }
     });
-}
-
-function escapeHtml(value: string): string {
-    const el = document.createElement("span");
-    el.textContent = value;
-    return el.innerHTML;
 }

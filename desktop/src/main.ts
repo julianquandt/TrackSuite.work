@@ -1,4 +1,5 @@
 import Chart from "chart.js/auto";
+import { escapeHtml, csvCell } from "../../shared/text.ts";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -6,6 +7,22 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./styles.css";
+import {
+  addDays, bucketKey, bucketLabel, endOfLastCompleteWeek, formatDuration, formatSigned,
+  localDateKey, shiftHoursByDay, splitAcrossDays, startOfWeek, weekKey,
+} from "../../shared/time.ts";
+import { buildProjectStackDatasets, stackedBarTopRadius, stackedTotalTooltip, type ProjectStackDataset } from "../../shared/charts.ts";
+import { createTimeline, type TimelineHandle } from "../../shared/ui/timeline.ts";
+import { suggestManualShift } from "../../shared/shifts.ts";
+import { showToast } from "../../shared/ui/toast.ts";
+import { pushUndo } from "../../shared/ui/undo.ts";
+import { showOffDayMenu } from "../../shared/ui/menu.ts";
+import { reasonInfo, summarizeReasons } from "../../shared/offdays.ts";
+import { createFocusRing, renderFocusSettings } from "../../shared/ui/focus.ts";
+import { renderPresets } from "../../shared/ui/presets.ts";
+import { enhanceSelects } from "../../shared/ui/select.ts";
+import { wireReportChoices, type ReportChoices } from "../../shared/ui/reportChoices.ts";
+import "../../shared/ui/ui.css";
 import { shifts, offDays, projects, settings } from "./lib/storage";
 import {
   DEFAULT_AUTO_RESUME_CONFIG,
@@ -13,6 +30,8 @@ import {
   type AutoResumeConfig,
   type ProjectRecord,
   type ShiftRecord,
+  type ShiftSnapshot,
+  type StaleClose,
   type SyncConfig,
   type AppearanceConfig,
   type WorkScheduleConfig,
@@ -31,35 +50,9 @@ let notificationPermissionGranted: boolean | null = null;
 // ── Project state ───────────────────────────────────────────────────
 let projectsCache: ProjectRecord[] = [];
 let currentProjectUuid: string | null = null;
-let timelineDate = "";
-// The visible window is the day's worked span (earliest→latest shift, padded),
-// expressed in minutes-since-midnight — not a fixed 24h.
-let timelineSpanStart = 8 * 60;
-let timelineSpanEnd = 18 * 60;
-let timelineHasShifts = false;
-let timelineStartMin: number | null = null;
-let timelineEndMin: number | null = null;
-let timelineDragStartMin = 0;
-let timelineSelStartMin = 0;
-let timelineSelEndMin = 0;
-let isTimelineDragging = false;
-let isTimelineResizingLeft = false;
-let isTimelineResizingRight = false;
-let isTimelineMoving = false;
-let timelineMoveGrabMin = 0;
-let timelineMoveOrigStart = 0;
-let timelineMoveOrigEnd = 0;
-// The day's rendered segments, for click-to-select on the track.
-let timelineBlocks: { startMin: number; endMin: number; projectUuid: string | null }[] = [];
-// Note-brush state: when active, timeline blocks become clickable/draggable to
-// "stamp" the brush note onto their shift (range-drag is suppressed).
-let brushActive = false;
-let brushPainting = false;
-let brushDirty = false;
-let brushStroke = new Set<number>();
-// In-flight note writes from the current stroke; the brush-end refresh must
-// await these, else its read can race ahead of the writes and revert the notes.
-let brushPending: Promise<unknown>[] = [];
+// The day timeline (shared/ui/timeline.ts) and the day it shows.
+let timeline: TimelineHandle | null = null;
+let timelineDayKey = localDateKey(new Date());
 
 const PROJECT_PALETTE = [
   "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6",
@@ -102,12 +95,6 @@ function nextProjectColor(): string {
     ?? PROJECT_PALETTE[projectsCache.length % PROJECT_PALETTE.length];
 }
 
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (ch) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!
-  ));
-}
-
 async function loadProjects() {
   const [list, current] = await Promise.all([
     projects.getProjects(),
@@ -124,7 +111,9 @@ async function notify(title: string, body?: string) {
       await invoke("show_native_notification", { title, body: body ?? null });
       return;
     } catch (error) {
-      if (!(error instanceof Error) || error.message !== "native-linux-notifications-unsupported") {
+      // Tauri rejects invoke() with the plain error string, not an Error.
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== "native-linux-notifications-unsupported") {
         console.warn("Desktop notification failed", error);
         return;
       }
@@ -195,43 +184,23 @@ function formatHoursValue(hours: number): string {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function formatDuration(hours: number): string {
-  const h = Math.floor(Math.abs(hours));
-  const m = Math.round((Math.abs(hours) - h) * 60);
-  const sign = hours < 0 ? "-" : "";
-  return m > 0 ? `${sign}${h}h ${m}m` : `${sign}${h}h`;
-}
-
-function formatSigned(hours: number): string {
-  const prefix = hours >= 0 ? "+" : "";
-  return prefix + formatDuration(hours);
-}
-
 function shiftDurationHours(s: ShiftRecord): number {
   const start = new Date(s.startTime).getTime();
   const end = s.endTime ? new Date(s.endTime).getTime() : Date.now();
   return (end - start) / 3_600_000;
 }
 
-function toDateKey(iso: string): string {
-  return iso.slice(0, 10);
-}
-
-function localDateKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function formatTimeFromMinutes(minutes: number): string {
-  // Round to whole minutes: block-click selections carry fractional minutes
-  // (derived from second-precision timestamps) that would otherwise render as
-  // "09:03.7833333333".
-  const total = Math.round(minutes);
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+/** Formats a date using the user's system / environment default locale consistently. */
+function formatSystemDate(d: Date | string): string {
+  if (typeof d === "string") {
+    const trimmed = d.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      const parts = trimmed.split("-").map(Number);
+      return new Date(parts[0], parts[1] - 1, parts[2]).toLocaleDateString();
+    }
+    return new Date(trimmed).toLocaleDateString();
+  }
+  return d.toLocaleDateString();
 }
 
 function parseLocalDate(dateStr: string, timeStr: string): Date {
@@ -240,34 +209,76 @@ function parseLocalDate(dateStr: string, timeStr: string): Date {
   return new Date(parts[0], parts[1] - 1, parts[2], timeParts[0], timeParts[1], timeParts[2] || 0);
 }
 
-function weekStartDate(): Date {
-  const now = new Date();
-  const day = now.getDay();
-  const diff = day === 0 ? 6 : day - 1; // Monday = start
-  const d = new Date(now);
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() - diff);
-  return d;
-}
-
-function addDays(d: Date, n: number): Date {
-  const r = new Date(d);
-  r.setDate(r.getDate() + n);
-  return r;
-}
-
 function dateInputToLocalDate(dateText: string): Date {
-  return new Date(`${dateText}T00:00:00`);
+  const normalized = normalizeDateInputValue(dateText);
+  return new Date(`${normalized || dateText}T00:00:00`);
+}
+
+function getSystemDateFormatOrder(): "dmy" | "mdy" | "ymd" {
+  const test = new Date(2026, 0, 20).toLocaleDateString();
+  const digits = test.match(/\d+/g);
+  if (digits && digits.length >= 3) {
+    if (digits[0] === "20") return "dmy";
+    if (digits[0] === "1" || digits[0] === "01") return "mdy";
+    if (digits[0] === "2026") return "ymd";
+  }
+  return "mdy";
+}
+
+function getSystemDateFormatPattern(): string {
+  const test = new Date(2026, 0, 20).toLocaleDateString();
+  const sep = test.match(/[\/\.-]/)?.[0] || "/";
+  const order = getSystemDateFormatOrder();
+  if (order === "dmy") return `DD${sep}MM${sep}YYYY`;
+  if (order === "ymd") return `YYYY${sep}MM${sep}DD`;
+  return `MM${sep}DD${sep}YYYY`;
 }
 
 function normalizeDateInputValue(dateText: string): string | null {
   const trimmed = dateText.trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  // YYYY-MM-DD (ISO)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const [y, m, d] = trimmed.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d) {
+      return trimmed;
+    }
+    return null;
+  }
 
-  const parsed = dateInputToLocalDate(trimmed);
-  if (Number.isNaN(parsed.getTime())) return null;
+  // DD/MM/YYYY, MM/DD/YYYY, DD.MM.YYYY, etc.
+  const dmyMatch = trimmed.match(/^(\d{1,2})[\/\.-](\d{1,2})[\/\.-](\d{4})$/);
+  if (dmyMatch) {
+    const p1 = Number(dmyMatch[1]);
+    const p2 = Number(dmyMatch[2]);
+    const y = Number(dmyMatch[3]);
+    let day = p1;
+    let month = p2;
+    if (p1 > 12 && p2 <= 12) {
+      day = p1;
+      month = p2;
+    } else if (p2 > 12 && p1 <= 12) {
+      day = p2;
+      month = p1;
+    } else {
+      const order = getSystemDateFormatOrder();
+      if (order === "dmy") {
+        day = p1;
+        month = p2;
+      } else {
+        month = p1;
+        day = p2;
+      }
+    }
+    const dt = new Date(y, month - 1, day);
+    if (dt.getFullYear() === y && dt.getMonth() === month - 1 && dt.getDate() === day) {
+      const mm = String(month).padStart(2, "0");
+      const dd = String(day).padStart(2, "0");
+      return `${y}-${mm}-${dd}`;
+    }
+  }
 
-  return localDateKey(parsed) === trimmed ? trimmed : null;
+  return null;
 }
 
 function normalizeTimeInputValue(timeText: string): string | null {
@@ -426,7 +437,9 @@ async function handleSystemSuspend() {
     return;
   }
 
-  await shifts.endShift();
+  // Only a shift this machine is tracking: closing the lid must not end a
+  // shift that was started on another device.
+  if (!(await shifts.endLocalShift())) return;
 
   if (currentAutoResumeConfig.enabled) {
     await setAutoResumePending({
@@ -456,42 +469,14 @@ async function handleSystemResume() {
   notify("Auto Clock-In", "Shift resumed after system wake");
 }
 
-// ── Liveness heartbeat + stale-session recovery ─────────────────────
+// ── Stale-session recovery ──────────────────────────────────────────
 // system-suspend is unreliable (no inhibitor lock; never fires on crash or
 // power loss), so a shift can be left open and later closed to "now" —
-// producing runaway durations. While tracking we stamp last_active_at every
-// few minutes; on startup / resume / focus / tick we retro-close any
-// desktop-origin shift whose heartbeat has gone stale, to its last active
-// time (the Rust side does the check and the close).
-const HEARTBEAT_MS = 5 * 60 * 1000;
+// producing runaway durations. The Rust background loop stamps a heartbeat
+// while this machine tracks and retro-closes a shift whose heartbeat went
+// stale (it reports that via "shift-auto-closed"); the UI also checks right
+// away on resume and focus.
 const STALE_MINUTES = 11; // ~2 missed beats before we consider a session dead
-let heartbeatTimer: number | null = null;
-let liveBlockTimer: number | null = null;
-
-function updateHeartbeat() {
-  if (isTracking && heartbeatTimer === null) {
-    heartbeatTimer = window.setInterval(() => {
-      void (async () => {
-        // A fired tick after a long gap means the app was frozen/asleep:
-        // recover first, then beat for the (possibly fresh) shift.
-        await checkStaleAndRecover();
-        if (isTracking) await shifts.heartbeat();
-      })();
-    }, HEARTBEAT_MS);
-  } else if (!isTracking && heartbeatTimer !== null) {
-    window.clearInterval(heartbeatTimer);
-    heartbeatTimer = null;
-  }
-
-  // Per-second ticker that grows the live timeline block while tracking. There's
-  // no other sub-minute UI clock in the desktop app, so this is dedicated.
-  if (isTracking && liveBlockTimer === null) {
-    liveBlockTimer = window.setInterval(updateLiveTimelineBlock, 1000);
-  } else if (!isTracking && liveBlockTimer !== null) {
-    window.clearInterval(liveBlockTimer);
-    liveBlockTimer = null;
-  }
-}
 
 async function checkStaleAndRecover() {
   let closed;
@@ -500,15 +485,16 @@ async function checkStaleAndRecover() {
   } catch {
     return; // non-critical; try again on the next trigger
   }
-  if (!closed) return;
+  if (closed) await onShiftAutoClosed(closed);
+}
+
+/** A shift was closed for the user: say so, maybe resume, sync. */
+async function onShiftAutoClosed(closed: StaleClose) {
   await refresh();
-  const endLabel = new Date(closed.endTime).toLocaleString([], {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
+  const endLabel = new Date(closed.endTime).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
   notify(
     "Shift auto-closed",
-    `A shift left running was closed at ${endLabel}. Review it if the time looks off.`,
+    `A shift left running was closed at ${endLabel}. Check its end time on the timeline (amber edge).`,
   );
   // Within work hours, resume a fresh shift (mirrors suspend/resume behaviour).
   if (
@@ -521,6 +507,12 @@ async function checkStaleAndRecover() {
     notify("Auto Clock-In", "Shift resumed");
   }
   performSync();
+}
+
+/** Handle (once) a close done by the Rust background loop. */
+async function takeAutoClosed() {
+  const closed = await shifts.takeAutoClosedShift().catch(() => null);
+  if (closed) await onShiftAutoClosed(closed);
 }
 
 function getScheduleHoursInput(day: WorkdayKey): HTMLInputElement | null {
@@ -588,9 +580,11 @@ function updateWorkSchedulePreview() {
 type Tab = "dashboard" | "statistics" | "reports" | "settings";
 
 function switchTab(tab: Tab) {
-  // The trend drill borrows the timeline editor into the Statistics tab; send it
-  // home before showing any other tab (esp. the dashboard, which owns it).
-  if (tab !== "statistics") restoreDrill();
+  // "Back to Statistics" only makes sense right after opening a day from there.
+  if (tab !== "dashboard") {
+    const back = document.getElementById("btn-back-to-stats");
+    if (back) back.hidden = true;
+  }
   document.querySelectorAll<HTMLElement>(".tab-page").forEach((p) => {
     const active = p.dataset.tab === tab;
     p.classList.toggle("tab-hidden", !active);
@@ -598,7 +592,7 @@ function switchTab(tab: Tab) {
   document.querySelectorAll<HTMLElement>(".tab-btn").forEach((b) => {
     b.classList.toggle("tab-active", b.dataset.tab === tab);
   });
-  if (tab === "dashboard") { refresh(); }
+  if (tab === "dashboard") refresh();
   if (tab === "settings") loadSettings();
   if (tab === "reports") renderReportsTab();
   if (tab === "statistics") {
@@ -626,8 +620,12 @@ app.innerHTML = `
         <button class="tab-btn tab-full-only" data-tab="reports" hidden>Reports</button>
         <button class="tab-btn" data-tab="settings">Settings</button>
       </nav>
-      <div id="project-chip-wrap" class="project-chip-wrap"></div>
-      <div id="clock-btn-wrap"></div>
+      <div class="header-actions">
+        <div id="project-chip-wrap" class="project-chip-wrap"></div>
+        <span id="sync-dot" class="sync-dot" hidden></span>
+        <span id="focus-wrap" class="focus-wrap"></span>
+        <div id="clock-btn-wrap"></div>
+      </div>
     </header>
 
     <!-- ═══ Dashboard tab ═══ -->
@@ -636,6 +634,7 @@ app.innerHTML = `
         <div class="stat-card" id="stat-today">
           <p class="stat-label">Today</p>
           <p class="stat-value" id="today-hours">–</p>
+          <p class="stat-sub" id="today-sub"></p>
         </div>
         <div class="stat-card" id="stat-week">
           <p class="stat-label">This week</p>
@@ -644,6 +643,7 @@ app.innerHTML = `
         <div class="stat-card" id="stat-status">
           <p class="stat-label">Status</p>
           <p class="stat-value" id="status-text">–</p>
+          <input type="text" id="running-note" class="running-note" maxlength="500" placeholder="What are you working on?" autocomplete="off" hidden>
         </div>
       </section>
 
@@ -658,42 +658,13 @@ app.innerHTML = `
         <div class="chart-wrap" style="height:220px"><canvas id="weekly-chart"></canvas></div>
       </section>
 
-      <!-- Day Timeline Editor -->
+      <!-- Day timeline (shared/ui/timeline.ts) -->
       <section class="panel" id="timeline-editor-panel">
         <div class="panel-header">
-          <div class="panel-title-row">
-            <h2>Day timeline editor</h2>
-            <span class="help-hint" tabindex="0" title="Click a bar in Weekly hours to pick a day. Drag across the track to select a range (or click a segment to select it); drag the selection to move it, or its edges to resize. Then Assign a project — or Remove / press Delete to clear an assignment.">ⓘ</span>
-          </div>
-          <span class="muted" id="timeline-day-label"></span>
+          <h2>Day</h2>
+          <button type="button" class="btn btn-sm" id="btn-back-to-stats" hidden>← Back to Statistics</button>
         </div>
-
-        <div class="timeline-editor-wrapper" id="timeline-editor-wrapper">
-          <div class="timeline-ticks" id="timeline-ticks"></div>
-          <div class="timeline-container" id="timeline-container">
-            <div class="timeline-track" id="timeline-track">
-              <div class="timeline-selection" id="timeline-selection" style="display: none;">
-                <div class="timeline-handle handle-left" id="handle-left"></div>
-                <div class="timeline-handle handle-right" id="handle-right"></div>
-              </div>
-            </div>
-          </div>
-          <p class="timeline-empty" id="timeline-empty" hidden>No shifts recorded on this day.</p>
-        </div>
-
-        <div class="timeline-controls">
-          <span class="timeline-selection-label" id="timeline-selection-label">No range selected. Drag on the timeline above to select.</span>
-          <div class="timeline-actions">
-            <select id="timeline-project-select" class="timeline-project-select" disabled></select>
-            <button class="btn btn-primary btn-sm" id="btn-timeline-assign" disabled>Assign</button>
-            <button class="btn btn-ghost btn-sm" id="btn-timeline-remove" disabled title="Clear the project from this range (or press Delete)">Remove</button>
-          </div>
-        </div>
-        <div class="timeline-brush" id="timeline-brush">
-          <button class="btn btn-ghost btn-sm" id="btn-brush-toggle" type="button" title="Paint a note onto shift blocks">🖌 Note brush</button>
-          <input type="text" id="timeline-brush-note" class="timeline-brush-input" placeholder="Turn on the brush, type a note, then click blocks to stamp it" maxlength="500" disabled>
-          <span class="muted timeline-brush-hint" id="timeline-brush-hint"></span>
-        </div>
+        <div id="timeline-root"></div>
       </section>
 
       <section class="panel">
@@ -702,14 +673,12 @@ app.innerHTML = `
           <div class="btn-row">
             <button class="btn btn-sm" id="btn-add-shift">+ Add shift</button>
             <button class="btn btn-sm" id="btn-jump-offdays" title="Jump to the off-days calendar">Off days ↓</button>
-            <button class="btn btn-sm" id="btn-export">Export CSV</button>
-            <button class="btn btn-sm" id="btn-import">Import CSV</button>
           </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Project</th><th>Note</th><th></th></tr>
+              <tr><th>Start</th><th>End</th><th>Duration</th><th>Project</th><th>Note</th><th></th></tr>
             </thead>
             <tbody id="shift-body"></tbody>
           </table>
@@ -729,7 +698,7 @@ app.innerHTML = `
           <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
         </div>
         <div class="calendar-grid" id="offcal-grid"></div>
-        <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Click a single day to toggle it.</p>
+        <p class="muted offcal-hint">Drag across days to mark them as off days — drag over existing off days to clear them. Right-click a day to give it a reason (vacation, sick leave, …).</p>
       </section>
     </div>
 
@@ -754,6 +723,9 @@ app.innerHTML = `
         <div class="panel-header">
           <h2>Averages</h2>
         </div>
+        <div id="avg-presets"></div>
+        <details class="ui-custom">
+        <summary>Custom range</summary>
         <div class="control-row">
           <label class="ctrl">
             Period
@@ -768,6 +740,9 @@ app.innerHTML = `
             Count
             <input type="number" id="stats-count" value="4" min="1" max="365">
           </label>
+        </div>
+        </details>
+        <div class="control-row">
           <label class="ctrl toggle-label">
             <input type="checkbox" id="stats-holidays">
             <span id="stats-holidays-label">Include off-days as credited hours</span>
@@ -780,6 +755,9 @@ app.innerHTML = `
         <div class="panel-header">
           <h2>Trends</h2>
         </div>
+        <div id="trend-presets"></div>
+        <details class="ui-custom">
+        <summary>Custom range</summary>
         <div class="control-row">
           <label class="ctrl">
             Show last
@@ -802,18 +780,16 @@ app.innerHTML = `
             </select>
           </label>
         </div>
+        </details>
         <div class="chart-wrap" style="height:280px"><canvas id="trend-chart"></canvas></div>
-        <p class="trend-hint muted">Click a bar to edit that day’s sessions — week/month bars zoom in first.</p>
+        <p class="trend-hint muted">Click a day to open it — week and month bars zoom in first.</p>
         <div class="project-summary" id="project-summary"></div>
 
-        <!-- Slide-down day editor: drill into any day from the trend chart -->
+        <!-- Zoomed trend view: breadcrumbs back out -->
         <div id="trend-drill-panel" class="trend-drill-panel" hidden>
           <div class="trend-drill-head">
             <div class="trend-drill-crumbs" id="trend-drill-crumbs"></div>
             <button type="button" class="btn btn-outline trend-drill-close" id="trend-drill-close">Close</button>
-          </div>
-          <div class="trend-drill-slot" id="trend-drill-slot">
-            <p class="muted trend-drill-empty" id="trend-drill-empty">Click a day bar above to edit that day’s sessions.</p>
           </div>
         </div>
       </section>
@@ -828,8 +804,8 @@ app.innerHTML = `
 
       <details class="panel" id="rp-profile-panel">
         <summary class="reports-summary-toggle"><strong>Letterhead &amp; Profile</strong><span class="muted"> — appears at the top of printed reports</span></summary>
-        <div id="rp-profile-unavailable" class="muted" hidden>Configure sync (server URL + key) in Settings to use the shared report profile.</div>
-        <div id="rp-profile-body" hidden>
+        <p class="muted" id="rp-profile-where"></p>
+        <div id="rp-profile-body">
           <div class="reports-profile-grid">
             <label>Your name<input type="text" id="pf-name" maxlength="120" placeholder="e.g. Alex Rivera"></label>
             <label>Company<input type="text" id="pf-company" maxlength="120" placeholder="ACME GmbH"></label>
@@ -855,6 +831,7 @@ app.innerHTML = `
       <section class="panel no-print">
         <div class="panel-header"><h2>Generate</h2></div>
         <p class="muted">Hourly rates are set per project — open the project menu and choose <strong>Manage projects</strong>.</p>
+        <div id="rp-range-presets"></div>
         <div class="reports-filter-grid">
           <label>Style<select id="rp-style">
             <option value="client">Client report (hours × rate)</option>
@@ -867,7 +844,6 @@ app.innerHTML = `
           <label class="reports-check" id="rp-times-wrap"><input type="checkbox" id="rp-times"> Show work times (don't pool same day)</label>
         </div>
         <div class="btn-row" style="margin-top:12px">
-          <button class="btn btn-primary" type="button" id="rp-generate">Generate</button>
           <button class="btn btn-outline" type="button" id="rp-csv">Export CSV</button>
           <button class="btn btn-outline" type="button" id="rp-print">Print / Save as PDF</button>
         </div>
@@ -904,10 +880,13 @@ app.innerHTML = `
           <label class="schedule-hour-row"><span>Sunday</span><input type="number" id="cfg-hours-sun" min="0" step="0.1" inputmode="decimal"></label>
         </div>
         <p class="muted" id="schedule-summary"></p>
-        <div class="btn-row" style="margin-top:16px">
-          <button class="btn btn-primary" id="btn-save-schedule">Save work schedule</button>
-          <span class="muted" id="schedule-status"></span>
-        </div>
+        <p class="muted" id="schedule-status"></p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header"><h2>Focus timer</h2></div>
+        <p class="muted">An optional timer for focus and breaks. It sits next to the clock button and never starts a round by itself.</p>
+        <div id="focus-settings"></div>
       </section>
 
       <section class="panel">
@@ -970,9 +949,25 @@ app.innerHTML = `
           </label>
         </div>
         <div class="btn-row" style="margin-top:16px">
-          <button class="btn btn-primary" id="btn-save-cfg">Save</button>
-          <button class="btn" id="btn-sync-now">Sync now</button>
+          <button class="btn btn-primary" id="btn-save-cfg">Save &amp; sync</button>
           <span class="muted" id="sync-status"></span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header"><h2>Your data</h2></div>
+        <p class="muted">Everything as a CSV file (shifts with project and note, and off days), or bring shifts in from such a file.</p>
+        <div class="btn-row">
+          <button class="btn btn-sm" id="btn-export">Export CSV</button>
+          <button class="btn btn-sm" id="btn-import">Import CSV</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header"><h2>About</h2></div>
+        <div class="btn-row">
+          <span class="muted" id="about-version">TrackSuite.work</span>
+          <button class="btn btn-sm" type="button" id="btn-whats-new">What's new</button>
         </div>
       </section>
     </div>
@@ -982,17 +977,19 @@ app.innerHTML = `
   <dialog id="dlg-shift" class="modal modal-wide">
     <form id="form-shift">
       <h3>Add shift manually</h3>
-      <p class="modal-note">Enter dates as YYYY-MM-DD and times as 24-hour HH:MM.</p>
+      <p class="modal-note" id="shift-form-note">Enter times as 24-hour HH:MM.</p>
       <p id="shift-form-error" class="modal-error" hidden></p>
       <div class="modal-grid">
         <label>Start date
-          <input type="text" id="inp-shift-start-date" placeholder="2026-04-01" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+          <input type="text" id="inp-shift-start-date" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+          <span class="date-preview" id="inp-shift-start-date-preview"></span>
         </label>
         <label>Start time
           <input type="text" id="inp-shift-start-time" placeholder="09:00" inputmode="numeric" autocomplete="off" spellcheck="false" required>
         </label>
         <label>End date
-          <input type="text" id="inp-shift-end-date" placeholder="2026-04-01" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+          <input type="text" id="inp-shift-end-date" inputmode="numeric" autocomplete="off" spellcheck="false" required>
+          <span class="date-preview" id="inp-shift-end-date-preview"></span>
         </label>
         <label>End time
           <input type="text" id="inp-shift-end-time" placeholder="17:30" inputmode="numeric" autocomplete="off" spellcheck="false" required>
@@ -1078,7 +1075,44 @@ app.innerHTML = `
 `;
 
 // ── Wire tab buttons ────────────────────────────────────────────────
-initTimeline();
+buildTimeline();
+// App-styled dropdowns everywhere (the native selects stay underneath).
+enhanceSelects(document.querySelector("main.shell")!);
+
+// Optional focus/break timer (Settings → Focus timer; off by default).
+// Started at boot: its first tick updates the live clock, defined further down.
+function initFocusTimer() {
+  createFocusRing(document.getElementById("focus-wrap")!, {
+    notify: (title, body) => void notify(title, body),
+    pauseTracking: async () => {
+      if (!(await shifts.getActiveShift())) return false;
+      const ended = await shifts.endShift();
+      await refresh();
+      performSync();
+      return ended;
+    },
+    resumeTracking: async () => {
+      if (await shifts.getActiveShift()) return;
+      await shifts.startShift();
+      await refresh();
+      performSync();
+    },
+    setStatus: (text) => { focusStatusText = text; renderLiveClock(); },
+  });
+}
+renderFocusSettings(document.getElementById("focus-settings")!);
+
+document.getElementById("running-note")!.addEventListener("change", async (e) => {
+  const input = e.target as HTMLInputElement;
+  const id = Number(input.dataset.id);
+  if (!id) return;
+  await shifts.setShiftNote(id, input.value.trim() || null);
+  await refresh();
+  performSync();
+});
+document.getElementById("running-note")!.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+});
 
 document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
   btn.addEventListener("click", () => switchTab(btn.dataset.tab as Tab));
@@ -1221,12 +1255,23 @@ function renderProjectsManageList() {
     currencyEl?.addEventListener("change", save);
     archEl.addEventListener("change", save);
     row.querySelector(".pm-delete")!.addEventListener("click", async () => {
+      // Delete at once (its shifts become Unassigned); Undo brings both back.
+      const tagged = (await shifts.getAllShifts()).filter((s) => s.projectUuid === uuid).map(toSnapshot);
       await projects.deleteProject(uuid);
       await loadProjects();
       renderProjectsManageList();
       renderProjectChip();
       await refresh();
       performSync();
+      pushUndo(`Deleted project ${proj?.name ?? ""}`.trim(), async () => {
+        await projects.restoreProject(uuid);
+        if (tagged.length) await shifts.restoreShifts(tagged, []);
+        await loadProjects();
+        renderProjectsManageList();
+        renderProjectChip();
+        await refresh();
+        performSync();
+      });
     });
   });
 }
@@ -1236,543 +1281,248 @@ function openProjectsDialog() {
   (document.getElementById("dlg-projects") as HTMLDialogElement).showModal();
 }
 
-let timelineShiftsCache: ShiftRecord[] = [];
+// ═══════════════════════════════════════════════════════════════════
+//  DAY TIMELINE + UNDO
+// ═══════════════════════════════════════════════════════════════════
 
-// Stamp the brush note onto one shift block: optimistic DOM update + persist.
-// Skips blocks already painted in this stroke so a drag doesn't re-write them.
-async function stampNoteOnBlock(el: HTMLElement): Promise<void> {
-  const id = Number(el.dataset.shiftId);
-  if (!id || brushStroke.has(id)) return;
-  brushStroke.add(id);
-  const raw = (document.getElementById("timeline-brush-note") as HTMLInputElement).value.trim();
-  const newNote = raw === "" ? null : raw;
-  el.classList.toggle("has-note", !!newNote);
-  el.classList.add("just-stamped");
-  setTimeout(() => el.classList.remove("just-stamped"), 400);
-  const dot = el.querySelector(".tl-note-dot");
-  if (newNote && !dot) el.insertAdjacentHTML("beforeend", `<span class="tl-note-dot">•</span>`);
-  else if (!newNote && dot) dot.remove();
-  brushDirty = true;
-  await shifts.setShiftNote(id, newNote);
-}
+// The latest shift list, for undo snapshots and the timeline adapter.
+let shiftsCache: ShiftRecord[] = [];
 
-function initBrush() {
-  const toggle = document.getElementById("btn-brush-toggle") as HTMLButtonElement | null;
-  const input = document.getElementById("timeline-brush-note") as HTMLInputElement | null;
-  const hint = document.getElementById("timeline-brush-hint");
-  const wrapper = document.getElementById("timeline-editor-wrapper");
-  if (!toggle || !input || !hint || !wrapper) return;
-  toggle.addEventListener("click", () => {
-    brushActive = !brushActive;
-    toggle.classList.toggle("active", brushActive);
-    wrapper.classList.toggle("brush-mode", brushActive);
-    input.disabled = !brushActive;
-    if (brushActive) {
-      timelineSelStartMin = timelineSelEndMin = 0;
-      updateSelectionUI();
-      hint.textContent = "Click a block to stamp the note; drag across to cover several. Empty note = erase.";
-      input.focus();
-    } else {
-      hint.textContent = "";
-    }
-    renderTimelineShifts(timelineShiftsCache);
-  });
-}
+const toSnapshot = (s: ShiftRecord): ShiftSnapshot => ({
+  uuid: s.uuid,
+  startTime: s.startTime,
+  endTime: s.endTime,
+  projectUuid: s.projectUuid ?? null,
+  note: s.note ?? null,
+  autoClosedAt: s.autoClosedAt ?? null,
+});
 
-function renderTimelineShifts(allShifts: ShiftRecord[]) {
-  timelineShiftsCache = allShifts;
-  const track = document.getElementById("timeline-track");
-  if (!track) return;
+const spanOf = (s: ShiftRecord): [number, number] =>
+  [new Date(s.startTime).getTime(), s.endTime ? new Date(s.endTime).getTime() : Date.now()];
 
-  // Clear existing shift blocks (keep the selection element!)
-  const selectionEl = document.getElementById("timeline-selection");
-  track.innerHTML = "";
-  if (selectionEl) {
-    track.appendChild(selectionEl);
-  }
-
-  if (!timelineDate) {
-    timelineDate = localDateKey(new Date());
-  }
-
-  const dayStartMs = parseLocalDate(timelineDate, "00:00:00").getTime();
-  const dayEndMs = dayStartMs + 1440 * 60000;
-
-  // Closed shifts overlapping this day, clamped to day bounds, in minutes.
-  const blocks = allShifts
-    .filter((s) => s.endTime && new Date(s.startTime).getTime() < dayEndMs && new Date(s.endTime).getTime() > dayStartMs)
-    .map((s) => {
-      const startMin = (Math.max(new Date(s.startTime).getTime(), dayStartMs) - dayStartMs) / 60000;
-      const endMin = (Math.min(new Date(s.endTime!).getTime(), dayEndMs) - dayStartMs) / 60000;
-      return { s, startMin, endMin, live: false };
-    });
-
-  // The running shift has no endTime, so it never lands in `blocks`. Render it as
-  // a live block whose right edge tracks "now" (capped to the day) and grows on a
-  // per-second tick — see updateLiveTimelineBlock().
-  const nowMs = Date.now();
-  const active = allShifts.find((s) => !s.endTime);
-  let liveEntry: { s: ShiftRecord; startMin: number; endMin: number; live: boolean } | null = null;
-  if (active) {
-    const st = new Date(active.startTime).getTime();
-    if (st < dayEndMs && Math.min(nowMs, dayEndMs) > dayStartMs) {
-      liveEntry = {
-        s: active,
-        startMin: (Math.max(st, dayStartMs) - dayStartMs) / 60000,
-        endMin: (Math.min(nowMs, dayEndMs) - dayStartMs) / 60000,
-        live: true,
-      };
-    }
-  }
-
-  const entries = liveEntry ? [...blocks, liveEntry] : blocks;
-  timelineHasShifts = entries.length > 0;
-  const container = document.getElementById("timeline-container");
-  const ticksEl = document.getElementById("timeline-ticks");
-  const emptyEl = document.getElementById("timeline-empty");
-  if (container) container.style.display = timelineHasShifts ? "" : "none";
-  if (ticksEl) ticksEl.style.display = timelineHasShifts ? "" : "none";
-  if (emptyEl) emptyEl.hidden = timelineHasShifts;
-
-  renderTimelineDayLabel();
-  // Range-assign occupancy excludes the open shift: splitting a running shift by
-  // range is not supported. The live block stays note-brushable only.
-  timelineBlocks = blocks.map((b) => ({ startMin: b.startMin, endMin: b.endMin, projectUuid: b.s.projectUuid ?? null }));
-
-  if (!timelineHasShifts) {
-    timelineSpanStart = 8 * 60;
-    timelineSpanEnd = 18 * 60;
-    return;
-  }
-
-  // Zoom the window to the worked span (± 30 min padding, snapped to 30 min).
-  const minStart = Math.min(...entries.map((b) => b.startMin));
-  const maxEnd = Math.max(...entries.map((b) => b.endMin));
-  timelineSpanStart = Math.max(0, Math.floor((minStart - 30) / 30) * 30);
-  timelineSpanEnd = Math.min(1440, Math.ceil((maxEnd + 30) / 30) * 30);
-  if (timelineSpanEnd - timelineSpanStart < 60) {
-    timelineSpanEnd = Math.min(1440, timelineSpanStart + 60);
-  }
-  const span = timelineSpanEnd - timelineSpanStart;
-
-  for (const b of entries) {
-    const start = new Date(b.s.startTime);
-    const blockColor = projectColor(b.s.projectUuid);
-    const shiftDiv = document.createElement("div");
-    shiftDiv.className = "timeline-shift";
-    const note = b.s.note ?? "";
-    if (note) shiftDiv.classList.add("has-note");
-    if (brushActive) shiftDiv.classList.add("brushable");
-    if (b.live) { shiftDiv.classList.add("timeline-live"); shiftDiv.id = "timeline-live-block"; }
-    shiftDiv.dataset.shiftId = String(b.s.id);
-    shiftDiv.style.left = `${((b.startMin - timelineSpanStart) / span) * 100}%`;
-    shiftDiv.style.width = `${((b.endMin - b.startMin) / span) * 100}%`;
-    shiftDiv.style.backgroundColor = blockColor;
-    shiftDiv.style.color = contrastText(blockColor);
-    shiftDiv.style.textShadow = "none";
-
-    const name = projectName(b.s.projectUuid);
-    const durHours = (b.endMin - b.startMin) / 60;
-    shiftDiv.innerHTML = `<span class="tl-shift-label">${escapeHtml(name)} (${durHours.toFixed(1)}h)</span>${note ? `<span class="tl-note-dot">•</span>` : ""}`;
-    const from = start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    if (b.live) {
-      shiftDiv.title = note ? `${name}: ${from} – now (running)\nNote: ${note}` : `${name}: ${from} – now (running)`;
-    } else {
-      const times = `${from} – ${new Date(b.s.endTime!).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-      shiftDiv.title = note ? `${name}: ${times}\nNote: ${note}` : `${name}: ${times}`;
-    }
-    track.appendChild(shiftDiv);
-  }
-
-  renderTimelineTicks();
-}
-
-// Grow the live (running-shift) block each second without a full re-render, so
-// the timeline reflects the active session in real time. Re-pads the whole strip
-// only when the block outgrows the padded span, and never yanks the DOM out from
-// under an in-progress drag/brush stroke.
-function updateLiveTimelineBlock() {
-  const active = timelineShiftsCache.find((s) => !s.endTime);
-  if (!active) return;
-  const el = document.getElementById("timeline-live-block") as HTMLElement | null;
-  if (!el) return;
-  if (isTimelineDragging || isTimelineResizingLeft || isTimelineResizingRight || isTimelineMoving || brushPainting) return;
-  const dayStartMs = parseLocalDate(timelineDate || localDateKey(new Date()), "00:00:00").getTime();
-  const dayEndMs = dayStartMs + 1440 * 60000;
-  const st = new Date(active.startTime).getTime();
-  if (st >= dayEndMs) return;
-  const startMin = (Math.max(st, dayStartMs) - dayStartMs) / 60000;
-  const endMin = (Math.min(Date.now(), dayEndMs) - dayStartMs) / 60000;
-  if (endMin > timelineSpanEnd) { renderTimelineShifts(timelineShiftsCache); return; }
-  const span = timelineSpanEnd - timelineSpanStart;
-  el.style.left = `${((startMin - timelineSpanStart) / span) * 100}%`;
-  el.style.width = `${((endMin - startMin) / span) * 100}%`;
-  const label = el.querySelector(".tl-shift-label");
-  if (label) label.textContent = `${projectName(active.projectUuid)} (${((endMin - startMin) / 60).toFixed(1)}h)`;
-}
-
-function renderTimelineTicks() {
-  const el = document.getElementById("timeline-ticks");
-  if (!el) return;
-  const span = timelineSpanEnd - timelineSpanStart;
-  const N = 5;
-  const parts: string[] = [];
-  for (let i = 0; i < N; i++) {
-    const min = Math.round((timelineSpanStart + (span * i) / (N - 1)) / 5) * 5;
-    parts.push(`<span>${formatTimeFromMinutes(min)}</span>`);
-  }
-  el.innerHTML = parts.join("");
-}
-
-function renderTimelineDayLabel() {
-  const el = document.getElementById("timeline-day-label");
-  if (!el) return;
-  const d = parseLocalDate(timelineDate || localDateKey(new Date()), "00:00:00");
-  el.textContent = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-}
-
-/** Switch the timeline to a given day (from clicking a weekly bar). */
-function setTimelineDay(dateKey: string, allShifts: ShiftRecord[]) {
-  timelineDate = dateKey;
-  timelineSelStartMin = 0;
-  timelineSelEndMin = 0;
-  updateSelectionUI();
-  renderTimelineShifts(allShifts);
-  document.getElementById("timeline-editor-wrapper")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-}
-
-function renderTimelineProjectSelect() {
-  const select = document.getElementById("timeline-project-select") as HTMLSelectElement;
-  if (!select) return;
-  // Preserve the user's in-progress choice across re-renders; otherwise default
-  // to the current project so "Assign" does something useful out of the box.
-  const prev = select.value || currentProjectUuid || "";
-  const active = projectsCache.filter((p) => !p.archived);
-  const opts = [
-    `<option value="">Unassigned</option>`,
-    ...active.map((p) => `<option value="${p.uuid}">${escapeHtml(p.name)}</option>`),
-  ];
-  select.innerHTML = opts.join("");
-  select.value = active.some((p) => p.uuid === prev) ? prev : "";
-}
-
-function updateSelectionUI() {
-  const selectionEl = document.getElementById("timeline-selection");
-  const labelEl = document.getElementById("timeline-selection-label");
-  const selectEl = document.getElementById("timeline-project-select") as HTMLSelectElement;
-  const assignBtn = document.getElementById("btn-timeline-assign") as HTMLButtonElement;
-  const removeBtn = document.getElementById("btn-timeline-remove") as HTMLButtonElement | null;
-
-  if (!selectionEl || !labelEl || !selectEl || !assignBtn) return;
-
-  if (timelineSelStartMin === timelineSelEndMin) {
-    selectionEl.style.display = "none";
-    labelEl.innerText = "No range selected. Drag on the timeline above to select.";
-    selectEl.disabled = true;
-    assignBtn.disabled = true;
-    if (removeBtn) removeBtn.disabled = true;
-    timelineStartMin = null;
-    timelineEndMin = null;
-  } else {
-    selectionEl.style.display = "block";
-    const span = timelineSpanEnd - timelineSpanStart;
-    const left = ((timelineSelStartMin - timelineSpanStart) / span) * 100;
-    const width = ((timelineSelEndMin - timelineSelStartMin) / span) * 100;
-    selectionEl.style.left = `${left}%`;
-    selectionEl.style.width = `${width}%`;
-
-    const startStr = formatTimeFromMinutes(timelineSelStartMin);
-    const endStr = formatTimeFromMinutes(timelineSelEndMin);
-    const durMin = Math.round(timelineSelEndMin - timelineSelStartMin);
-    const h = Math.floor(durMin / 60);
-    const m = durMin % 60;
-    const durStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
-
-    labelEl.innerText = `Selected: ${startStr} to ${endStr} (${durStr})`;
-    selectEl.disabled = false;
-    assignBtn.disabled = false;
-    if (removeBtn) removeBtn.disabled = false;
-    timelineStartMin = timelineSelStartMin;
-    timelineEndMin = timelineSelEndMin;
-  }
-}
-
-function getMinutesFromEvent(e: MouseEvent | TouchEvent, trackEl: HTMLElement): number {
-  const rect = trackEl.getBoundingClientRect();
-  const clientX = "touches" in e ? e.touches[0].clientX : e.clientX;
-  const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  const span = timelineSpanEnd - timelineSpanStart;
-  return Math.round((timelineSpanStart + pct * span) / 5) * 5;
-}
-
-function initTimelineDrag() {
-  const track = document.getElementById("timeline-track");
-  const handleLeft = document.getElementById("handle-left");
-  const handleRight = document.getElementById("handle-right");
-  const selectionEl = document.getElementById("timeline-selection");
-
-  if (!track || !handleLeft || !handleRight || !selectionEl) return;
-
-  const startDrag = (e: MouseEvent | TouchEvent) => {
-    if (brushActive) return; // brush mode owns block clicks; no range-select
-    // Clicks on the selection are handled by its own move/resize listeners.
-    if (selectionEl.contains(e.target as Node)) return;
-
-    isTimelineDragging = true;
-    timelineDragStartMin = getMinutesFromEvent(e, track);
-    timelineSelStartMin = timelineDragStartMin;
-    timelineSelEndMin = timelineDragStartMin;
-    updateSelectionUI();
-
-    if (e.cancelable) e.preventDefault();
-  };
-
-  track.addEventListener("mousedown", startDrag);
-  track.addEventListener("touchstart", startDrag, { passive: false });
-
-  // Note-brush painting: stamp the brush note onto blocks in brush mode.
-  const brushBlockFromEvent = (e: Event): HTMLElement | null =>
-    (e.target as HTMLElement)?.closest(".timeline-shift") as HTMLElement | null;
-  const brushDown = (e: MouseEvent | TouchEvent) => {
-    if (!brushActive) return;
-    const blk = brushBlockFromEvent(e);
-    if (!blk) return;
-    if (e.cancelable) e.preventDefault();
-    brushPainting = true;
-    brushStroke = new Set();
-    brushPending.push(stampNoteOnBlock(blk));
-  };
-  const brushOver = (e: MouseEvent) => {
-    if (!brushActive || !brushPainting) return;
-    const blk = brushBlockFromEvent(e);
-    if (blk) brushPending.push(stampNoteOnBlock(blk));
-  };
-  track.addEventListener("mousedown", brushDown);
-  track.addEventListener("touchstart", brushDown, { passive: false });
-  track.addEventListener("mouseover", brushOver);
-  track.addEventListener("touchmove", (e) => {
-    if (!brushActive || !brushPainting) return;
-    const t = e.touches[0];
-    const el = document.elementFromPoint(t.clientX, t.clientY)?.closest(".timeline-shift") as HTMLElement | null;
-    if (el) brushPending.push(stampNoteOnBlock(el));
-  }, { passive: true });
-
-  // Grab the selection body to move the whole window.
-  const startMove = (e: MouseEvent | TouchEvent) => {
-    if (e.target === handleLeft || e.target === handleRight) return;
-    e.stopPropagation();
-    isTimelineMoving = true;
-    timelineMoveGrabMin = getMinutesFromEvent(e, track);
-    timelineMoveOrigStart = timelineSelStartMin;
-    timelineMoveOrigEnd = timelineSelEndMin;
-    if (e.cancelable) e.preventDefault();
-  };
-  selectionEl.addEventListener("mousedown", startMove);
-  selectionEl.addEventListener("touchstart", startMove, { passive: false });
-
-  handleLeft.addEventListener("mousedown", (e) => {
-    e.stopPropagation();
-    isTimelineResizingLeft = true;
-  });
-  handleLeft.addEventListener("touchstart", (e) => {
-    e.stopPropagation();
-    isTimelineResizingLeft = true;
-  }, { passive: true });
-
-  handleRight.addEventListener("mousedown", (e) => {
-    e.stopPropagation();
-    isTimelineResizingRight = true;
-  });
-  handleRight.addEventListener("touchstart", (e) => {
-    e.stopPropagation();
-    isTimelineResizingRight = true;
-  }, { passive: true });
-
-  const onMove = (e: MouseEvent | TouchEvent) => {
-    if (isTimelineDragging) {
-      const currentMin = getMinutesFromEvent(e, track);
-      timelineSelStartMin = Math.min(timelineDragStartMin, currentMin);
-      timelineSelEndMin = Math.max(timelineDragStartMin, currentMin);
-      updateSelectionUI();
-    } else if (isTimelineResizingLeft) {
-      const currentMin = getMinutesFromEvent(e, track);
-      if (currentMin < timelineSelEndMin) {
-        timelineSelStartMin = currentMin;
-        updateSelectionUI();
-      }
-    } else if (isTimelineResizingRight) {
-      const currentMin = getMinutesFromEvent(e, track);
-      if (currentMin > timelineSelStartMin) {
-        timelineSelEndMin = currentMin;
-        updateSelectionUI();
-      }
-    } else if (isTimelineMoving) {
-      const width = timelineMoveOrigEnd - timelineMoveOrigStart;
-      const delta = getMinutesFromEvent(e, track) - timelineMoveGrabMin;
-      let ns = timelineMoveOrigStart + delta;
-      ns = Math.max(timelineSpanStart, Math.min(ns, timelineSpanEnd - width));
-      timelineSelStartMin = ns;
-      timelineSelEndMin = ns + width;
-      updateSelectionUI();
-    }
-  };
-
-  const onEnd = () => {
-    if (brushPainting) {
-      brushPainting = false;
-      if (brushDirty) {
-        brushDirty = false;
-        // Await the stroke's writes before reconciling, or the refresh read
-        // races the writes and reverts the freshly-stamped notes.
-        const pend = brushPending; brushPending = [];
-        void Promise.allSettled(pend).then(() => { void refresh(); performSync(); });
-      }
-    }
-    // A click (drag with no movement) on a segment selects that segment's range.
-    const wasClick = isTimelineDragging && timelineSelStartMin === timelineSelEndMin;
-    isTimelineDragging = false;
-    isTimelineResizingLeft = false;
-    isTimelineResizingRight = false;
-    isTimelineMoving = false;
-
-    if (wasClick) {
-      const min = timelineSelStartMin;
-      const blk = timelineBlocks.find((b) => min >= b.startMin && min < b.endMin);
-      if (blk) {
-        timelineSelStartMin = blk.startMin;
-        timelineSelEndMin = blk.endMin;
-        const sel = document.getElementById("timeline-project-select") as HTMLSelectElement | null;
-        if (sel) sel.value = blk.projectUuid || "";
-        updateSelectionUI();
-      }
-    }
-  };
-
-  window.addEventListener("mousemove", onMove);
-  window.addEventListener("touchmove", onMove, { passive: false });
-  window.addEventListener("mouseup", onEnd);
-  window.addEventListener("touchend", onEnd);
+/** Whole local days covering [fromMs, toMs): edits merge neighbours within them. */
+function daysAround(fromMs: number, toMs: number): [number, number] {
+  const lo = parseLocalDate(localDateKey(new Date(fromMs)), "00:00:00").getTime();
+  const hi = addDays(parseLocalDate(localDateKey(new Date(Math.max(fromMs, toMs - 1))), "00:00:00"), 1).getTime();
+  return [lo, hi];
 }
 
 /**
- * Build a local "%Y-%m-%dT%H:%M:%S" timestamp from a day + minutes-since-midnight,
- * correctly rolling 1440 (the far-right edge) to the next day's 00:00:00 rather
- * than emitting an invalid "24:00:00".
+ * Run an edit that touches shifts within [fromMs, toMs) and offer Undo. The
+ * snapshot covers the whole local days (a merge can extend a neighbour);
+ * undo writes it back and deletes the rows the edit created.
  */
-function timelineDateTime(dateStr: string, minutes: number): string {
-  const dt = new Date(parseLocalDate(dateStr, "00:00:00").getTime() + minutes * 60000);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}T${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`;
-}
-
-async function applyTimelineRange(projectUuid: string | null) {
-  if (timelineStartMin === null || timelineEndMin === null) return;
-  const startStr = timelineDateTime(timelineDate, timelineStartMin);
-  const endStr = timelineDateTime(timelineDate, timelineEndMin);
-
-  await projects.assignProjectToRange(startStr, endStr, projectUuid);
-
-  timelineSelStartMin = 0;
-  timelineSelEndMin = 0;
-  updateSelectionUI();
-
+async function undoable(label: string, fromMs: number, toMs: number, action: () => Promise<unknown>) {
+  const [lo, hi] = daysAround(fromMs, toMs);
+  const inRange = (s: ShiftRecord) => { const [a, b] = spanOf(s); return a < hi && b > lo; };
+  const before = (await shifts.getAllShifts()).filter(inRange);
+  await action();
+  const after = (await shifts.getAllShifts()).filter(inRange);
+  const known = new Set(before.map((s) => s.uuid));
+  const created = after.filter((s) => !known.has(s.uuid)).map((s) => s.uuid);
   await refresh();
+  // Nothing changed (e.g. painting a project onto time that already has it):
+  // no Undo entry, or the next Undo would silently do nothing.
+  if (!created.length && sameShifts(before, after)) return;
   performSync();
-}
-
-function onTimelineAssignSubmit() {
-  const select = document.getElementById("timeline-project-select") as HTMLSelectElement;
-  void applyTimelineRange(select.value || null);
-}
-
-/** Clear any project from the selected range (revert to Unassigned). */
-function onTimelineRemove() {
-  if (timelineStartMin === null || timelineEndMin === null) return;
-  void applyTimelineRange(null);
-}
-
-function initTimeline() {
-  if (!timelineDate) timelineDate = localDateKey(new Date());
-  renderTimelineDayLabel();
-
-  document.getElementById("btn-timeline-assign")?.addEventListener("click", onTimelineAssignSubmit);
-  document.getElementById("btn-timeline-remove")?.addEventListener("click", onTimelineRemove);
-
-  // Delete / Backspace clears the current selection's project (unless typing).
-  document.addEventListener("keydown", (e) => {
-    if (e.key !== "Delete" && e.key !== "Backspace") return;
-    if (timelineStartMin === null || timelineEndMin === null) return;
-    const tag = (e.target as HTMLElement | null)?.tagName;
-    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
-    e.preventDefault();
-    onTimelineRemove();
+  pushUndo(label, async () => {
+    await shifts.restoreShifts(before.map(toSnapshot), created);
+    await refresh();
+    performSync();
   });
-
-  initTimelineDrag();
-  initBrush();
 }
 
-type BarRadius = { topLeft: number; topRight: number; bottomLeft: number; bottomRight: number };
-type ProjectStackDataset = {
-  label: string;
-  data: number[];
-  backgroundColor: string;
-  stack: string;
-  borderRadius: (ctx: { datasetIndex: number; dataIndex: number; chart: Chart }) => BarRadius;
-  borderSkipped: boolean;
+/** True when two shift lists hold the same rows with the same content. */
+function sameShifts(a: ShiftRecord[], b: ShiftRecord[]): boolean {
+  if (a.length !== b.length) return false;
+  const key = (s: ShiftRecord) => [s.uuid, s.startTime, s.endTime, s.projectUuid ?? "", s.note ?? "", s.autoClosedAt ?? ""].join("|");
+  const keys = new Set(a.map(key));
+  return b.every((s) => keys.has(key(s)));
+}
+
+function shiftById(id: number): ShiftRecord {
+  const s = shiftsCache.find((x) => x.id === id);
+  if (!s) throw new Error("That shift no longer exists.");
+  return s;
+}
+
+/** Rust error codes as a sentence for the timeline's status line. */
+function describeShiftError(err: unknown): string {
+  const code = err instanceof Error ? err.message : String(err);
+  if (code === "overlap") return "That would overlap another shift.";
+  if (code === "invalid_range") return "The end must be after the start, and not in the future.";
+  if (code === "not_found") return "That shift no longer exists.";
+  if (code === "open_conflict") return "Another shift is already running.";
+  return `Couldn't save: ${code}`;
+}
+
+function buildTimeline() {
+  const root = document.getElementById("timeline-root");
+  if (!root) return;
+  const iso = (ms: number) => timelineIso(ms);
+  timeline = createTimeline(root, {
+    assignRange: (fromMs, toMs, project) =>
+      undoable(`Painted ${projectName(project)}`, fromMs, toMs, () => projects.assignProjectToRange(iso(fromMs), iso(toMs), project)),
+    assignRanges: (ranges, project) =>
+      undoable(`Painted ${projectName(project)}`, Math.min(...ranges.map((r) => r.startMs)), Math.max(...ranges.map((r) => r.endMs)), async () => {
+        for (const r of ranges) await projects.assignProjectToRange(iso(r.startMs), iso(r.endMs), project);
+      }),
+    fillRange: (fromMs, toMs, project) =>
+      undoable(`Added time to ${projectName(project)}`, fromMs, toMs, () => shifts.fillRange(iso(fromMs), iso(toMs), project)),
+    setTimes: async (changes) => {
+      const spans = changes.flatMap((c) => [c.startMs, c.endMs ?? Date.now(), ...spanOf(shiftById(c.id))]);
+      await undoable("Changed shift times", Math.min(...spans), Math.max(...spans), () => shifts.updateShiftTimes(
+        changes.map((c) => ({ id: c.id, startTime: iso(c.startMs), endTime: c.endMs === null ? null : iso(c.endMs) }))));
+    },
+    setNotes: async (ids, note) => {
+      const spans = ids.flatMap((id) => spanOf(shiftById(id)));
+      await undoable(note ? "Painted note" : "Erased note", Math.min(...spans), Math.max(...spans), async () => {
+        for (const id of ids) await shifts.setShiftNote(id, note);
+      });
+    },
+    setProject: async (id, project) => {
+      const s = shiftById(id);
+      await undoable(project ? `Moved to ${projectName(project)}` : "Removed project", ...spanOf(s), async () => {
+        if (s.endTime) {
+          // Through the range assign: touching pieces with the same project and
+          // note merge back into one shift (e.g. after removing projects).
+          await projects.assignProjectToRange(s.startTime, s.endTime, project);
+        } else {
+          // The running shift's project is the current project: switch it
+          // there too (no split needed for a re-tag of the whole running block).
+          await projects.setShiftProject(id, project);
+          if ((currentProjectUuid ?? null) !== project) await projects.setCurrentProject(project);
+        }
+      });
+    },
+    deleteShift: (id) => deleteShiftUndoable(id),
+    clearAutoClosed: async (id) => {
+      await shifts.clearAutoClosed(id);
+      await refresh();
+      performSync();
+    },
+    projectColor: (uuid) => projectColor(uuid),
+    projectName: (uuid) => projectName(uuid),
+    textColorOn: contrastText,
+    onDayChange: (key) => { timelineDayKey = key; },
+    describeError: describeShiftError,
+  }, timelineDayKey);
+}
+
+/** Naive local "YYYY-MM-DDTHH:MM:SS" — the frame the desktop DB stores. */
+function timelineIso(ms: number): string {
+  const dt = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${localDateKey(dt)}T${p(dt.getHours())}:${p(dt.getMinutes())}:${p(dt.getSeconds())}`;
+}
+
+function pushTimelineData(allShifts: ShiftRecord[]) {
+  shiftsCache = allShifts;
+  timeline?.setData(
+    allShifts.map((s) => ({
+      id: s.id,
+      startMs: new Date(s.startTime).getTime(),
+      endMs: s.endTime ? new Date(s.endTime).getTime() : null,
+      project: s.projectUuid ?? null,
+      note: s.note ?? null,
+      autoClosed: !!s.autoClosedAt,
+    })),
+    projectsCache.filter((p) => !p.archived).map((p) => ({ uuid: p.uuid, name: p.name, color: p.color || unassignedColor() })),
+  );
+}
+
+/** Open a day in the timeline (from a chart bar) and bring it into view. */
+function setTimelineDay(dateKey: string) {
+  timelineDayKey = dateKey;
+  timeline?.showDay(dateKey);
+  document.getElementById("timeline-editor-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/** Delete a shift at once, with Undo (no "Are you sure?"). */
+async function deleteShiftUndoable(id: number, label = "Shift deleted") {
+  const s = shiftById(id);
+  await undoable(label, ...spanOf(s), () => shifts.deleteShift(id));
+}
+
+/** Project names/colours for the shared stacked-chart builder. */
+const projectLook = {
+  name: (uuid: string) => projectName(uuid),
+  color: (uuid: string) => projectColor(uuid),
+  unassignedColor,
 };
 
-/** Round the top corners of the top-most segment of each stacked bar (per bar). */
-function stackedBarTopRadius(r: number) {
-  return (ctx: { dataIndex: number; datasetIndex: number; chart: Chart }): BarRadius => {
-    const datasets = ctx.chart.data.datasets;
-    let topIdx = -1;
-    for (let i = 0; i < datasets.length; i++) {
-      const v = datasets[i].data[ctx.dataIndex] as number;
-      if (v && v > 0) topIdx = i;
-    }
-    const isTop = ctx.datasetIndex === topIdx;
-    return { topLeft: isTop ? r : 0, topRight: isTop ? r : 0, bottomLeft: 0, bottomRight: 0 };
-  };
-}
-
-/**
- * Group hours per bucket (day/period) and per project into stacked Chart.js
- * datasets. `bucketOf` maps a shift to a bucket index, or -1 to exclude it.
- */
-function buildProjectStackDatasets(
-  bucketCount: number,
-  list: ShiftRecord[],
-  hoursOf: (s: ShiftRecord) => number,
-  bucketOf: (s: ShiftRecord) => number,
-): ProjectStackDataset[] {
-  const buckets = new Map<string, number[]>();
-  const ensure = (k: string) => {
-    let arr = buckets.get(k);
-    if (!arr) { arr = new Array(bucketCount).fill(0); buckets.set(k, arr); }
-    return arr;
-  };
-  for (const s of list) {
-    const b = bucketOf(s);
-    if (b < 0 || b >= bucketCount) continue;
-    ensure(s.projectUuid || "")[b] += hoursOf(s);
-  }
-  const keys = [...buckets.keys()].sort((a, b) =>
-    a === "" ? 1 : b === "" ? -1 : projectName(a).localeCompare(projectName(b)));
-  const radius = stackedBarTopRadius(4);
-  return keys.map((k) => ({
-    label: k ? projectName(k) : "Unassigned",
-    data: buckets.get(k)!.map((v) => parseFloat(v.toFixed(2))),
-    backgroundColor: k ? projectColor(k) : unassignedColor(),
-    stack: "hours",
-    borderRadius: radius,
-    borderSkipped: false,
-  }));
+/** [bucketIndex, hours] pairs of a shift, split at midnight, for day-keyed buckets. */
+function dayContributions(s: ShiftRecord, indexOfDay: (dayKey: string) => number): [number, number][] {
+  return [...shiftHoursByDay(s.startTime, s.endTime)].map(([day, h]) => [indexOfDay(day), h]);
 }
 
 // ═══════════════════════════════════════════════════════════════════
 //  DASHBOARD
 // ═══════════════════════════════════════════════════════════════════
+
+// ── Live clock: elapsed time on the Status card, "left today" on the Today card,
+// and the tray tooltip. Recomputed from the last refresh every 15 s.
+let liveShiftStartMs: number | null = null;
+let todayBase = { hours: 0, atMs: Date.now(), targetHours: 0 };
+let focusStatusText = "";
+
+function renderLiveClock() {
+  const now = Date.now();
+  const elapsedEl = document.getElementById("clock-elapsed");
+  if (elapsedEl && liveShiftStartMs !== null) {
+    const min = Math.max(0, Math.floor((now - liveShiftStartMs) / 60000));
+    elapsedEl.textContent = `· ${Math.floor(min / 60)}:${String(min % 60).padStart(2, "0")}`;
+  }
+  // Today so far, growing while tracking.
+  const today = todayBase.hours + (liveShiftStartMs !== null ? (now - todayBase.atMs) / 3_600_000 : 0);
+  const todayEl = document.getElementById("today-hours");
+  if (todayEl) todayEl.textContent = formatDuration(today);
+  const sub = document.getElementById("today-sub");
+  if (sub) {
+    const left = todayBase.targetHours - today;
+    if (todayBase.targetHours <= 0) sub.textContent = "";
+    else if (left <= 0) sub.textContent = "Target reached ✓";
+    else if (liveShiftStartMs !== null) {
+      const done = new Date(now + left * 3_600_000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      sub.textContent = `${formatDuration(left)} to go · done ≈ ${done}`;
+    } else sub.textContent = `${formatDuration(left)} to go`;
+  }
+  const trackingText = liveShiftStartMs !== null ? `Tracking · ${formatDuration((now - liveShiftStartMs) / 3_600_000)}` : "";
+  const tooltip = [trackingText, focusStatusText].filter(Boolean).join(" · ");
+  if (tooltip !== lastTrayTooltip) {
+    lastTrayTooltip = tooltip;
+    invoke("set_tray_tooltip", { text: tooltip }).catch(() => {});
+  }
+}
+let lastTrayTooltip: string | null = null;
+window.setInterval(renderLiveClock, 15_000);
+
+// One clock action at a time: a double click must not clock in and straight
+// back out (or race the tray). The button re-renders on refresh, so the flag
+// lives here rather than on the element.
+let clockBusy = false;
+
+async function onClockClick() {
+  if (clockBusy) return;
+  clockBusy = true;
+  (document.getElementById("btn-clock") as HTMLButtonElement | null)?.setAttribute("disabled", "");
+  try {
+    const active = await shifts.getActiveShift();
+    if (active) {
+      if (await shifts.endShift()) {
+        const dur = formatDuration(shiftDurationHours({ ...active, endTime: new Date().toISOString() }));
+        notify("Clocked Out", `Tracked ${dur}`);
+      }
+    } else if (await shifts.startShift()) {
+      notify("Clocked In", "Time tracking started");
+    }
+  } finally {
+    clockBusy = false;
+    await refresh();
+    // Push the change so other devices see it (fire-and-forget).
+    performSync();
+  }
+}
 
 async function refresh() {
   const [allShifts, activeShift, offDayList] = await Promise.all([
@@ -1783,55 +1533,45 @@ async function refresh() {
   ]);
 
   isTracking = activeShift !== null;
-  updateHeartbeat();
   const offDayDates = new Set(offDayList.map((o) => o.date));
 
   // ── Project chip ────────────────────────────────────────────────
   renderProjectChip();
 
-  renderTimelineShifts(allShifts);
-  renderTimelineProjectSelect();
-  updateSelectionUI();
+  pushTimelineData(allShifts);
 
   // ── Clock button ────────────────────────────────────────────────
   const wrap = document.getElementById("clock-btn-wrap")!;
   wrap.innerHTML = `<button class="btn ${isTracking ? "btn-danger" : "btn-primary"}" id="btn-clock">
         ${isTracking ? "Clock Out" : "Clock In"}</button>`;
-  document.getElementById("btn-clock")!.addEventListener("click", async () => {
-    const wasClockedIn = isTracking;
-    let clockedShift: ShiftRecord | null = null;
-    if (wasClockedIn) clockedShift = await shifts.getActiveShift();
-    if (isTracking) await shifts.endShift();
-    else await shifts.startShift();
-    await refresh();
-    if (wasClockedIn) {
-      // Notify clock-out with duration
-      if (clockedShift) {
-        const dur = formatDuration(shiftDurationHours({ ...clockedShift, endTime: new Date().toISOString() }));
-        notify("Clocked Out", `Tracked ${dur}`);
-      }
-      // Auto-sync after clock-out (fire-and-forget)
-      performSync();
-    } else {
-      notify("Clocked In", "Time tracking started");
-      // Push the freshly-opened shift so it's visible on other devices.
-      performSync();
-    }
-  });
+  const clockBtn = document.getElementById("btn-clock") as HTMLButtonElement;
+  clockBtn.disabled = clockBusy;
+  clockBtn.addEventListener("click", () => void onClockClick());
 
   // ── Status ──────────────────────────────────────────────────────
-  document.getElementById("status-text")!.textContent = isTracking ? "Tracking" : "Idle";
+  document.getElementById("status-text")!.innerHTML = isTracking
+    ? `Tracking <span class="clock-elapsed" id="clock-elapsed"></span>` : "Idle";
   document.getElementById("stat-status")!.classList.toggle("tracking", isTracking);
+  // A note for what you're doing right now, without opening the table.
+  const runningNote = document.getElementById("running-note") as HTMLInputElement;
+  runningNote.hidden = !isTracking;
+  if (activeShift && document.activeElement !== runningNote) runningNote.value = activeShift.note ?? "";
+  runningNote.dataset.id = activeShift ? String(activeShift.id) : "";
+  liveShiftStartMs = activeShift ? new Date(activeShift.startTime).getTime() : null;
 
   // ── Today hours ─────────────────────────────────────────────────
   const todayKey = localDateKey(new Date());
-  const todayHours = allShifts
-    .filter((s) => toDateKey(s.startTime) === todayKey)
-    .reduce((sum, s) => sum + shiftDurationHours(s), 0);
+  const hoursByDay = new Map<string, number>();
+  for (const s of allShifts) {
+    for (const [day, h] of shiftHoursByDay(s.startTime, s.endTime)) hoursByDay.set(day, (hoursByDay.get(day) ?? 0) + h);
+  }
+  const todayHours = hoursByDay.get(todayKey) ?? 0;
   document.getElementById("today-hours")!.textContent = formatDuration(todayHours);
+  todayBase = { hours: todayHours, atMs: Date.now(), targetHours: offDayDates.has(todayKey) ? 0 : getTargetHoursForDate(new Date(), currentWorkSchedule) };
+  renderLiveClock();
 
   // ── Week hours & chart data ─────────────────────────────────────
-  const ws = weekStartDate();
+  const ws = startOfWeek(new Date());
   const dayLabels: string[] = [];
   const dayKeys: string[] = [];
   let weekTotal = 0;
@@ -1841,9 +1581,7 @@ async function refresh() {
     const key = localDateKey(d);
     dayKeys.push(key);
     dayLabels.push(d.toLocaleDateString(undefined, { weekday: "short" }));
-    weekTotal += allShifts
-      .filter((s) => toDateKey(s.startTime) === key)
-      .reduce((sum, s) => sum + shiftDurationHours(s), 0);
+    weekTotal += hoursByDay.get(key) ?? 0;
   }
 
   document.getElementById("week-hours")!.textContent = formatDuration(weekTotal);
@@ -1859,7 +1597,7 @@ async function refresh() {
 
   // ── Chart (stacked by project) ──────────────────────────────────
   const weekDatasets = buildProjectStackDatasets(
-    7, allShifts, shiftDurationHours, (s) => dayKeys.indexOf(toDateKey(s.startTime)),
+    7, allShifts, (s) => s.projectUuid, (s) => dayContributions(s, (day) => dayKeys.indexOf(day)), projectLook,
   );
   if (weeklyChart) weeklyChart.destroy();
   {
@@ -1871,7 +1609,10 @@ async function refresh() {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
-        plugins: { legend: { display: weekDatasets.length > 1, position: "bottom" } },
+        plugins: {
+          legend: { display: weekDatasets.length > 1, position: "bottom" },
+          tooltip: stackedTotalTooltip("Day Total"),
+        },
         scales: {
           x: { stacked: true, grid: { display: false } },
           y: { stacked: true, beginAtZero: true, ticks: { stepSize: 2 } },
@@ -1881,7 +1622,7 @@ async function refresh() {
           const native = evt.native as Event | null;
           if (!native) return;
           const pts = chart.getElementsAtEventForMode(native, "index", { intersect: false }, false);
-          if (pts.length) setTimelineDay(dayKeys[pts[0].index], allShifts);
+          if (pts.length) setTimelineDay(dayKeys[pts[0].index]);
         },
         onHover: (evt, els) => {
           const el = evt.native?.target as HTMLElement | undefined;
@@ -1893,15 +1634,21 @@ async function refresh() {
 
   // ── Shift table ─────────────────────────────────────────────────
   const tbody = document.getElementById("shift-body")!;
+  // Grouped by day, each day with its total; a click on a row opens that
+  // shift in the timeline editor (times, project, note, delete).
   const recent = allShifts.slice(0, 20);
+  let lastDay = "";
   tbody.innerHTML = recent
     .map((s) => {
       const d = shiftDurationHours(s);
-      const dateStr = new Date(s.startTime).toLocaleDateString();
+      const day = localDateKey(new Date(s.startTime));
+      const dayHeader = day === lastDay ? "" : `<tr class="day-row"><td colspan="6"><span>${escapeHtml(
+        new Date(s.startTime).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" }))}</span><span class="day-total">${formatDuration(hoursByDay.get(day) ?? 0)}</span></td></tr>`;
+      lastDay = day;
       const startStr = new Date(s.startTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       const endStr = s.endTime ? new Date(s.endTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "active";
-      return `<tr style="box-shadow: inset 3px 0 0 ${projectColor(s.projectUuid)}">
-        <td>${dateStr}</td><td>${startStr}</td><td>${endStr}</td>
+      return dayHeader + `<tr class="shift-row" data-id="${s.id}" title="Open in the timeline" style="box-shadow: inset 3px 0 0 ${projectColor(s.projectUuid)}">
+        <td>${startStr}</td><td>${endStr}</td>
         <td>${formatDuration(d)}</td>
         <td><span class="shift-project-tag"><span class="project-dot" style="background:${projectColor(s.projectUuid)}"></span>${escapeHtml(projectName(s.projectUuid))}</span></td>
         <td><input type="text" class="shift-note-input" data-id="${s.id}" value="${escapeHtml(s.note ?? "")}" placeholder="Add note…" maxlength="500" title="Enter: save and move down · ↓: copy the note from the row above"></td>
@@ -1926,13 +1673,16 @@ async function refresh() {
     // Carry-down flow: Enter saves and drops to the next row; ↓ copies the note
     // from the row above (fast repeats without copy-paste).
     input.addEventListener("keydown", (e) => {
+      // Neighbouring note fields, skipping the day header rows.
+      const all = [...tbody.querySelectorAll<HTMLInputElement>(".shift-note-input")];
+      const i = all.indexOf(input);
+      const next = all[i + 1] ?? null;
       if (e.key === "Enter") {
         e.preventDefault();
         void saveNoteInput(input);
-        const next = input.closest("tr")?.nextElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
         next?.focus();
       } else if (e.key === "ArrowDown") {
-        const prev = input.closest("tr")?.previousElementSibling?.querySelector(".shift-note-input") as HTMLInputElement | null;
+        const prev = all[i - 1] ?? null;
         if (prev) {
           e.preventDefault();
           input.value = prev.value;
@@ -1942,15 +1692,24 @@ async function refresh() {
     });
   });
 
+  tbody.querySelectorAll<HTMLTableRowElement>(".shift-row").forEach((row) => {
+    row.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest("input, button")) return;
+      timeline?.select(Number(row.dataset.id));
+      document.getElementById("timeline-editor-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  });
+
   tbody.querySelectorAll<HTMLButtonElement>(".delete-shift").forEach((btn) => {
-    btn.addEventListener("click", async () => {
+    btn.addEventListener("click", () => {
       const id = Number(btn.dataset.id);
-      if (id) { await shifts.deleteShift(id); await refresh(); performSync(); }
+      if (id) void deleteShiftUndoable(id);
     });
   });
 
   // ── Off days: monthly calendar ──────────────────────────────────
   offDayDatesCache = new Set(offDayList.map((o) => o.date));
+  offDayReasons = new Map(offDayList.map((o) => [o.date, o.reason ?? null]));
   renderOffdayCalendar();
 
   syncTrayState();
@@ -1961,6 +1720,7 @@ async function refresh() {
 let offCalYear = new Date().getFullYear();
 let offCalMonth = new Date().getMonth();
 let offDayDatesCache = new Set<string>();
+let offDayReasons = new Map<string, string | null>();
 
 function renderOffdayCalendar() {
   const grid = document.getElementById("offcal-grid");
@@ -1984,7 +1744,15 @@ function renderOffdayCalendar() {
     const dateKey = `${offCalYear}-${String(offCalMonth + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
     cell.dataset.date = dateKey;
     if (dateKey === todayStr) cell.classList.add("cal-today");
-    if (offDayDatesCache.has(dateKey)) cell.classList.add("cal-offday");
+    if (offDayDatesCache.has(dateKey)) {
+      cell.classList.add("cal-offday");
+      const info = reasonInfo(offDayReasons.get(dateKey));
+      cell.title = info.label;
+      if (info.key) {
+        cell.dataset.reason = info.key;
+        cell.insertAdjacentHTML("beforeend", `<span class="cal-reason" aria-hidden="true">${info.icon}</span>`);
+      }
+    }
     grid.appendChild(cell);
   }
 }
@@ -2025,12 +1793,23 @@ async function endOffDrag() {
   offDragAnchor = offDragCurrent = null;
   if (!anchor || !current) return;
   try {
-    await applyOffDays(inclusiveDateRange(anchor, current), offDragMode);
+    const mode = offDragMode;
+    const changed = inclusiveDateRange(anchor, current).filter((d) => (mode === "add") !== offDayDatesCache.has(d));
+    await applyOffDays(changed, mode);
     await refresh(); // re-renders the calendar, clearing the preview classes
     performSync();
+    if (changed.length) {
+      const what = `${changed.length} off day${changed.length > 1 ? "s" : ""}`;
+      pushUndo(mode === "add" ? `Marked ${what}` : `Cleared ${what}`, async () => {
+        await applyOffDays(changed, mode === "add" ? "remove" : "add");
+        await refresh();
+        performSync();
+      });
+    }
   } catch (err) {
     console.error("Failed to apply off days", err);
     renderOffdayCalendar(); // at least clear the preview highlight
+    showToast("Couldn't save the off days.", { tone: "error" });
   }
 }
 
@@ -2040,6 +1819,7 @@ function initOffdayCalendar() {
   const cellDate = (e: Event): string | null =>
     (e.target as HTMLElement)?.closest<HTMLElement>("[data-date]")?.dataset.date ?? null;
   grid.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return; // right-click opens the reason menu instead
     const d = cellDate(e);
     if (!d) return;
     e.preventDefault(); // don't text-select while dragging
@@ -2056,6 +1836,37 @@ function initOffdayCalendar() {
     paintOffDragPreview();
   });
   window.addEventListener("mouseup", () => { void endOffDrag(); });
+
+  // Right-click a day: mark it off with a reason (vacation, sick, …), change
+  // the reason, or make it a normal day again. Undoable like painting.
+  grid.addEventListener("contextmenu", (e) => {
+    const d = cellDate(e);
+    if (!d) return;
+    e.preventDefault();
+    const wasOff = offDayDatesCache.has(d);
+    const prevReason = offDayReasons.get(d) ?? null;
+    const label = parseLocalDate(d, "00:00:00").toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+    const restore = async () => {
+      if (!wasOff) await offDays.removeOffDay(d);
+      else await offDays.setOffDayReason(d, prevReason);
+      await refresh();
+      performSync();
+    };
+    showOffDayMenu({ x: e.clientX, y: e.clientY }, { label, isOff: wasOff, reason: prevReason }, {
+      setReason: async (reason) => {
+        await offDays.setOffDayReason(d, reason);
+        await refresh();
+        performSync();
+        pushUndo(`${label}: ${reasonInfo(reason).label}`, restore);
+      },
+      clear: async () => {
+        await offDays.removeOffDay(d);
+        await refresh();
+        performSync();
+        pushUndo(`${label}: not an off day`, restore);
+      },
+    });
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2079,11 +1890,8 @@ async function refreshStats() {
   document.getElementById("stats-count-wrap")!.style.display = unit === "ytd" ? "none" : "";
 
   // End of last complete week (Sunday 23:59:59 — week starts Monday)
-  const dayOfWeek = now.getDay(); // 0=Sun
-  const daysSinceSunday = dayOfWeek === 0 ? 0 : dayOfWeek;
-  const endOfLastWeek = new Date(now);
-  endOfLastWeek.setDate(endOfLastWeek.getDate() - daysSinceSunday - 1);
-  endOfLastWeek.setHours(23, 59, 59, 999);
+  // (Monday–Sunday weeks; this used to stop on Saturday.)
+  const endOfLastWeek = endOfLastCompleteWeek(now);
 
   let startDate: Date;
   if (unit === "days") startDate = addDays(endOfLastWeek, -(count - 1));
@@ -2107,17 +1915,18 @@ async function refreshStats() {
   const hoursPerWeek: Record<string, number> = {};
   let totalActual = 0;
 
+  const fromMs = startDate.getTime();
+  const toMs = endOfLastWeek.getTime();
   for (const s of allShifts) {
     if (!s.endTime) continue;
-    const st = new Date(s.startTime);
-    const en = new Date(s.endTime);
-    if (st < startDate || st > endOfLastWeek) continue;
-    const dur = (en.getTime() - st.getTime()) / 3_600_000;
-    totalActual += dur;
-    const dayKey = toDateKey(s.startTime);
-    hoursPerDay[dayKey] = (hoursPerDay[dayKey] ?? 0) + dur;
-    const wk = weekKey(st);
-    hoursPerWeek[wk] = (hoursPerWeek[wk] ?? 0) + dur;
+    const st = Math.max(new Date(s.startTime).getTime(), fromMs);
+    const en = Math.min(new Date(s.endTime).getTime(), toMs + 1);
+    for (const [dayKey, h] of splitAcrossDays(st, en)) {
+      totalActual += h;
+      hoursPerDay[dayKey] = (hoursPerDay[dayKey] ?? 0) + h;
+      const wk = weekKey(dateInputToLocalDate(dayKey));
+      hoursPerWeek[wk] = (hoursPerWeek[wk] ?? 0) + h;
+    }
   }
 
   // Expected hours & holiday virtual hours
@@ -2138,6 +1947,10 @@ async function refreshStats() {
     cursor.setDate(cursor.getDate() + 1);
   }
 
+  const periodOffDays = offDayList.filter((o) => {
+    const t = parseLocalDate(o.date, "00:00:00").getTime();
+    return t >= startDate.getTime() && t <= endOfLastWeek.getTime();
+  });
   const daysWorked = Object.keys(hoursPerDay).length;
   const weeksWorked = Object.keys(hoursPerWeek).length;
   const totalForAvg = Object.values(hoursPerDay).reduce((a, b) => a + b, 0);
@@ -2145,28 +1958,47 @@ async function refreshStats() {
   const avgWeekly = weeksWorked > 0 ? totalForAvg / weeksWorked : 0;
   const overtime = totalActual - expectedHours;
 
+  // Averages use complete weeks only. Before the first one ends there is
+  // nothing to average: say when there will be, instead of "0h" and an
+  // upside-down period.
+  if (startDate > endOfLastWeek) {
+    for (const id of ["avg-daily", "avg-weekly", "overtime-val"]) document.getElementById(id)!.textContent = "–";
+    document.getElementById("overtime-card")!.classList.remove("overtime-pos", "overtime-neg");
+    const firstSunday = addDays(endOfLastWeek, 7);
+    document.getElementById("avg-detail")!.innerHTML =
+      `<p>Averages count complete weeks (Mon–Sun). Your first one is done on <strong>${escapeHtml(firstSunday.toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" }))}</strong>.</p>`;
+    refreshTrendChart(allShifts, offDayDates, includeHolidays);
+    return;
+  }
+
   document.getElementById("avg-daily")!.textContent = formatDuration(avgDaily);
   document.getElementById("avg-weekly")!.textContent = formatDuration(avgWeekly);
-  document.getElementById("overtime-val")!.textContent = formatSigned(overtime);
-  document.getElementById("overtime-card")!.classList.toggle("overtime-pos", overtime >= 0);
-  document.getElementById("overtime-card")!.classList.toggle("overtime-neg", overtime < 0);
+  // Overtime against a schedule the user never set is a made-up number: ask
+  // for the schedule instead.
+  const otVal = document.getElementById("overtime-val")!;
+  const otCard = document.getElementById("overtime-card")!;
+  if (await settings.hasExplicitWorkSchedule()) {
+    otVal.textContent = formatSigned(overtime);
+    otCard.classList.toggle("overtime-pos", overtime >= 0);
+    otCard.classList.toggle("overtime-neg", overtime < 0);
+  } else {
+    otVal.innerHTML = `<button type="button" class="link-btn" id="btn-set-schedule">Set your schedule →</button>`;
+    otCard.classList.remove("overtime-pos", "overtime-neg");
+    document.getElementById("btn-set-schedule")!.addEventListener("click", () => {
+      switchTab("settings");
+      document.getElementById("cfg-hours-mon")?.focus();
+    });
+  }
 
   document.getElementById("avg-detail")!.innerHTML = `
-    <p>Period: <strong>${startDate.toLocaleDateString()} – ${endOfLastWeek.toLocaleDateString()}</strong></p>
+    <p>Period: <strong>${formatSystemDate(startDate)} – ${formatSystemDate(endOfLastWeek)}</strong></p>
     <p>Days with shifts: <strong>${daysWorked}</strong> · Weeks: <strong>${weeksWorked}</strong></p>
     <p>Total worked: <strong>${formatDuration(totalActual)}</strong> · Expected: <strong>${formatDuration(expectedHours)}</strong></p>
+    ${periodOffDays.length ? `<p>Off days: <strong>${escapeHtml(summarizeReasons(periodOffDays.map((o) => o.reason)))}</strong></p>` : ""}
   `;
 
   // ── Trend chart ─────────────────────────────────────────────────
   refreshTrendChart(allShifts, offDayDates, includeHolidays);
-}
-
-function weekKey(d: Date): string {
-  // ISO week-ish key: year + week number (Monday start)
-  const jan1 = new Date(d.getFullYear(), 0, 1);
-  const days = Math.floor((d.getTime() - jan1.getTime()) / 86_400_000);
-  const wn = Math.ceil((days + jan1.getDay() + 1) / 7);
-  return `${d.getFullYear()}-W${String(wn).padStart(2, "0")}`;
 }
 
 // ── Trend-chart drill-down: reach & edit ANY day's sessions ──────────
@@ -2180,9 +2012,6 @@ let trendDrillStack: TrendDrillLevel[] = [];
 let trendBucketRange: Record<string, { start: number; end: number }> = {};
 let trendLabelsCurrent: string[] = [];
 let trendGranularityCurrent = "day";
-let drillDay: string | null = null;
-let drillEditorOrigParent: HTMLElement | null = null;
-let drillEditorOrigNext: Node | null = null;
 // Cached inputs so drill navigation can re-render the chart without refreshStats.
 let trendLastShifts: ShiftRecord[] = [];
 let trendLastOffDays: Set<string> = new Set();
@@ -2195,82 +2024,34 @@ function currentTrendView(): { start: Date | null; end: Date; granularity: strin
   return { start: null, end: new Date(), granularity: g };
 }
 
-// Relocate the whole timeline-editor PANEL (bar + assign controls + brush, which
-// are siblings) into the drill slot and back. Moving only the bar left the assign
-// controls and brush behind in the dashboard tab.
-function moveEditorIntoSlot() {
-  const panel = document.getElementById("timeline-editor-panel");
-  const slot = document.getElementById("trend-drill-slot");
-  if (!panel || !slot || panel.parentElement === slot) return;
-  drillEditorOrigParent = panel.parentElement;
-  drillEditorOrigNext = panel.nextSibling;
-  slot.appendChild(panel);
-}
-function restoreEditorHome() {
-  const panel = document.getElementById("timeline-editor-panel");
-  if (panel && drillEditorOrigParent) {
-    if (drillEditorOrigNext && drillEditorOrigNext.parentNode === drillEditorOrigParent)
-      drillEditorOrigParent.insertBefore(panel, drillEditorOrigNext);
-    else drillEditorOrigParent.appendChild(panel);
-  }
-  drillEditorOrigParent = null;
-  drillEditorOrigNext = null;
-}
-
 function rerenderTrend() {
   refreshTrendChart(trendLastShifts, trendLastOffDays, trendLastHolidays);
 }
 
-function openDayDrill(dateKey: string) {
-  drillDay = dateKey;
-  moveEditorIntoSlot();
-  const empty = document.getElementById("trend-drill-empty");
-  if (empty) empty.hidden = true;
-  setTimelineDay(dateKey, trendLastShifts);
-  syncDrillUI();
-  document.getElementById("trend-drill-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-}
-
-// Restore the editor to its dashboard home and reset drill state. Used both by
-// the Close button and when leaving the Statistics tab.
-function restoreDrill() {
-  restoreEditorHome();
-  trendDrillStack = [];
-  drillDay = null;
-  const empty = document.getElementById("trend-drill-empty");
-  if (empty) empty.hidden = false;
-  const panel = document.getElementById("trend-drill-panel");
-  if (panel) panel.hidden = true;
-}
-
-function closeTrendDrill() {
-  restoreDrill();
-  rerenderTrend();
+/** A day bar: open that day on the Dashboard, with a way back here. */
+function openDayFromStats(dateKey: string) {
+  switchTab("dashboard");
+  const back = document.getElementById("btn-back-to-stats");
+  if (back) back.hidden = false;
+  setTimelineDay(dateKey);
 }
 
 function drillToLevel(level: number) {
-  restoreEditorHome();
   trendDrillStack = level < 0 ? [] : trendDrillStack.slice(0, level + 1);
-  drillDay = null;
-  const empty = document.getElementById("trend-drill-empty");
-  if (empty) empty.hidden = false;
   rerenderTrend();
 }
 
 function onTrendBarClick(index: number) {
   const bk = trendLabelsCurrent[index];
   if (bk == null) return;
-  if (trendGranularityCurrent === "day") { openDayDrill(bk); return; }
+  if (trendGranularityCurrent === "day") { openDayFromStats(bk); return; }
   const range = trendBucketRange[bk];
   if (!range) return;
   const startD = new Date(range.start);
   const label = trendGranularityCurrent === "week"
-    ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    ? "Wk of " + startD.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })
     : startD.toLocaleDateString(undefined, { month: "long", year: "numeric" });
   trendDrillStack.push({ start: startD, end: new Date(range.end), granularity: "day", label });
-  drillDay = null;
-  const empty = document.getElementById("trend-drill-empty");
-  if (empty) empty.hidden = false;
   rerenderTrend();
 }
 
@@ -2278,17 +2059,12 @@ function syncDrillUI() {
   const panel = document.getElementById("trend-drill-panel");
   const crumbs = document.getElementById("trend-drill-crumbs");
   if (!panel || !crumbs) return;
-  const open = trendDrillStack.length > 0 || drillDay != null;
-  panel.hidden = !open;
-  if (!open) return;
+  panel.hidden = trendDrillStack.length === 0;
+  if (panel.hidden) return;
   const parts = [`<button type="button" class="crumb" data-level="-1">All</button>`];
   trendDrillStack.forEach((lvl, i) => {
     parts.push(`<span class="crumb-sep">▸</span><button type="button" class="crumb" data-level="${i}">${escapeHtml(lvl.label)}</button>`);
   });
-  if (drillDay) {
-    const d = new Date(drillDay + "T00:00:00");
-    parts.push(`<span class="crumb-sep">▸</span><span class="crumb crumb-current">${escapeHtml(d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }))}</span>`);
-  }
   crumbs.innerHTML = parts.join("");
   crumbs.querySelectorAll(".crumb[data-level]").forEach((b) =>
     b.addEventListener("click", () => drillToLevel(parseInt((b as HTMLElement).dataset.level!))));
@@ -2354,11 +2130,14 @@ function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, i
   trendGranularityCurrent = granularity;
   trendBucketRange = bucketRange;
 
+  // Closed shifts only, split at midnight so a night shift lands on both days.
   const datasets = buildProjectStackDatasets(
     labels.length,
-    relevant,
-    (s) => (new Date(s.endTime!).getTime() - new Date(s.startTime).getTime()) / 3_600_000,
-    (s) => (s.endTime ? idxOf(bucketKey(new Date(s.startTime), granularity)) : -1),
+    relevant.filter((s) => s.endTime),
+    (s) => s.projectUuid,
+    (s) => [...shiftHoursByDay(s.startTime, s.endTime)].map(([day, h]): [number, number] =>
+      [idxOf(bucketKey(dateInputToLocalDate(day), granularity)), h]),
+    projectLook,
   );
 
   // Fold off-day credited hours into the Unassigned segment.
@@ -2379,14 +2158,23 @@ function refreshTrendChart(allShifts: ShiftRecord[], offDayDates: Set<string>, i
     const canvas = document.getElementById("trend-chart") as HTMLCanvasElement;
     trendChart = new Chart(canvas, {
       type: "bar",
-      data: { labels, datasets },
+      data: { labels: labels.map((k) => bucketLabel(k, granularity)), datasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
-        onClick: (_evt, els) => { if (els.length) onTrendBarClick(els[0].index); },
+        // Anywhere in a column counts, so an empty day can be opened to add time.
+        onClick: (evt, _els, chart) => {
+          const native = evt.native as Event | null;
+          if (!native) return;
+          const pts = chart.getElementsAtEventForMode(native, "index", { intersect: false }, false);
+          if (pts.length) onTrendBarClick(pts[0].index);
+        },
         onHover: (evt, els) => { const t = evt.native?.target as HTMLElement | undefined; if (t) t.style.cursor = els.length ? "pointer" : "default"; },
-        plugins: { legend: { display: datasets.length > 1, position: "bottom" } },
+        plugins: {
+          legend: { display: datasets.length > 1, position: "bottom" },
+          tooltip: stackedTotalTooltip(trendGranularityCurrent === "month" ? "Month Total" : trendGranularityCurrent === "week" ? "Week Total" : "Day Total"),
+        },
         scales: {
           x: { stacked: true, grid: { display: false }, ticks: { maxRotation: 45 } },
           y: { stacked: true, beginAtZero: true },
@@ -2417,22 +2205,36 @@ function renderProjectSummary(datasets: ProjectStackDataset[]) {
     .join("");
 }
 
-function bucketKey(d: Date, granularity: string): string {
-  if (granularity === "week") return weekKey(d);
-  if (granularity === "month") return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  return localDateKey(d); // day
-}
+// One-click ranges; the selects stay under "Custom range".
+const highlightAvgPresets = renderPresets(document.getElementById("avg-presets")!, [
+  { label: "Last 4 weeks", values: { "stats-unit": "weeks", "stats-count": "4" } },
+  { label: "Last 12 weeks", values: { "stats-unit": "weeks", "stats-count": "12" } },
+  { label: "Last 6 months", values: { "stats-unit": "months", "stats-count": "6" } },
+  { label: "Year to date", values: { "stats-unit": "ytd" } },
+], () => void refreshStats());
+const highlightTrendPresets = renderPresets(document.getElementById("trend-presets")!, [
+  { label: "7 days", values: { "trend-count": "7", "trend-unit": "days", "trend-granularity": "day" } },
+  { label: "30 days", values: { "trend-count": "30", "trend-unit": "days", "trend-granularity": "day" } },
+  { label: "12 weeks", values: { "trend-count": "12", "trend-unit": "weeks", "trend-granularity": "week" } },
+  { label: "12 months", values: { "trend-count": "12", "trend-unit": "months", "trend-granularity": "month" } },
+], () => { trendDrillStack = []; void refreshStats(); });
 
 // Wire stats controls
 for (const id of ["stats-unit", "stats-count", "stats-holidays", "trend-count", "trend-unit", "trend-granularity"]) {
   document.getElementById(id)!.addEventListener("change", () => {
+    highlightAvgPresets();
+    highlightTrendPresets();
     // Changing the trend range/granularity redefines the root view — drop any
     // active drill so the fresh selection isn't overridden by a stale level.
-    if (id.startsWith("trend-")) restoreDrill();
+    if (id.startsWith("trend-")) trendDrillStack = [];
     refreshStats();
   });
 }
-document.getElementById("trend-drill-close")!.addEventListener("click", closeTrendDrill);
+document.getElementById("trend-drill-close")!.addEventListener("click", () => drillToLevel(-1));
+document.getElementById("btn-back-to-stats")!.addEventListener("click", (e) => {
+  (e.currentTarget as HTMLElement).hidden = true;
+  switchTab("statistics");
+});
 
 // ═══════════════════════════════════════════════════════════════════
 //  SETTINGS + SYNC
@@ -2445,6 +2247,47 @@ document.getElementById("trend-drill-close")!.addEventListener("click", closeTre
  * Returns true on success, false on failure/skip.
  */
 let _syncInFlight = false;
+
+// Sync health for the header dot. Background syncs run on every focus and
+// after every edit, so a failure there stays quiet (an offline laptop used to
+// get a notification each time the window was focused). Only a manual "Sync
+// now", or failures lasting SYNC_ALERT_AFTER_MS, notify.
+type SyncState = "off" | "ok" | "offline" | "error";
+const SYNC_ALERT_AFTER_MS = 30 * 60 * 1000;
+let syncFailingSince: number | null = null;
+let syncAlerted = false;
+
+function looksOffline(msg: string): boolean {
+  return /network|connect|dns|resolve|timed? ?out|unreachable|offline|error sending request/i.test(msg);
+}
+
+function setSyncDot(state: SyncState, detail = "") {
+  const dot = document.getElementById("sync-dot");
+  if (!dot) return;
+  dot.hidden = state === "off";
+  dot.dataset.state = state;
+  dot.dataset.detail = detail;
+}
+
+async function syncDotTitle(): Promise<string> {
+  const dot = document.getElementById("sync-dot");
+  const state = dot?.dataset.state as SyncState | undefined;
+  const last = await invoke<string | null>("get_config", { key: "last_synced_at" }).catch(() => null);
+  const ago = last ? `last synced ${formatAgo(new Date(last))}` : "not synced yet";
+  if (state === "offline") return `Offline — ${ago}. Changes are kept and sync when you're back online.`;
+  if (state === "error") return `Sync problem: ${dot?.dataset.detail ?? ""} (${ago})`;
+  return `Synced — ${ago}`;
+}
+
+function formatAgo(d: Date): string {
+  const min = Math.round((Date.now() - d.getTime()) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} h ago`;
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
 async function performSync(statusEl?: HTMLElement | null): Promise<boolean> {
   if (_syncInFlight) return false;
   _syncInFlight = true;
@@ -2453,9 +2296,13 @@ async function performSync(statusEl?: HTMLElement | null): Promise<boolean> {
     const result = await invoke<string>("sync_now");
     if (result === "not_configured") {
       if (statusEl) statusEl.textContent = "Not configured";
+      setSyncDot("off");
       return false;
     }
 
+    syncFailingSince = null;
+    syncAlerted = false;
+    setSyncDot("ok");
     // The local DB may have changed (pulled shifts/off-days); refresh views.
     await refresh();
     await refreshStats();
@@ -2463,15 +2310,36 @@ async function performSync(statusEl?: HTMLElement | null): Promise<boolean> {
     return true;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (statusEl) statusEl.textContent = `Failed: ${msg}`;
-    notify("Sync Failed", msg);
+    const offline = looksOffline(msg);
+    setSyncDot(offline ? "offline" : "error", msg);
+    syncFailingSince ??= Date.now();
+    if (statusEl) {
+      statusEl.textContent = offline ? "Offline — will sync when you're back online." : `Failed: ${msg}`;
+      notify("Sync Failed", msg);
+    } else if (!syncAlerted && Date.now() - syncFailingSince >= SYNC_ALERT_AFTER_MS) {
+      syncAlerted = true;
+      notify("Sync isn't working", offline
+        ? "No connection for 30 minutes. Your changes are safe and will sync later."
+        : msg);
+    }
     return false;
   } finally {
     _syncInFlight = false;
   }
 }
 
+document.getElementById("sync-dot")?.addEventListener("mouseenter", async (e) => {
+  (e.currentTarget as HTMLElement).title = await syncDotTitle();
+});
+
+// "System Default" follows the OS live: re-apply when it switches dark/light.
+let currentAppearance: AppearanceConfig | null = null;
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (currentAppearance?.theme === "system") applyAppearance(currentAppearance);
+});
+
 function applyAppearance(cfg: AppearanceConfig) {
+  currentAppearance = cfg;
   const root = document.documentElement;
   const theme = cfg.theme === "system"
     ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
@@ -2597,10 +2465,14 @@ document.getElementById("cfg-auto-resume-end")?.addEventListener("change", () =>
   void saveAutoResumeConfigFromInputs();
 });
 
+// The schedule saves itself shortly after you stop typing (no Save button).
+let scheduleSaveTimer: number | null = null;
 WORKDAY_KEYS.forEach((day) => {
   getScheduleHoursInput(day)?.addEventListener("input", () => {
     setScheduleStatus("");
     updateWorkSchedulePreview();
+    if (scheduleSaveTimer !== null) window.clearTimeout(scheduleSaveTimer);
+    scheduleSaveTimer = window.setTimeout(() => void saveScheduleFromInputs(), 700);
   });
 });
 
@@ -2652,7 +2524,8 @@ async function reconcileScheduleRemote() {
   }
 }
 
-document.getElementById("btn-save-schedule")!.addEventListener("click", async () => {
+async function saveScheduleFromInputs() {
+  scheduleSaveTimer = null;
   const config = readWorkScheduleFromInputs();
 
   if (!config) {
@@ -2670,7 +2543,7 @@ document.getElementById("btn-save-schedule")!.addEventListener("click", async ()
   setScheduleStatus("Saved ✓");
   await refresh();
   await refreshStats();
-});
+}
 
 document.getElementById("btn-save-cfg")!.addEventListener("click", async () => {
   const cfg: SyncConfig = {
@@ -2679,20 +2552,14 @@ document.getElementById("btn-save-cfg")!.addEventListener("click", async () => {
   };
   await settings.saveSyncConfig(cfg);
   await settings.saveServerUrl(cfg.serverUrl);
-  setSyncStatus("Saved ✓");
-});
-
-document.getElementById("btn-sync-now")!.addEventListener("click", async () => {
+  // Saving also tests the connection: a sync right away says whether it works.
+  if (!cfg.serverUrl || !cfg.apiKey) { setSyncStatus("Saved — add a server URL and key to sync."); return; }
   await performSync(document.getElementById("sync-status"));
 });
 
 // ═══════════════════════════════════════════════════════════════════
 //  CSV EXPORT
 // ═══════════════════════════════════════════════════════════════════
-
-function csvCell(v: string): string {
-  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
-}
 
 document.getElementById("btn-export")!.addEventListener("click", async () => {
   const allShifts = await shifts.getAllShifts();
@@ -2703,10 +2570,10 @@ document.getElementById("btn-export")!.addEventListener("click", async () => {
 
   // Shifts section
   rows.push("[Shifts]");
-  rows.push(["ID", "Start Time", "End Time", "Duration (Hours)", "Project"].join(","));
+  rows.push(["ID", "Start Time", "End Time", "Duration (Hours)", "Project", "Note"].join(","));
   for (const s of allShifts) {
     const dur = shiftDurationHours(s).toFixed(2);
-    rows.push([String(s.id), s.startTime, s.endTime ?? "", dur, csvCell(projectName(s.projectUuid))].join(","));
+    rows.push([String(s.id), s.startTime, s.endTime ?? "", dur, csvCell(projectName(s.projectUuid)), csvCell(s.note ?? "")].join(","));
   }
 
   // Off-days section
@@ -2750,10 +2617,10 @@ document.getElementById("btn-import")!.addEventListener("click", () => {
       if (result.shifts_skipped > 0) parts.push(`${result.shifts_skipped} shifts skipped (duplicates)`);
       if (result.offdays_imported > 0) parts.push(`${result.offdays_imported} off-days imported`);
       if (result.offdays_skipped > 0) parts.push(`${result.offdays_skipped} off-days skipped (duplicates)`);
-      alert(parts.length > 0 ? parts.join("\n") : "No data found in file.");
+      showToast(parts.length > 0 ? parts.join(" · ") : "No data found in the file.", { timeoutMs: 8000 });
       await refresh();
     } catch (err) {
-      alert("Import failed: " + err);
+      showToast("Import failed: " + err, { tone: "error", timeoutMs: 10000 });
     }
   });
   input.click();
@@ -2763,15 +2630,43 @@ document.getElementById("btn-import")!.addEventListener("click", () => {
 
 document.getElementById("btn-add-shift")!.addEventListener("click", () => {
   clearDialogError("shift-form-error");
-  const today = localDateKey(new Date());
-  (document.getElementById("inp-shift-start-date") as HTMLInputElement).value = today;
-  (document.getElementById("inp-shift-end-date") as HTMLInputElement).value = today;
-  (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = "";
-  (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = "";
+  // Prefill: the day shown in the timeline, right after its last shift.
+  const day = timeline?.day() ?? localDateKey(new Date());
+  const dayStartMs = parseLocalDate(day, "00:00:00").getTime();
+  const [sugStart, sugEnd] = suggestManualShift(shiftsCache.map((x) => ({ startMs: spanOf(x)[0], endMs: spanOf(x)[1] })), dayStartMs, Date.now(),
+    offDayDatesCache.has(day) ? 0 : getTargetHoursForDate(new Date(dayStartMs), currentWorkSchedule));
+  const hhmm = (ms: number) => new Date(ms).toTimeString().slice(0, 5);
+  const pattern = getSystemDateFormatPattern();
+  const startInput = document.getElementById("inp-shift-start-date") as HTMLInputElement;
+  const endInput = document.getElementById("inp-shift-end-date") as HTMLInputElement;
+  document.getElementById("shift-form-note")!.textContent =
+    `Enter dates as ${pattern} or YYYY-MM-DD, and times as 24-hour HH:MM.`;
+  startInput.placeholder = pattern;
+  endInput.placeholder = pattern;
+  startInput.value = localDateKey(new Date(sugStart));
+  endInput.value = localDateKey(new Date(sugEnd));
+  updateDatePreview(startInput);
+  updateDatePreview(endInput);
+  (document.getElementById("inp-shift-start-time") as HTMLInputElement).value = hhmm(sugStart);
+  (document.getElementById("inp-shift-end-time") as HTMLInputElement).value = hhmm(sugEnd);
   (document.getElementById("inp-shift-note") as HTMLInputElement).value = "";
   (document.getElementById("dlg-shift") as HTMLDialogElement).showModal();
-  (document.getElementById("inp-shift-start-date") as HTMLInputElement).focus();
+  (document.getElementById("inp-shift-start-time") as HTMLInputElement).focus();
 });
+// Show how a typed date was read ("= Fri, 3 Apr 2026"), so a day/month mix-up
+// is visible before saving.
+function updateDatePreview(input: HTMLInputElement) {
+  const preview = document.getElementById(`${input.id}-preview`);
+  if (!preview) return;
+  const normalized = normalizeDateInputValue(input.value);
+  preview.textContent = normalized
+    ? "= " + dateInputToLocalDate(normalized).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short", year: "numeric" })
+    : "";
+}
+for (const id of ["inp-shift-start-date", "inp-shift-end-date"]) {
+  const input = document.getElementById(id) as HTMLInputElement;
+  input.addEventListener("input", () => updateDatePreview(input));
+}
 (document.getElementById("btn-cancel-shift") as HTMLButtonElement).addEventListener("click", () => {
   (document.getElementById("dlg-shift") as HTMLDialogElement).close("cancel");
 });
@@ -2792,7 +2687,7 @@ document.getElementById("btn-add-shift")!.addEventListener("click", () => {
   );
 
   if (!start || !end) {
-    setDialogError("shift-form-error", "Use YYYY-MM-DD for dates and HH:MM for times.");
+    setDialogError("shift-form-error", `Use ${getSystemDateFormatPattern()} or YYYY-MM-DD for dates and HH:MM for times.`);
     return;
   }
 
@@ -2926,6 +2821,27 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.10.0",
+    date: "2026-10-02",
+    title: "Paint your day",
+    changes: [
+      "The day timeline is now a canvas. Pick a project colour (or press 0–9 over it), then click a start and an end, or drag. Unassigned time gets the project, and an empty spot gets the time you forgot to track. Time that already has a project is left alone — click it to edit it. Ctrl+click paints a whole block.",
+      "Fix times by dragging the edge of a block, or click a block to edit its times, project and note — including the start of the running shift. Right-click a block for quick actions; Del removes its project, Shift+Del the whole shift.",
+      "Move through days with ‹ › or the arrow keys, or click the date for a calendar (days with tracked time have a dot). In Statistics, click any day — even an empty one — to open it.",
+      "Nothing asks “Are you sure?” any more: deleting, painting and editing happen at once, with Undo (or Ctrl+Z).",
+      "Shifts the app had to close for you after a missed clock-out get an amber edge until you fix or confirm them.",
+      "Off days can have a reason: right-click a day in the calendar for vacation, sick leave, public holiday or other. Statistics and timesheets show them.",
+      "Optional Pomodoro timer (Settings → Focus timer): a small ring next to the clock runs focus rounds with short breaks and a long break every few rounds. Click it to pause, right-click to skip or stop. A soft sound and a notification are optional. Off unless you turn it on.",
+      "The header with the clock stays at the top while you scroll. Today shows how much of your target is left and when you'd be done, and the Status card takes a note for what you're working on.",
+      "Less typing: one-click ranges in Statistics and Reports; reports update as you change them and remember your last choice; settings save themselves; “Add shift” opens with sensible times for the day you're looking at.",
+      "Recent shifts are grouped by day with day totals — click a row to edit it on the timeline. Chart tooltips show each project's time and the day's total.",
+      "The report letterhead works without sync (stored on this device). Archived projects can still be reported. CSV export and import moved to Settings → Your data and now include notes and projects.",
+      "Sync problems no longer pop up every time you switch windows: a small dot in the header shows synced, offline or a problem.",
+      "Bind a global hotkey to “tracksuite-work-desktop --toggle” to clock in or out from anywhere (see HOTKEYS.md). Launching at login now starts quietly in the tray.",
+      "Fixes: weeks in Statistics start on Monday and averages include Sundays; night shifts count on both days; time near midnight from the web app lands on the right day; merging touching shifts never drops a note; a shift continued after a project switch can no longer run on for days after a crash; notifications work on macOS and Windows; a second launch opens the running app; on Linux the window buttons work after reopening from the tray; “System Default” follows your OS theme.",
+    ],
+  },
+  {
     version: "0.9.2",
     date: "2026-07-22",
     title: "Smarter updates on apt",
@@ -3049,6 +2965,9 @@ function scheduleRefresh() {
 
 // Keep the visible UI in sync when tray actions update the local database.
 listen("tray-data-changed", () => scheduleRefresh());
+// The Rust loop closed a stale shift; take it once (it may also have happened
+// before this listener existed, hence the take at boot).
+listen("shift-auto-closed", () => void takeAutoClosed());
 
 // On focus, pull remote changes (e.g. a shift closed on the web app) as well
 // as refresh. performSync refreshes on success; scheduleRefresh covers the
@@ -3165,6 +3084,22 @@ async function checkForUpdates() {
   } catch { /* non-critical */ }
 }
 
+// Settings → About: the release notes, any time (not only after an update).
+document.getElementById("btn-whats-new")?.addEventListener("click", () => renderWhatsNew(CHANGELOG.slice(0, 3)));
+void getVersion().then((v) => {
+  const el = document.getElementById("about-version");
+  if (el) el.textContent = `TrackSuite.work ${v}`;
+}).catch(() => {});
+
+// The webview's own right-click menu only offers "Reload"; keep it for text
+// fields (copy/paste) and replace it with nothing elsewhere. The timeline and
+// the off-day calendar bring their own menus.
+document.addEventListener("contextmenu", (e) => {
+  const t = e.target as HTMLElement | null;
+  if (t?.closest("input, textarea, [contenteditable='true']") || window.getSelection()?.toString()) return;
+  e.preventDefault();
+});
+
 document.getElementById("btn-whats-new-close")?.addEventListener("click", () => {
   (document.getElementById("dlg-whats-new") as HTMLDialogElement).close();
 });
@@ -3173,8 +3108,18 @@ document.getElementById("btn-whats-new-close")?.addEventListener("click", () => 
 let rpProfile: ReportProfile = {};
 let rpShifts: ShiftRecord[] = [];
 let rpOffDaySet = new Set<string>();
+let rpOffDayReasons = new Map<string, string | null>();
 let rpWired = false;
-let rpProfileAvailable = false;
+// The letterhead lives on this device (config "report_profile") and, when
+// sync is set up, also on the server so the web app shows the same one.
+const RP_PROFILE_KEY = "report_profile";
+
+async function rpLoadLocalProfile(): Promise<ReportProfile> {
+  try { return JSON.parse((await invoke<string | null>("get_config", { key: RP_PROFILE_KEY })) || "{}"); } catch { return {}; }
+}
+async function rpSaveLocalProfile(p: ReportProfile) {
+  await invoke("set_config", { key: RP_PROFILE_KEY, value: JSON.stringify(p) });
+}
 
 const RP_WEEKDAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -3188,12 +3133,6 @@ function fmtMoney(a: number): string {
 function signedHoursNum(h: number): string {
   const r = Math.round(h * 100) / 100;
   return (r >= 0 ? "+" : "") + r.toFixed(2);
-}
-function reportCsvCell(v: string): string {
-  let s = v ?? "";
-  if (/^[=+\-@]/.test(s)) s = "'" + s;
-  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-  return s;
 }
 
 interface RpLineItem {
@@ -3279,9 +3218,13 @@ function rpBuildTimesheet(): RpTimesheetRow[] {
   while (cursor.getTime() <= end.getTime()) {
     const key = localDateKey(cursor);
     const worked = workedByDay.get(key) ?? 0;
-    const target = rpOffDaySet.has(key) ? 0 : getTargetHoursForDate(cursor, currentWorkSchedule);
-    if (worked > 0 || target > 0) {
-      rows.push({ date: key, weekday: RP_WEEKDAY[cursor.getDay()], worked, target, diff: worked - target });
+    const off = rpOffDaySet.has(key);
+    const target = off ? 0 : getTargetHoursForDate(cursor, currentWorkSchedule);
+    // Off days on a scheduled workday are listed too, with their reason.
+    const listOff = off && getTargetHoursForDate(cursor, currentWorkSchedule) > 0;
+    if (worked > 0 || target > 0 || listOff) {
+      const weekday = RP_WEEKDAY[cursor.getDay()] + (off ? ` · ${reasonInfo(rpOffDayReasons.get(key)).label}` : "");
+      rows.push({ date: key, weekday, worked, target, diff: worked - target });
     }
     cursor.setDate(cursor.getDate() + 1);
   }
@@ -3304,8 +3247,8 @@ function rpLetterhead(from: string, to: string): string {
       </div>
       <div class="report-meta">
         <div class="report-title">${p.letter_header ? escapeHtml(p.letter_header) : "Time report"}</div>
-        <div class="muted">${escapeHtml(from)} — ${escapeHtml(to)}</div>
-        <div class="muted">Generated ${escapeHtml(localDateKey(new Date()))}</div>
+        <div class="muted">${escapeHtml(formatSystemDate(from))} — ${escapeHtml(formatSystemDate(to))}</div>
+        <div class="muted">Generated ${escapeHtml(formatSystemDate(new Date()))}</div>
       </div>
     </div>`;
 }
@@ -3349,7 +3292,7 @@ function rpRenderClientReport() {
   const detailTable = detailed ? `
     <h4 class="report-h">Itemized entries</h4>
     <table class="report-table"><thead><tr><th>Date</th>${withTimes ? "<th>Time</th>" : ""}<th>Project</th><th>Note</th><th class="num">Hours</th><th class="num">Amount</th></tr></thead>
-    <tbody>${detailRows.map((r) => `<tr><td>${escapeHtml(r.date)}</td>${withTimes ? `<td>${escapeHtml(r.times)}</td>` : ""}<td>${escapeHtml(r.projectName)}</td><td>${escapeHtml(r.note)}</td>
+    <tbody>${detailRows.map((r) => `<tr><td>${escapeHtml(formatSystemDate(r.date))}</td>${withTimes ? `<td>${escapeHtml(r.times)}</td>` : ""}<td>${escapeHtml(r.projectName)}</td><td>${escapeHtml(r.note)}</td>
       <td class="num">${fmtHoursNum(r.hours)}</td><td class="num">${r.amount != null ? fmtMoney(r.amount) + " " + escapeHtml(r.currency) : "—"}</td></tr>`).join("")}</tbody></table>` : "";
 
   out.innerHTML = `
@@ -3371,7 +3314,7 @@ function rpRenderTimesheet() {
   const toV = rpEl<HTMLInputElement>("rp-to").value;
   const totalWorked = rows.reduce((s, r) => s + r.worked, 0);
   const totalTarget = rows.reduce((s, r) => s + r.target, 0);
-  const body = rows.map((r) => `<tr><td>${escapeHtml(r.date)}</td><td>${escapeHtml(r.weekday)}</td>
+  const body = rows.map((r) => `<tr><td>${escapeHtml(formatSystemDate(r.date))}</td><td>${escapeHtml(r.weekday)}</td>
     <td class="num">${fmtHoursNum(r.worked)}</td><td class="num">${fmtHoursNum(r.target)}</td><td class="num">${signedHoursNum(r.diff)}</td></tr>`).join("");
   out.innerHTML = `
     ${rpLetterhead(fromV, toV)}
@@ -3388,14 +3331,14 @@ async function rpExportCsv() {
   let header: string[]; let rows: string[][]; let kind: string;
   if (rpCurrentStyle() === "timesheet") {
     const ts = rpBuildTimesheet();
-    if (ts.length === 0) { alert("No working days in this range to export."); return; }
+    if (ts.length === 0) { showToast("No working days in this range to export."); return; }
     header = ["Date", "Day", "Worked", "Target", "Difference"];
     rows = ts.map((r) => [r.date, r.weekday, fmtHoursNum(r.worked), fmtHoursNum(r.target), signedHoursNum(r.diff)]);
     kind = "timesheet";
   } else {
     const withTimes = rpEl<HTMLInputElement>("rp-times").checked;
     const detail = rpBuildDetailRows(withTimes);
-    if (detail.length === 0) { alert("No completed shifts in this range to export."); return; }
+    if (detail.length === 0) { showToast("No completed shifts in this range to export."); return; }
     header = withTimes
       ? ["Date", "Time", "Project", "Note", "Hours", "Currency", "Amount"]
       : ["Date", "Project", "Note", "Hours", "Currency", "Amount"];
@@ -3407,13 +3350,13 @@ async function rpExportCsv() {
     });
     kind = "report";
   }
-  const csv = [header, ...rows].map((r) => r.map((c) => reportCsvCell(String(c))).join(",")).join("\r\n");
+  const csv = [header, ...rows].map((r) => r.map((c) => csvCell(String(c))).join(",")).join("\r\n");
   const name = `${kind}_${rpEl<HTMLInputElement>("rp-from").value}_${rpEl<HTMLInputElement>("rp-to").value}.csv`;
   try {
     const path = await invoke<string>("save_download_file", { name, contents: csv });
-    alert("Saved to: " + path);
+    showToast("Saved to " + path, { timeoutMs: 8000 });
   } catch (err) {
-    alert("Failed to save CSV: " + err);
+    showToast("Couldn't save the CSV: " + err, { tone: "error" });
   }
 }
 
@@ -3456,68 +3399,74 @@ function rpReadProfileForm(): ReportProfile {
   };
 }
 
+// Every report choice re-renders at once and is remembered (shared/ui/reportChoices.ts).
+let rpChoices: ReportChoices | null = null;
+
 function rpWireHandlers() {
   if (rpWired) return;
   rpWired = true;
-  rpEl("rp-generate").addEventListener("click", rpRenderReport);
-  rpEl("rp-style").addEventListener("change", rpRenderReport);
-  rpEl("rp-detailed").addEventListener("change", rpRenderReport);
-  rpEl("rp-times").addEventListener("change", rpRenderReport);
+  rpChoices = wireReportChoices(rpEl("rp-range-presets"), rpRenderReport);
   rpEl("rp-csv").addEventListener("click", () => void rpExportCsv());
   rpEl("rp-print").addEventListener("click", () => { if (rpEl("report-output").hidden) rpRenderReport(); window.print(); });
   rpEl("pf-add-field").addEventListener("click", () => { const f = rpCollectCustomFields(); f.push({ label: "", value: "" }); rpRenderCustomFields(f); });
   rpEl("pf-save").addEventListener("click", async () => {
     const status = rpEl("pf-status");
-    const sync = await settings.getSyncConfig();
-    if (!sync) { status.textContent = "Configure sync first."; return; }
     const btn = rpEl<HTMLButtonElement>("pf-save");
     btn.disabled = true; status.textContent = "Saving…";
     rpProfile = rpReadProfileForm();
-    const res = await saveRemoteProfile(sync.serverUrl, sync.apiKey, rpProfile);
+    await rpSaveLocalProfile(rpProfile);
+    const sync = await settings.getSyncConfig();
+    let msg = "Saved.";
+    if (sync) {
+      const res = await saveRemoteProfile(sync.serverUrl, sync.apiKey, rpProfile).catch(() => null);
+      if (!res?.ok) msg = "Saved on this device — couldn't reach the server, try again later.";
+    }
     btn.disabled = false;
-    if (res.ok) { status.textContent = "Saved."; setTimeout(() => (status.textContent = ""), 2500); }
-    else { status.textContent = "Failed to save: " + (res.message ?? "server error"); }
+    status.textContent = msg;
+    rpRenderReport();
+    setTimeout(() => { if (status.textContent === msg) status.textContent = ""; }, 4000);
   });
 }
 
 async function renderReportsTab() {
   rpWireHandlers();
 
-  // Default the date range to the current month on first open.
-  const fromEl = rpEl<HTMLInputElement>("rp-from");
-  const toEl = rpEl<HTMLInputElement>("rp-to");
-  if (!fromEl.value) {
-    const now = new Date();
-    fromEl.value = localDateKey(new Date(now.getFullYear(), now.getMonth(), 1));
-    toEl.value = localDateKey(now);
-  }
+  // Open the way it was left last time (default: this month so far).
+  const savedProject = rpChoices?.restore() ?? "";
 
-  // Load the shared report profile from the server (Full mode needs sync).
+  // The letterhead: the server's copy when sync works (kept locally too),
+  // otherwise the one stored on this device.
   const sync = await settings.getSyncConfig();
-  rpProfileAvailable = !!sync;
-  rpEl("rp-profile-unavailable").hidden = rpProfileAvailable;
-  rpEl("rp-profile-body").hidden = !rpProfileAvailable;
+  rpProfile = await rpLoadLocalProfile();
+  let where = "Stored on this device. Set up sync in Settings to use it in the web app too.";
   if (sync) {
     try {
       const res = await getRemoteProfile(sync.serverUrl, sync.apiKey);
-      if (res.ok && res.data?.profile) rpProfile = res.data.profile; else rpProfile = {};
-    } catch { rpProfile = {}; }
-    rpFillProfileForm();
+      if (res.ok && res.data?.profile) { rpProfile = res.data.profile; await rpSaveLocalProfile(rpProfile); }
+      // Filled in before sync was set up: hand the device's copy to the server.
+      else if (res.ok && Object.keys(rpProfile).length) await saveRemoteProfile(sync.serverUrl, sync.apiKey, rpProfile).catch(() => null);
+      where = res.ok ? "Shared with the web app through sync." : "Couldn't reach the server — showing the copy on this device.";
+    } catch {
+      where = "Couldn't reach the server — showing the copy on this device.";
+    }
   }
+  rpEl("rp-profile-where").textContent = where;
+  rpFillProfileForm();
 
   // Load tracking data (projects are already in projectsCache).
   const [allShifts, offDayList] = await Promise.all([shifts.getAllShifts(), offDays.getOffDays()]);
   rpShifts = allShifts;
   rpOffDaySet = new Set(offDayList.map((o) => o.date));
+  rpOffDayReasons = new Map(offDayList.map((o) => [o.date, o.reason ?? null]));
 
+  // Archived projects stay reportable (billing old work), grouped at the end.
   const sel = rpEl<HTMLSelectElement>("rp-project");
-  sel.innerHTML = `<option value="">All projects</option>`;
-  for (const p of projectsCache.filter((p) => !p.archived)) {
-    const opt = document.createElement("option");
-    opt.value = p.uuid;
-    opt.textContent = p.name;
-    sel.appendChild(opt);
-  }
+  const prevProject = sel.value || savedProject;
+  const opts = (list: ProjectRecord[]) => list.map((p) => `<option value="${p.uuid}">${escapeHtml(p.name)}</option>`).join("");
+  const archived = projectsCache.filter((p) => p.archived);
+  sel.innerHTML = `<option value="">All projects</option>${opts(projectsCache.filter((p) => !p.archived))}`
+    + (archived.length ? `<optgroup label="Archived">${opts(archived)}</optgroup>` : "");
+  sel.value = projectsCache.some((p) => p.uuid === prevProject) ? prevProject : "";
 
   rpRenderReport();
 }
@@ -3527,6 +3476,8 @@ loadMode()
   .then(async () => {
     // Recover a shift the app couldn't clock out last run before the first paint.
     await checkStaleAndRecover();
+    await takeAutoClosed();
+    initFocusTimer();
     refresh();
     performSync();
     // Pull the shared work schedule (may adopt a newer server copy and re-render).

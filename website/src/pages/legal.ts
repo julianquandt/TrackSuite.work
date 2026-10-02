@@ -415,13 +415,20 @@ export function renderPrivacy(app: HTMLElement): void {
 
         <h2>6. How long we keep it</h2>
         <table class="legal-table legal-table-wide">
-            <tr><th>Account and content</th><td>Until you delete your account. Deletion is immediate and irreversible.</td></tr>
+            <tr><th>Account and content</th><td>Until you delete your account. Deletion from the live service is immediate and irreversible; see backups below.</td></tr>
             <tr><th>Deleted items (shifts, projects, off-days)</th><td>A deletion marker is retained for 180 days so the deletion propagates to your other devices, then purged.</td></tr>
             <tr><th>Sessions (incl. IP and user-agent)</th><td>Purged 30 days after the session expires or is revoked. Sessions expire after 90 days at the latest.</td></tr>
             <tr><th>Rate-limiting counters</th><td>Purged after 24 hours.</td></tr>
             <tr><th>Accounts that never completed setup</th><td>Deleted automatically after 48 hours.</td></tr>
             <tr><th>Security logs</th><td>Kept for the retention period configured on the server's system journal, then rotated out.</td></tr>
+            <tr><th>Encrypted backups</th><td>Kept for up to 30 days, then deleted. Data you delete disappears from the live service at once, but remains in existing backups until those rotate out.</td></tr>
         </table>
+        <p>
+            Backups exist so that a hardware failure doesn't cost you your records. They are
+            encrypted, stored separately from the server, and never used to bring back an
+            individual account that was deleted — only to restore the service as a whole after a
+            loss.
+        </p>
         <p>
             If an inactivity policy is enabled on this instance, we email you a warning before a
             long-dormant account is removed, and delete it only after a grace period.

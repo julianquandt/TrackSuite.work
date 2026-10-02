@@ -43,7 +43,7 @@ configure_origin() {
 
 configure_sparse_checkout() {
     if git -C "$DEPLOY_DIR" sparse-checkout init --cone >/dev/null 2>&1; then
-        git -C "$DEPLOY_DIR" sparse-checkout set backend app_server website
+        git -C "$DEPLOY_DIR" sparse-checkout set backend app_server website shared
         return
     fi
 
@@ -53,6 +53,7 @@ configure_sparse_checkout() {
 backend/*
 app_server/*
 website/*
+shared/*
 EOF
 }
 

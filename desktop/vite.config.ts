@@ -5,6 +5,8 @@ export default defineConfig({
     server: {
         port: 5173,
         strictPort: true,
+        // Allow importing ../shared (code shared with the web app).
+        fs: { allow: [".."] },
         watch: {
             ignored: ["**/src-tauri/**"],
         },

@@ -80,12 +80,25 @@ mod linux {
     }
 }
 
+/// Show a desktop notification. Works on every platform: Linux talks to the
+/// notification daemon directly (notify-send, else D-Bus); macOS and Windows
+/// use tauri-plugin-notification. Used by the tray and by the UI's
+/// `show_native_notification` command.
 #[cfg(target_os = "linux")]
-pub async fn show(title: String, body: Option<String>) -> Result<(), String> {
+pub async fn show(_app: tauri::AppHandle, title: String, body: Option<String>) -> Result<(), String> {
     linux::show(title, body).await
 }
 
 #[cfg(not(target_os = "linux"))]
-pub async fn show(_title: String, _body: Option<String>) -> Result<(), String> {
-    Err("native-linux-notifications-unsupported".to_string())
+pub async fn show(app: tauri::AppHandle, title: String, body: Option<String>) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut builder = app.notification().builder().title(title);
+        if let Some(body) = body {
+            builder = builder.body(body);
+        }
+        builder.show().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

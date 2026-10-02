@@ -13,6 +13,7 @@
         "resolveJsonModule": true,
         "isolatedModules": true,
         "noEmit": true,
+        "allowImportingTsExtensions": true,
         "strict": true,
         "noUnusedLocals": true,
         "noUnusedParameters": true,
@@ -23,6 +24,10 @@
     },
     "include": [
         "src/**/*.ts",
+        "../shared/**/*.ts",
         "vite.config.ts"
+    ],
+    "exclude": [
+        "../shared/**/*.test.ts"
     ]
 }

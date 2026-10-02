@@ -1,4 +1,5 @@
 import QRCode from "qrcode";
+import { escapeHtml } from "../../../shared/text.ts";
 
 import {
     changePassword,
@@ -757,10 +758,4 @@ export function renderDashboard(app: HTMLElement): void {
 
 function formatTimestamp(value: string): string {
     return new Date(value).toLocaleString();
-}
-
-function escapeHtml(value: string): string {
-    const el = document.createElement("span");
-    el.textContent = value;
-    return el.innerHTML;
 }
