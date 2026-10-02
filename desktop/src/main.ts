@@ -2821,6 +2821,14 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.10.1",
+    date: "2026-10-02",
+    title: "Header fix",
+    changes: [
+      "The header no longer jumps to two rows a moment after opening (it ran out of space once the sync dot appeared, especially with wider system fonts). The app also uses a bit more of a wide window.",
+    ],
+  },
+  {
     version: "0.10.0",
     date: "2026-10-02",
     title: "Paint your day",

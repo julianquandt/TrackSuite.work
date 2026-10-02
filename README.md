@@ -37,6 +37,8 @@ The website has guided install instructions for every platform. If you'd rather 
 
 The desktop app updates itself on Windows, macOS, and the Linux AppImage. Installed via apt? Updates arrive with your normal system updates.
 
+**macOS, first launch:** the app isn't notarized by Apple, so macOS asks once before opening it. Open the app, then go to **System Settings → Privacy & Security** and click **Open Anyway** (on macOS 14 and older, right-click the app → Open works too). If macOS says the app "is damaged", run `xattr -cr "/Applications/TrackSuite.work.app"` in Terminal and open it again. Updates install without this step.
+
 ## Your data, your control
 
 - **Private by default.** The desktop app works with **no account and no server** — nothing leaves your machine.

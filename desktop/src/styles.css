@@ -289,7 +289,8 @@ select {
 }
 
 .shell {
-    width: min(960px, calc(100vw - 48px));
+    /* Room for the one-row header even with wider system fonts. */
+    width: min(1080px, calc(100vw - 48px));
     margin: 0 auto;
     padding: 32px 0 56px;
 }
@@ -318,9 +319,19 @@ select {
 .dash-header h1 {
     font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
     letter-spacing: -0.03em;
-    font-size: 1.8rem;
+    /* Smaller on narrower windows, and the first thing to give way. */
+    font-size: clamp(1.3rem, 2.1vw, 1.8rem);
     margin: 0;
+    flex: 0 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
+/* One row, always: the header used to wrap its right-hand group onto a second
+   row when a wider system font or the sync dot added a few pixels. */
+.dash-header { flex-wrap: nowrap; }
+.dash-header .tab-bar, .dash-header .header-actions { flex-shrink: 0; }
 
 /* ── Tab bar ─────────────────────────────────────────────────────── */
 
@@ -1507,7 +1518,7 @@ select option {
 }
 .running-note[hidden] { display: none; }
 /* Chip, sync dot, focus ring and clock stay together on the right. */
-.header-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 
 /* Recent shifts grouped by day */
 tr.day-row td {

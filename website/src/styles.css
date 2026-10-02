@@ -2231,3 +2231,4 @@ button[type="submit"] {
 .reports-intro { margin: 0 0 16px; }
 /* Inside the tracker's Reports tab the page needs no outer spacing of its own. */
 #tab-reports .reports-page { max-width: none; margin: 0; padding: 0; }
+.mac-setup-text { font-size: 0.88rem; color: var(--text-secondary); line-height: 1.55; margin: 0 0 0.85rem; }

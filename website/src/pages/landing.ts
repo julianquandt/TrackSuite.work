@@ -167,6 +167,27 @@ function miniTimeline(opts: { live?: boolean; note?: string } = {}): string {
 }
 
 // The apt setup as three separate, copy-paste steps with 1-click copy buttons.
+/**
+ * The app is not notarized by Apple, so macOS asks once before the first
+ * launch. Updates install without this step.
+ */
+function macStepsHtml(): string {
+    const fix = `xattr -cr "/Applications/TrackSuite.work.app"`;
+    const copyIcon = `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+    return `<p class="mac-setup-text">TrackSuite.work isn't notarized by Apple, so macOS asks once before opening it. Open the app, then go to <strong>System Settings → Privacy &amp; Security</strong> and click <strong>Open Anyway</strong>. (On macOS 14 and older, right-click the app → Open works too.) Updates install without this step.</p>
+    <ol class="apt-steps">
+        <li>
+            <div class="apt-step-head">
+                <span class="apt-step-label">If macOS says the app "is damaged", run this in Terminal</span>
+                <button type="button" class="btn-copy-code" data-code='${fix}' title="Copy command" aria-label="Copy the macOS command">
+                    ${copyIcon}<span>Copy</span>
+                </button>
+            </div>
+            <pre><code>${fix.replace(/"/g, "&quot;")}</code></pre>
+        </li>
+    </ol>`;
+}
+
 function aptStepsHtml(): string {
     const key = "https://julianquandt.github.io/TrackSuite.work/apt/tracksuite-work.asc";
     const url = "https://julianquandt.github.io/TrackSuite.work/apt";
@@ -464,6 +485,10 @@ export function renderLanding(app: HTMLElement): void {
                 <div class="apt-setup">
                     <p class="apt-setup-title">Debian / Ubuntu — set up apt</p>
                     ${aptStepsHtml()}
+                </div>
+                <div class="apt-setup mac-setup">
+                    <p class="apt-setup-title">macOS — first launch</p>
+                    ${macStepsHtml()}
                 </div>
             </div>
         </section>
