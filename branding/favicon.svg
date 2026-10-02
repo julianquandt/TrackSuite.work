@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="13" fill="#161a2b"/>
+  <g transform="translate(32 32) scale(0.74) translate(-32 -32)"><clipPath id="bar"><rect x="5" y="9.5" width="54" height="18" rx="9"/></clipPath>
+  <g clip-path="url(#bar)">
+    <rect x="5" y="9.5" width="19.5" height="18" fill="#2563eb"/>
+    <rect x="26.5" y="9.5" width="11" height="18" fill="#14b8a6"/>
+    <rect x="39.5" y="9.5" width="19.5" height="18" fill="#fbbf24"/>
+  </g>
+  <path d="M26.5 29.5 H37.5 V49 A5.5 5.5 0 0 1 26.5 49 Z" fill="#f3f4f7"/></g>
+</svg>

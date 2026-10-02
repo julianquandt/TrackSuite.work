@@ -2821,6 +2821,14 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.10.2",
+    date: "2026-10-02",
+    title: "A new logo",
+    changes: [
+      "TrackSuite.work has a new logo: a T whose top bar is a day painted in project colours, with the stem as the \"now\" line. You'll see it in your dock, taskbar and tray.",
+    ],
+  },
+  {
     version: "0.10.1",
     date: "2026-10-02",
     title: "Header fix",
