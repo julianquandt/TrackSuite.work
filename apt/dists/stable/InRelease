@@ -4,40 +4,40 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Wed, 22 Jul 2026 17:05:58 +0000
+Date: Fri, 02 Oct 2026 09:20:22 +0000
 Description: TrackSuite.work desktop app — apt repository
 Label: TrackSuite.work
 Origin: TrackSuite.work
 Suite: stable
 MD5Sum:
- 2ac9a9ca59260c984d9f7dc3e5bfc962              214 Release
- 611b17d554a50e28f36a095fa9dc08f3             1244 main/binary-amd64/Packages
- 15d1647c984627bb45016982c556a6f0              645 main/binary-amd64/Packages.gz
+ d3aa6fe3befe2a4e487bda9e20542320              214 Release
+ c939e9eaccaca41e796251d929237c6f             1868 main/binary-amd64/Packages
+ c7dd2acc66920fe2a966b109c55ca137              837 main/binary-amd64/Packages.gz
 SHA1:
- 1d178e9841a44223fe44f42a4d2557a97848796f              214 Release
- c7ca591cf3c9d4952787786101166bcbaa094f8a             1244 main/binary-amd64/Packages
- 40130fe043e2595516fab337bb9597e125d3466d              645 main/binary-amd64/Packages.gz
+ 6b6c5cdd2c6f04ab0f7717e6057fb3096d7be77d              214 Release
+ 8b767ee2e6d07c066c2e542fd147cc7ba11281f9             1868 main/binary-amd64/Packages
+ 2c7db08b0da1380ad63b5467e5e3b82ce3307522              837 main/binary-amd64/Packages.gz
 SHA256:
- d02114895d98adcfb93fcee48335d4994cb95f92d9d52f011b4e5870d9726290              214 Release
- bc93b3b237950bff0a25fa46770b5f4353122c64c166d4c5af667a652c19a78f             1244 main/binary-amd64/Packages
- 12a74fc52f5eff7f30e1d9b7d5fb0458e855383a40e0cad8b0c6e530ff9ae41e              645 main/binary-amd64/Packages.gz
+ 2a4fccaf48d36e3e1064b1b4d934b2e3c55673ba7a45a90c8b3e439a3b672815              214 Release
+ 5b31aab1362af3c8b42f8eec7040959ad558d4455a09896cf590dfb9e4affdee             1868 main/binary-amd64/Packages
+ 59543e3ad54595478882440bb31739f988a16008e32969307354a0c1d70f0e9e              837 main/binary-amd64/Packages.gz
 SHA512:
- fec2b74b79dcc1d1c95ff9bf893f71ad78641c88ba36cdb852d161a982c90ee129480395234ba6eb0fc0a0efe0b0dd998ec7f802a8e10bdb2abb9c0d0928fc3d              214 Release
- eb369c9fb741d3f1e0e6aee6a644c436ac8c9b90817e6f6536cbc4486ec07ef2c0acb84abec141d7dd1a1ef8ac9c299d5efcfc3d10577fb14537bd67b0244666             1244 main/binary-amd64/Packages
- da6addbf1b96e11e13e0f6e90caec9e13a840bec7cb95b1ce92716476b893f6305d989370132a847bbbaa39aee6434595bab97c011bc25052e994c8d8a90c6e1              645 main/binary-amd64/Packages.gz
+ d0b4fa942dc68cc5b7d481dc88c1afb72a3839cc6ef8fbb63fe979e4d9d9168fc837411861a9835350fb648ada0227d6c610d3d4d105bf6053723f962ce2ad69              214 Release
+ 0042cf50125f8e2c9a809a720ea05b118c2e09a2faf17c7f9d4ff52cacbcbb0783689cf8e3e4a643fc69578e57d73fc437d820294af791036022516ae4e048fb             1868 main/binary-amd64/Packages
+ 74d7f8630a09b9124bc014c4261334b0f864f7893c2b2ef18397c64a3896ce68c03731c08b7816927f1f40b9663d0b782b53d4095d18c8bd147da4c12c355114              837 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE4v4/1Q4JfWCvmGfqud80bbnAlPoFAmpg+HYACgkQud80bbnA
-lPqjhg//QRCqWfLizklAjCsJYSsGTOcI6sJR7jWqT1D7PMa9JHBDLnnahZngUqM8
-L0uucaf6bzf/i9/GvULlHBomoI49N/yyDGlkGFiUY0p8jqS+PQZKJBeXL9iLmdN6
-js5DumagnMOWgs6vxgr3crGNxPZbgJ4gupg4DxiHqQZ1uTkJdc3DgHab7ei5MMKo
-EiBqKxEPjdIpMA57UTZgX5Uy1MsFlFsnFWwNHULv3Cq9gshi+S5g2+AsoEDW1iC+
-ILfCFTVaZV0Fi0bNk+P6B1btZjMFyIeMn46tlNKVin31XRfFNOb5QdVT6VuveT3e
-QFcjg06ofbT0T1iPTORx6XNcBgjDyn6ZUOiqmwYw1X2BlUU4GJwdThur1hSv4mdd
-ybnUZ0Gg0AMo6FVS7WQzZuAPIRovSMJiTU2AhVuFMlMJy1NWrGjVI5c/qPcCUaJu
-D/oQWWZQd+hBmt1aPvlzF5KQdtnS6mPb7vESyqZ0+Zl9w8S6E1zY/bSDgEUPIh5l
-5LtWFKxwsUivZZY9k93HLxU4PUW2bbszwnHE6yYr3g4I79+yugvzWFGjBBG8famX
-GjhgPatWHSRaIAk7H6h8KBh1c64ngZ9Qp0R3tDOPwPUz7GDUQ+pxprnM6WohLu7a
-GlX0kF7vAs6cvcp7gKMkOfb92LiezS7jB0PKKRkCiAY2b9Um55g=
-=+MC6
+iQIzBAEBCgAdFiEE4v4/1Q4JfWCvmGfqud80bbnAlPoFAmq/d1YACgkQud80bbnA
+lPqPHA//c2BuXDMPt5LysxamR/QxBTCXmAfvbaRJMujvD810eeJiL2EHbgiGbW8e
+7srHlzs394hstMynYK4h3C0V1pSu2rHPebT1ef1bMVfeNmifbsCTCKLB7N/8sMu0
+I7Vr2A4V4rCxRjDVWUsAmhVTbm826qk8/rUNKjNU6MdDF0Ac1eIvWEbqnRpjb41o
+zt4HCWee9O6AVkDJcSdcBzs9zodzwAArwhJ+ZLaFb84zBlW/WdZWrqZI31WRUN5z
+Ay37oc5eSpCbNfw4EikW/MOsxBoA8feSoIJkyliETF9iD9lS5Eb4ZeNhnMWlsV0m
+XD8IdFkWyKkc7uGxF69+2eaMQWOcAOcZjjRC0d0EC/AWJlTKD8vwXmIWa/uI+Q3u
+AVmzx10x1faENLgMnLkyXaIJT789tpl3FxnX6llBSG7ib2O8PNB4/Di/DxNTnb61
+Qi7sGSDPl1mHe0tM4nyAtNIKO0VhEKGL3o5TimyA4zAaTv1x6AcIHT1K078WOfSu
+PhMOnZnxLv2XJ43cvw0t/ks/furo3S7wm4kdV6O6eNFbPqjDVwpEUM8lGY4h4Sj8
+bqYIngIaaf5xV4pn3Wb9jYiTcOU3aiAymgzHbWmxZQcn25vP8fhadQF8vVZ6M5G3
+WbrdJCsGT5jDPCf2QEbjq0FD68aXq4uCKqw+OvC/aNcqFCkkjFo=
+=PYNe
 -----END PGP SIGNATURE-----
