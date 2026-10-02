@@ -32,6 +32,22 @@ Description: Cross-platform work time tracking desktop app
 
 Package: track-suite-work
 Architecture: amd64
+Version: 0.10.2
+Priority: optional
+Maintainer: TrackSuite.work
+Installed-Size: 8166
+Depends: libappindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/TrackSuite.work_0.10.2_amd64.deb
+Size: 3882502
+MD5sum: 0a76208b17fc327d249827281299bc46
+SHA1: 5469eb94f9626a2c6f4e9901b295e8809dbda445
+SHA256: d69c8ce7bbe9addfb74f89fda937b7bc6f8d7afbed8db21de476dcf0452a2f37
+SHA512: d19c41496d33c5edadac6015f73adb9b6241ed3bab9e78d47030ce8511e1002205d5c5f62e70b0b4f8a3e62b2bcf8163b0aaf991d6b7e93bb767c7dd792c1540
+Description: Cross-platform work time tracking desktop app
+ (none)
+
+Package: track-suite-work
+Architecture: amd64
 Version: 0.9.1
 Priority: optional
 Maintainer: TrackSuite.work
