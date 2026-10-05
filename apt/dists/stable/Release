@@ -1,24 +1,24 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Fri, 02 Oct 2026 12:05:42 +0000
+Date: Mon, 05 Oct 2026 16:26:27 +0000
 Description: TrackSuite.work desktop app — apt repository
 Label: TrackSuite.work
 Origin: TrackSuite.work
 Suite: stable
 MD5Sum:
- 95ba6a4e042d071419696bc75421dbcf              214 Release
- ee7a848467396b8928dbe59d5528d033             3116 main/binary-amd64/Packages
- af7f91a97f49f944cef2d1bafb4d1946             1201 main/binary-amd64/Packages.gz
+ 502a5df717f51eeaacc32bb03be012a8              214 Release
+ 6c03b7d12cf695c34b5cfce0c4509def             3740 main/binary-amd64/Packages
+ 0321681b4a13a1fdf7d4eaee58ee3e95             1383 main/binary-amd64/Packages.gz
 SHA1:
- 6718fe406da204f0cfd2dc9a8fc2652bef73aa2b              214 Release
- a7e90a252beeddf7a82ddb7bbd72138ac2b83454             3116 main/binary-amd64/Packages
- 6f3317966f48174f103f2e89d21899aac7e214b0             1201 main/binary-amd64/Packages.gz
+ e50102a94faf66b1f0aae69adfae5a579e5b56d2              214 Release
+ c30aa7441f0987e7e84531a52b594d2ceae01f26             3740 main/binary-amd64/Packages
+ 76e5cd6bfc85c89387ef6c6c3b2ac4b2e3f632d2             1383 main/binary-amd64/Packages.gz
 SHA256:
- 0e9d78e2e9565c0f4be414a035430a1597e54d26727b11b91cb223fe3119e6c7              214 Release
- 4a39ec645b3990fa9d13facdf94af228c735f1e5b814e0085e560d79e45f15f3             3116 main/binary-amd64/Packages
- ba803d69bc3bf5ecb17ac0d71141b8d7ae1160d58a384892720a1adebedbd6f8             1201 main/binary-amd64/Packages.gz
+ e3a59404662b8811f400466f39f5e81de26d190d3f9f6db65b18cfffde01ba4a              214 Release
+ a4ed807d8df5ad1b9676afe770ab8df52599609e16056e73f83143da83addd3b             3740 main/binary-amd64/Packages
+ 1cb668564f3f5f379b6aa319a1da7f7ee4381278b333fe5810b8ae54cef4b572             1383 main/binary-amd64/Packages.gz
 SHA512:
- d7098a2469f66510338fd13351090a58f78b74a5c5c8863fed96e9a5b990fbf3b022251e5372de83410ed923b5810df5af738eb89577c5b9f35b8ed057e02fb0              214 Release
- 7ee7269e11e5350029ca5563a1ef8bc83c541b8219cdc4879b3d7e4862fd8cf6d7b809a449108ec5db5e32f0f096eda216b89b62a01d2f92a04da62c422c43e1             3116 main/binary-amd64/Packages
- 007a625f066b09debc914608350e5050fd4c86a8584b1f65eb4b29c6f6dee8bb31f126169440ce11472631638f22b973803c8e005ff7fdc7988494537b5146da             1201 main/binary-amd64/Packages.gz
+ 144b93cfcc1ebd0e81aed46d478071fd55406bea51e2a0b259d13756d37b1668a9e05f0a2a4ab863c8a14a6868bca209ebd02252410e87d5286e9fa7613def67              214 Release
+ 052e928aa24288cff33deffc0f2e274b2c1b4c9025bb769db2623dfb99532a0275efc8146df2a7100ed0877f155556fad4e7d95e34341fffa17676fb1a84b540             3740 main/binary-amd64/Packages
+ 6eed77684a33871eaa34bdb343076ae31e269821dd1358a8c1b6b80b8c3e703256968fc3c0736c4c9080ca44dd966f557c46c43e2cc9870ff447f877478ba604             1383 main/binary-amd64/Packages.gz
