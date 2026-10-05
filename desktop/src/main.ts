@@ -2821,6 +2821,14 @@ type ChangelogEntry = { version: string; date: string; title?: string; changes: 
 // Newest first. Add a new entry per release; it shows once on the next launch.
 const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.10.3",
+    date: "2026-10-05",
+    title: "Project menu fix",
+    changes: [
+      "The project menu in the header opens fully again. Since 0.10.0 it was cut off below the header, so you could not switch projects from there.",
+    ],
+  },
+  {
     version: "0.10.2",
     date: "2026-10-02",
     title: "A new logo",

@@ -298,8 +298,10 @@ select {
 /* ── Header ──────────────────────────────────────────────────────── */
 
 /* The header (tabs, project, focus timer, clock) stays at the top while the
-   page scrolls. The box-shadow + clip-path pair stretches its background to
-   the full window width without changing its layout. */
+   page scrolls. Its ::before layer stretches the background to the full window
+   width (box-shadow + clip-path) without changing the layout. The clip must
+   stay on that layer, never on the header: it would cut off the project menu
+   that drops below it. */
 .dash-header {
     display: flex;
     justify-content: space-between;
@@ -311,6 +313,12 @@ select {
     position: sticky;
     top: 0;
     z-index: 60;
+}
+.dash-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
     background: var(--bg-main);
     box-shadow: 0 0 0 100vmax var(--bg-main);
     clip-path: inset(0 -100vmax);

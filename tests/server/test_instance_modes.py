@@ -9,7 +9,7 @@ import pytest
 
 from app_server import limiter
 from app_server.auth import decrypt_secret, hash_email
-from app_server.models import Base, User
+from app_server.models import Base, Shift, User, UserSession
 
 from backend.app_server import instance
 from backend.app_server import cli
@@ -283,3 +283,27 @@ def test_cli_commands_report_a_missing_account(cli_db):
         if command == "delete-user":
             args.append("--yes")
         assert cli.main(args) == 1
+
+
+def test_cli_list_users_shows_last_activity(cli_db, capsys):
+    cli.main(["create-user", "--email", "idle@example.com", "--password", TEST_PASSWORD])
+    cli.main(["create-user", "--email", "busy@example.com", "--password", TEST_PASSWORD])
+    with cli_db() as db:
+        busy = db.query(User).filter(User.email_hash == hash_email("busy@example.com")).one()
+        db.add(UserSession(id="s1", user_id=busy.id, refresh_token_hash="h1",
+                           created_at="2026-09-01T08:00:00+00:00",
+                           last_used_at="2026-09-01T08:00:00+00:00",
+                           expires_at="2026-10-01T08:00:00+00:00"))
+        # A later shift edit (naive timestamps count as UTC) is the latest sign of use.
+        db.add(Shift(user_id=busy.id, start_time="2026-09-03T09:00:00",
+                     updated_at="2026-09-03T17:45:10.123456+00:00"))
+        db.commit()
+    capsys.readouterr()
+
+    assert cli.main(["list-users"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "LAST ACTIVE" in lines[0]
+    busy_line = next(l for l in lines if "busy@example.com" in l)
+    idle_line = next(l for l in lines if "idle@example.com" in l)
+    assert busy_line.endswith("2026-09-03 17:45")
+    assert idle_line.endswith("never")

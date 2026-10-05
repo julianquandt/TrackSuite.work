@@ -2206,10 +2206,30 @@ button[type="submit"] {
     gap: 10px 16px;
     margin: 0 0 24px;
     padding: 10px 0;
+}
+/* The full-width background lives on its own layer: a clip on the bar itself
+   would cut off the project menu that drops below it. */
+.tracker-bar::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
     background: var(--bg-main);
     box-shadow: 0 0 0 100vmax var(--bg-main);
     clip-path: inset(0 -100vmax);
-    border-bottom: 1px solid var(--border-subtle);
+}
+/* The line under the bar, across the full window width. */
+.tracker-bar::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 1px;
+    z-index: -1;
+    background: var(--border-subtle);
+    box-shadow: 0 0 0 100vmax var(--border-subtle);
+    clip-path: inset(0 -100vmax);
 }
 .tracker-bar .tabs-nav { margin: 0; padding: 0; border: none; }
 .tracker-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }

@@ -1,0 +1,12 @@
+{
+    "name": "tracksuite-ui-tests",
+    "private": true,
+    "type": "module",
+    "description": "Browser tests for the desktop and web interfaces. See README.md.",
+    "scripts": {
+        "test": "node --test"
+    },
+    "devDependencies": {
+        "playwright-core": "^1.63.0"
+    }
+}

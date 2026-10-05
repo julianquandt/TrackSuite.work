@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 # The maintenance sweep is a service concern; a short-lived CLI must not start
@@ -41,7 +42,7 @@ from .auth import (  # noqa: E402  (import after the env guard above, deliberate
     hash_password,
 )
 from . import main as server  # noqa: E402
-from .models import User  # noqa: E402
+from .models import ApiKey, Shift, User, UserSession  # noqa: E402
 
 
 # ── Terminal helpers ─────────────────────────────────────────────────
@@ -161,13 +162,34 @@ def cmd_create_user(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_utc(value: Optional[str]) -> Optional[datetime]:
+    """Parse a stored timestamp; a value without an offset is UTC."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _last_activity(db, user_id: int) -> Optional[datetime]:
+    """Latest sign of use: a login refresh (web or app), a sync with an API
+    key, or a change to the user's shifts. Reads only what is stored anyway."""
+    stamps = [r[0] for r in db.query(UserSession.last_used_at).filter(UserSession.user_id == user_id)]
+    stamps += [r[0] for r in db.query(ApiKey.last_used_at).filter(ApiKey.user_id == user_id)]
+    stamps += [r[0] for r in db.query(Shift.updated_at).filter(Shift.user_id == user_id)]
+    parsed = [dt for dt in map(_parse_utc, stamps) if dt]
+    return max(parsed) if parsed else None
+
+
 def cmd_list_users(args: argparse.Namespace) -> int:
     with server.SessionLocal() as db:
         users = db.query(User).order_by(User.id).all()
         if not users:
             print("No accounts on this instance.")
             return 0
-        print(f"{'ID':>4}  {'EMAIL':<38} {'STATE':<12} CREATED")
+        print(f"{'ID':>4}  {'EMAIL':<38} {'STATE':<12} {'CREATED':<19}  LAST ACTIVE (UTC)")
         for user in users:
             if user.mfa_enrolled_at and user.email_verified_at:
                 state = "active"
@@ -175,7 +197,9 @@ def cmd_list_users(args: argparse.Namespace) -> int:
                 state = "no-2fa"
             else:
                 state = "unverified"
-            print(f"{user.id:>4}  {user.email:<38} {state:<12} {(user.created_at or '')[:19]}")
+            last = _last_activity(db, user.id)
+            last_text = last.strftime("%Y-%m-%d %H:%M") if last else "never"
+            print(f"{user.id:>4}  {user.email:<38} {state:<12} {(user.created_at or '')[:19]:<19}  {last_text}")
     return 0
 
 
