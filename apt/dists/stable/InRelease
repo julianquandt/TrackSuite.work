@@ -4,40 +4,40 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Mon, 05 Oct 2026 16:26:27 +0000
+Date: Tue, 06 Oct 2026 07:17:12 +0000
 Description: TrackSuite.work desktop app — apt repository
 Label: TrackSuite.work
 Origin: TrackSuite.work
 Suite: stable
 MD5Sum:
- 502a5df717f51eeaacc32bb03be012a8              214 Release
+ 2741ed9667354402974c7f27269fadb2              214 Release
  6c03b7d12cf695c34b5cfce0c4509def             3740 main/binary-amd64/Packages
- 0321681b4a13a1fdf7d4eaee58ee3e95             1383 main/binary-amd64/Packages.gz
+ 7f9a54c99134dd558f0de5cef9cf07f6             1383 main/binary-amd64/Packages.gz
 SHA1:
- e50102a94faf66b1f0aae69adfae5a579e5b56d2              214 Release
+ e438a31d736957c6465829f0d2070b50e48cc625              214 Release
  c30aa7441f0987e7e84531a52b594d2ceae01f26             3740 main/binary-amd64/Packages
- 76e5cd6bfc85c89387ef6c6c3b2ac4b2e3f632d2             1383 main/binary-amd64/Packages.gz
+ 203f38acb761e028920fd3be1bbc6acfae56835e             1383 main/binary-amd64/Packages.gz
 SHA256:
- e3a59404662b8811f400466f39f5e81de26d190d3f9f6db65b18cfffde01ba4a              214 Release
+ 5381a5f4887aebc987f1e5b75e6464022d5dd2bc0653fe2ce45d0a8d8dc07ec3              214 Release
  a4ed807d8df5ad1b9676afe770ab8df52599609e16056e73f83143da83addd3b             3740 main/binary-amd64/Packages
- 1cb668564f3f5f379b6aa319a1da7f7ee4381278b333fe5810b8ae54cef4b572             1383 main/binary-amd64/Packages.gz
+ 1e6542c6ddee6c17f6c12e45004e460d7fd6e0d2969dbc64a0d6f5cb8c640d39             1383 main/binary-amd64/Packages.gz
 SHA512:
- 144b93cfcc1ebd0e81aed46d478071fd55406bea51e2a0b259d13756d37b1668a9e05f0a2a4ab863c8a14a6868bca209ebd02252410e87d5286e9fa7613def67              214 Release
+ 6fa7e2bfe50b07d8eced08a507dff89720e3740abba4fc709d9a69a4562706589048106c8ec120634f4ef6408a177336c69dce564f23f14b81182effb0e9a92e              214 Release
  052e928aa24288cff33deffc0f2e274b2c1b4c9025bb769db2623dfb99532a0275efc8146df2a7100ed0877f155556fad4e7d95e34341fffa17676fb1a84b540             3740 main/binary-amd64/Packages
- 6eed77684a33871eaa34bdb343076ae31e269821dd1358a8c1b6b80b8c3e703256968fc3c0736c4c9080ca44dd966f557c46c43e2cc9870ff447f877478ba604             1383 main/binary-amd64/Packages.gz
+ 913b92a65baab347879b39f35ff926955457747acbe4acc07bf654f253d0548ede6d35ec56adb18d81ebac98d3825aa14bb0b6e5dc6d0898ea2f620fb6585414             1383 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEE4v4/1Q4JfWCvmGfqud80bbnAlPoFAmrDz7MACgkQud80bbnA
-lPp98g/9GxbsRNHi0CAZpSAg2+MOBe2TDLt5wiJ973TY6zDvg3WCqvFmCTtA9peq
-ZWo3lfNoo6jTz1CD5nr6YU256Q5UjLAF3pYBCbO/IwR40tbcnUsL3zK8gm78h1Ew
-746rFyh7N3Uejc4bcWGu2OrxTh3mT8A2sfLm/7SltN2FKMbxcs6FU3Bf/Uq5vDBs
-STx9TmnfcmT5F5+HZOD4g0ApP+i1TeG5rsx+YpTQ6hI3a+S+kTfBJp3iQZqcUHL+
-26POiScTH4W1pz2YauJYBuhEe3OoHH4xnS2o0bGqsYBt+5YSi3n55AW54rzRIFoE
-So6O4e/WJdyRt0WaA6T/fwVG0ToSxAWd63jWbsEgdjoZ/moBYJJMfbGd/fyqe1Rr
-+0cpA2301zp6Cw7mPLxs5aT/6zp4kLBjScYoOvo+PBoC/WM2FQtG32nJz+OMIT39
-cpjBnu04gFRitBmtEvUAiWVDplTA/L54CyS9MM/LmuMQNjV1rNp1DZMMboXpPPC1
-+ad8XgeBOjwAKvvIShuMws46N7LOTy/50Qm8jpE5yYJsLQqirHX2w8r9CAkeF4sA
-5rbHS4rmJwmZeNmfyeeQzOlagCrIWy2XcySdOiqw8JU67eKaUqAglOQEdM2FJoxS
-X4B3RFZZavLjiY7BDd6/EhBM0JUzAhFk7X3rEWS4oI2K+UCRx/0=
-=nFCs
+iQIzBAEBCgAdFiEE4v4/1Q4JfWCvmGfqud80bbnAlPoFAmrEoHgACgkQud80bbnA
+lPrrVA//UBJg1zhAo6lf3KMG0tBYWskzMXRRLP+yfv4g3i2+zBqyETj499l7CDOn
+r9fRQyC/dKszjWYxvGbom+PMxrZp5/kgawCTXJDO6slNE4AumgVDv4kmO7ZxQf7f
+EcL3C2IA1bTcXjCz/l9XBmZiPNFlx5p6eUrNzjnXV3hacypu5+NxuxpEPX+A/8T4
+8zrumgjPivRFFx5b9D3jsQrv+8BeBQxKCL4DP5/A2ueW1H0GNMGH1LcITZl9At9j
+FazKhoUHdcB/KVmldRdpIwzNuiGasTFasRS0jgP0wecjIPJslusJbi9kc0SP8iqA
+CB+ILLONOfitSSUFdk3ifd6OzHG23bhqKUBuQSXUNHaWd+MbSp9JlXIW1wQh3K/i
+RoIgEza0zh24MeCo/zvXVq0drcUXeTb4HW0G+/nblX9S3PN6P24TDHJnE4OoyqQ3
+RJGR1dNUURSPfWGOslipzUm67i6QSTaed1Ca5xbg8jS0q1JCGw1V/n4y+5iqG3mb
+Zl87+9NE5LkCeb7Q3vIqn0wQCpUQjYij7BrW5ksVP/WqitxhLDXB8hleKok3u/8I
+1cBhSDqXpXPo9g+sKj4eDbHpQBr3H0uHXo8yZ6Uc56vxmOX4emV5wd0HTbSFsjCT
+KOB7IggPqll1fH53cM6pDKnJDUzpjfvwWs83ebkEkqwu8I+kfYY=
+=uuVO
 -----END PGP SIGNATURE-----
